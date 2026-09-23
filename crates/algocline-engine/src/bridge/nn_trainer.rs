@@ -103,7 +103,7 @@ use algocline_nn::card::{
 };
 use algocline_nn::train::{
     run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, BundleIdentity,
-    CrossEntropyLoss, Dataset, DistillLossKind, DistillSpec, TrainingLease,
+    CrossEntropyLoss, Dataset, DistillLossKind, DistillSpec, FullFtConfig, TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -285,6 +285,7 @@ fn run_lora_ft_impl(
     let arch = handle.arch();
     let lora_cfg = extract_lora_cfg(RUN_LORA_FT_ERR_PREFIX, arch, &opts)?;
     let train_cfg = extract_run_train_cfg(RUN_LORA_FT_ERR_PREFIX, &opts)?;
+    refuse_val_dataset(RUN_LORA_FT_ERR_PREFIX, &opts)?;
 
     // 7. Pre-mint the Card id (mirrors save_impl / merge_lora_impl).
     //    Minted before training because the id doubles as the delta
@@ -303,6 +304,19 @@ fn run_lora_ft_impl(
     let base_bundle_ref = bundle_ref_for(&handle.arch_family_variant());
     let architecture = handle.arch_family_variant();
     let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
+
+    // 8.5. What the delta checkpoint will say about itself. An adapter
+    //      is loaded onto a base, so the facts a reader needs are the
+    //      base's — the same four the sibling surfaces record.
+    let mut train_cfg = train_cfg;
+    train_cfg.bundle_identity = Some(BundleIdentity {
+        architecture: architecture.clone(),
+        vocab: handle.vocab(),
+        ctx: handle.ctx(),
+        dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
+        run: Some(lora_card_id.to_string()),
+    });
+    let train_cfg = train_cfg;
     // Same "before any lock" rule: reading the custom spec takes the
     // model mutex briefly (see `custom_branch_of_gpt2`), so it happens
     // here rather than nested inside the training critical section.
@@ -559,6 +573,27 @@ fn extract_val_dataset(
         )));
     }
     Ok(Some(ud))
+}
+
+/// Refuse `opts.val_dataset` on a surface that has nowhere to score
+/// it.
+///
+/// Only [`run_full_ft_impl`] reaches a training entry point that takes
+/// a held-out set. The LoRA and distillation surfaces pass no such
+/// argument, so a key set here was read and dropped: the run trained
+/// with no validation at all while its caller believed a held-out loss
+/// was being measured, and nothing in the Card or the log said
+/// otherwise. Refusing costs the caller one error; ignoring costs them
+/// the run.
+fn refuse_val_dataset(prefix: &str, opts: &LuaTable) -> LuaResult<()> {
+    match opts.get::<LuaValue>("val_dataset")? {
+        LuaValue::Nil => Ok(()),
+        _ => Err(LuaError::external(format!(
+            "{prefix}: opts.val_dataset is not supported here — this entry point has no \
+             held-out scoring pass, and a key it silently dropped would leave the run \
+             unvalidated; use alc.nn.trainer.run_full_ft to score a held-out set"
+        ))),
+    }
 }
 
 /// L5c S1 core. Mirrors [`run_lora_ft_impl`] structurally; see the
@@ -994,10 +1029,7 @@ fn run_distill_impl(
     //    Lua-shaped error rather than a candle back-trace).
     let train_cfg = extract_run_train_cfg(RUN_DISTILL_ERR_PREFIX, &opts)?;
     let loss_kind = extract_distill_loss_kind(RUN_DISTILL_ERR_PREFIX, Some(&opts))?;
-    let spec = DistillSpec {
-        hyperparams: train_cfg,
-        loss_kind,
-    };
+    refuse_val_dataset(RUN_DISTILL_ERR_PREFIX, &opts)?;
 
     // 7. Pre-mint the Card id (mirrors run_full_ft_impl step 7).
     let name: Option<String> = opts.get("name")?;
@@ -1014,6 +1046,26 @@ fn run_distill_impl(
     let architecture = handle.arch_family_variant();
     let custom = custom_branch_of_gpt2(RUN_DISTILL_ERR_PREFIX, &handle)?;
     let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
+
+    // 8.5. What the checkpoints will say about themselves. A distilled
+    //      student is an ordinary model once it is on disk, so it
+    //      carries the same four facts its siblings write — see
+    //      `BundleIdentity`. The spec is assembled here rather than
+    //      beside the opts because the architecture is only known
+    //      after step 8.
+    let spec = DistillSpec {
+        hyperparams: FullFtConfig {
+            bundle_identity: Some(BundleIdentity {
+                architecture: architecture.clone(),
+                vocab: handle.vocab(),
+                ctx: handle.ctx(),
+                dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
+                run: Some(card_id.to_string()),
+            }),
+            ..train_cfg
+        },
+        loss_kind,
+    };
 
     // 9. Fresh per-call TrainingLease (design §0, matches the
     //    siblings).
@@ -1607,6 +1659,111 @@ mod run_ft_bridge_tests {
 
         let sidecar = algocline_nn::train::identity_sidecar_path(&bundle);
         assert!(sidecar.exists(), "and a sidecar beside it");
+    }
+
+    /// The sibling surfaces write the same four facts into their
+    /// bundles. An adapter records the base it loads onto, because
+    /// that is the model a reader has to rebuild before the delta
+    /// means anything.
+    #[test]
+    fn run_lora_ft_writes_a_bundle_that_identifies_itself() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_train_opts());
+        let card_id = run_lora_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_lora_ft");
+
+        let bundle = nn_dir
+            .join("nn")
+            .join(format!("lora-{card_id}.safetensors"));
+        let header = algocline_nn::train::read_bundle_header(&bundle)
+            .expect("readable")
+            .expect("the trainer writes a header");
+        assert_eq!(
+            header.get("architecture").map(String::as_str),
+            Some("gpt2-tiny")
+        );
+        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
+        assert_eq!(
+            header.get("run").map(String::as_str),
+            Some(card_id.as_str())
+        );
+    }
+
+    /// And a distilled student, which is an ordinary bundle once it is
+    /// on disk.
+    #[test]
+    fn run_distill_writes_a_bundle_that_identifies_itself() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let card_id = run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_distill");
+
+        let bundle = nn_dir.join(format!("{card_id}.safetensors"));
+        let header = algocline_nn::train::read_bundle_header(&bundle)
+            .expect("readable")
+            .expect("the trainer writes a header");
+        assert_eq!(
+            header.get("architecture").map(String::as_str),
+            Some("gpt2-tiny")
+        );
+        assert_eq!(
+            header.get("run").map(String::as_str),
+            Some(card_id.as_str())
+        );
+    }
+
+    /// Neither sibling reaches an entry point that takes a held-out
+    /// set, so the key is refused rather than read and dropped.
+    #[test]
+    fn a_held_out_set_is_refused_where_nothing_would_score_it() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let val_ud = make_dataset_handle(&lua, overfit_row(), 4);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_train_opts());
+        opts.set("val_dataset", val_ud.clone()).unwrap();
+        let err = run_lora_ft_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud.clone()),
+            &LuaValue::UserData(ds_ud.clone()),
+            opts,
+        )
+        .expect_err("LoRA has no validation pass")
+        .to_string();
+        assert!(err.contains("val_dataset is not supported here"), "{err}");
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        opts.set("val_dataset", val_ud).unwrap();
+        let err = run_distill_impl(
+            &store,
+            &nn_dir,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect_err("distillation has no validation pass")
+        .to_string();
+        assert!(err.contains("val_dataset is not supported here"), "{err}");
     }
 
     /// A second dataset under `opts.val_dataset` is scored every

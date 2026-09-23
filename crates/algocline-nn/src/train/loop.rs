@@ -865,6 +865,28 @@ pub enum TrainError {
         /// at: the model input or the loss mask.
         needed: &'static str,
     },
+    /// A batch arrived whose loss mask scores no position at all.
+    ///
+    /// Refused rather than run. The masked mean divides by
+    /// `max(mask_sum, 1)` to keep a fully-masked batch from producing
+    /// `NaN`, so such a batch yields a loss of exactly `0.0` — a step
+    /// with no gradient, reported as the best loss the run has seen.
+    /// Once that value is latched, `min_train_loss` never rises again
+    /// and every later checkpoint looks worse than a step that learnt
+    /// nothing. The two readings — "this batch is empty" and "this
+    /// batch is perfect" — are the same number, which is why it has to
+    /// stop here instead of being scored.
+    #[error(
+        "a batch of {rows} row(s) has {scored} scored position(s): its loss mask leaves nothing \
+         to learn from, which scores 0.0 and would latch as the run's best loss"
+    )]
+    NothingScored {
+        /// Rows in the batch.
+        rows: usize,
+        /// Scored positions across the whole batch — zero, by
+        /// construction of this error.
+        scored: usize,
+    },
 }
 
 /// Information handed to the [`CkptHook`] at every `ckpt_every` boundary.
@@ -1708,50 +1730,6 @@ fn run_ft_core(
                 .map_err(|e| TrainError::Ckpt(format!("metrics: {e}")))?;
         }
 
-        if out_of_patience {
-            // The run stops where it stopped improving, and says so:
-            // a caller reading `step` against `cfg.steps` would
-            // otherwise have to guess whether the run was cut short or
-            // the config was.
-            tracing::info!(
-                target: "algocline_nn::train",
-                step = step + 1,
-                val_loss = last_val_loss,
-                "early stop: the held-out loss stopped improving"
-            );
-            // Score the weights this record names, the way the normal
-            // exit does: `last_val_loss` may be several steps old, and
-            // a record pairing step N's weights with step N-3's
-            // held-out loss is a comparison nobody can make sense of
-            // later.
-            if let Some(batches) = val_batches.as_ref() {
-                if !(step + 1).is_multiple_of(cfg.eval_every) {
-                    let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
-                    last_val_loss = Some(v);
-                    if v < min_val_loss {
-                        min_val_loss = v;
-                    }
-                }
-            }
-            let final_path = ckpt_store
-                .save_final(save_vm, step + 1)
-                .map_err(|e| TrainError::Ckpt(e.to_string()))?;
-            save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
-            let mut metrics: HashMap<String, f32> = HashMap::new();
-            metrics.insert("min_train_loss".into(), running_min_loss);
-            metrics.insert("final_lr".into(), lr as f32);
-            metrics.insert("early_stop".into(), 1.0);
-            metrics.insert("min_val_loss".into(), min_val_loss);
-            if resumed_step > 0 {
-                metrics.insert("resumed_from_step".into(), resumed_step as f32);
-            }
-            let mut ckpt =
-                checkpoint_from_path(&final_path, step + 1, mean_loss, last_val_loss, metrics)
-                    .map_err(TrainError::Ckpt)?;
-            ckpt.candidates = candidates;
-            return Ok(ckpt);
-        }
-
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
             let ckpt_path = ckpt_store
                 .save_step(save_vm, step + 1)
@@ -1843,6 +1821,53 @@ fn run_ft_core(
                     }
                 }
             }
+        } // After the checkpoint block above, not before it: the
+          // step that runs out of patience can also be a
+          // `ckpt_every` boundary, and returning here first would
+          // deny the hook the one fire it most needs — the step the
+          // run ends on is the step a selection hook wants to keep.
+        if out_of_patience {
+            // The run stops where it stopped improving, and says so:
+            // a caller reading `step` against `cfg.steps` would
+            // otherwise have to guess whether the run was cut short or
+            // the config was.
+            tracing::info!(
+                target: "algocline_nn::train",
+                step = step + 1,
+                val_loss = last_val_loss,
+                "early stop: the held-out loss stopped improving"
+            );
+            // Score the weights this record names, the way the normal
+            // exit does: `last_val_loss` may be several steps old, and
+            // a record pairing step N's weights with step N-3's
+            // held-out loss is a comparison nobody can make sense of
+            // later.
+            if let Some(batches) = val_batches.as_ref() {
+                if !(step + 1).is_multiple_of(cfg.eval_every) {
+                    let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                    last_val_loss = Some(v);
+                    if v < min_val_loss {
+                        min_val_loss = v;
+                    }
+                }
+            }
+            let final_path = ckpt_store
+                .save_final(save_vm, step + 1)
+                .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+            save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
+            let mut metrics: HashMap<String, f32> = HashMap::new();
+            metrics.insert("min_train_loss".into(), running_min_loss);
+            metrics.insert("final_lr".into(), lr as f32);
+            metrics.insert("early_stop".into(), 1.0);
+            metrics.insert("min_val_loss".into(), min_val_loss);
+            if resumed_step > 0 {
+                metrics.insert("resumed_from_step".into(), resumed_step as f32);
+            }
+            let mut ckpt =
+                checkpoint_from_path(&final_path, step + 1, mean_loss, last_val_loss, metrics)
+                    .map_err(TrainError::Ckpt)?;
+            ckpt.candidates = candidates;
+            return Ok(ckpt);
         }
     }
 
@@ -2178,6 +2203,23 @@ fn forward_loss(
     loss_fn: &dyn Loss,
 ) -> Result<Tensor, TrainError> {
     let (inputs, targets, mask) = batch_to_input_target(batch, device)?;
+    // Counted on the rows the batch carries rather than on the tensor:
+    // the mask is host-side data and a `sum_all` here would pull the
+    // device back for every step. The first column is dropped because
+    // the mask is sliced in lockstep with the target shift.
+    if let Some(rows) = batch.loss_mask.as_ref() {
+        let scored = rows
+            .iter()
+            .flat_map(|row| row.iter().skip(1))
+            .filter(|weight| **weight != 0.0)
+            .count();
+        if scored == 0 {
+            return Err(TrainError::NothingScored {
+                rows: rows.len(),
+                scored,
+            });
+        }
+    }
     // The allowed-id input, built only for the entry point that takes
     // one: every other run would pay for a tensor it cannot read. The
     // sets are shifted to line up with the model's inputs — see
@@ -3373,6 +3415,88 @@ mod tests {
         assert!(tmp.path().join("stop.safetensors").exists());
     }
 
+    /// The step a run stops on is a step the hook sees. A selection
+    /// hook picks the checkpoint it wants to keep from what it is
+    /// shown, and the last step of the run is the one it most wants to
+    /// be shown — so the checkpoint block runs before the stop, not
+    /// after it.
+    #[test]
+    fn the_hook_sees_the_step_the_run_stops_on() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            // Frozen weights: the held-out loss cannot improve, so the
+            // patience rule is what ends the run.
+            lr: 0.0,
+            weight_decay: 0.0,
+            steps: 20,
+            warmup: 0,
+            eval_every: 1,
+            // Every step is a boundary, so the stopping step is one.
+            ckpt_every: 1,
+            ckpt_keep: 20,
+            early_stop: Some(EarlyStop {
+                patience: 2,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+
+        let fires: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let fires_hook = Arc::clone(&fires);
+        let hook: CkptHook = Box::new(move |info| {
+            fires_hook.lock().unwrap().push(info.step);
+            Ok(CkptControl {
+                flow: CkptFlow::Continue,
+                keep: Some(KeepMark {
+                    reason: Some("last one wins".into()),
+                    values: Default::default(),
+                }),
+            })
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "stop_hook",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .expect("run");
+
+        assert_eq!(
+            ckpt.metrics.get("early_stop").copied(),
+            Some(1.0),
+            "the run has to have stopped on the rule for this to test anything"
+        );
+        let seen = fires.lock().unwrap();
+        assert_eq!(
+            seen.last().copied(),
+            Some(ckpt.step),
+            "the stopping step must be among the fires, got {seen:?} for a run ending at {}",
+            ckpt.step
+        );
+        let last = ckpt
+            .candidates
+            .last()
+            .expect("the hook kept every fire it saw");
+        assert_eq!(last.info.step, ckpt.step);
+        assert!(
+            last.info.ckpt_path.exists(),
+            "a candidate kept on the stopping step has to survive the exit"
+        );
+    }
+
     /// A rule with nothing to watch is refused rather than left never
     /// to fire.
     #[test]
@@ -3655,6 +3779,54 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, TrainError::EmptyValidationSet), "{err}");
+    }
+
+    /// A row short enough that padding covers everything the loss
+    /// would score. The masked mean answers `0.0` for such a batch, so
+    /// without a refusal the run would report a perfect step it never
+    /// took.
+    #[test]
+    fn a_batch_that_scores_nothing_is_refused_rather_than_scored_zero() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        // One real token, seven pads: the mask is 1 at position 0 and 0
+        // everywhere after, and position 0 is the one the target shift
+        // drops.
+        let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| vec![1u32]).take(4).collect();
+        let mut ds = TokenizedDataset::new(
+            rows,
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                shuffle: false,
+                seed: None,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "empty-mask",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::NothingScored { scored: 0, .. }),
+            "{err}"
+        );
     }
 
     #[test]

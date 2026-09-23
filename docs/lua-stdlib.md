@@ -1094,7 +1094,10 @@ crate defines.
 Available on the trainable handles (`gpt2` / `tinyllama`) and on the
 union a reloaded Card carries. The llama adapter refuses it by name: its
 forward returns the head's output and there is no hidden state behind it
-to pool.
+to pool. A handle built with a conditioning table refuses it too: there
+is no unconditioned forward pass through such a model, and an embedding
+taken with the channel dropped would describe a model the caller did not
+build.
 
 ```lua
 local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
@@ -1119,6 +1122,11 @@ be evaluated here and nowhere else.
 | path | string | yes | file to write |
 | opts.precision | string | no | `f32` (default) / `f16` / `q8_0` / `q5_1` / `q5_0` / `q4_1` / `q4_0` / `q6k` / `q5k` / `q4k` / `q3k` / `q2k` |
 | opts.tokenizer | string | no | path to an HF `tokenizer.json` to embed (the preset cache is `<app>/nn/tokenizers/<preset>.json`) |
+
+A model whose output projection is tied to its embedding is written
+with that matrix under **both** names — `token_embd.weight` and
+`output.weight` — because GGUF has a slot for the head and a reader
+finding it empty has no output projection to apply.
 
 **Returns** `{ path, tensors, metadata, tokenizer, architecture }` —
 what was written, including whether a tokenizer went in. Without one the
@@ -1208,6 +1216,15 @@ two Lua handles onto one sampler would each hold half of a history. The
 composed sampler carries `sample` / `is_done` / `reset` as before, plus
 `observe(id)` for a loop that decides some steps elsewhere (a forced
 prefix, a spliced tool call) and still wants them to weigh.
+
+`observe` is **refused on a penalised-over-constrained sampler**: the
+verb reaches the penalty history and nothing else, and the constraint's
+prefix would stay a token behind the generation, so every later mask
+would be the mask for a shorter sequence. The token it then permits is
+legal — for a sequence that is not the one being generated, which is
+the one failure no error would surface. Splice such a token by sampling
+it under a mask that admits only it, so both halves of the state move
+together.
 
 Wrap the *constrained* sampler in this one rather than the reverse: the
 penalty then reads logits the mask has already applied and is never
@@ -1647,6 +1664,13 @@ token. A row that should teach where it ends carries that token
 itself; the filler behind it is not scored. Batches whose rows all
 reach `ctx_len` carry no mask at all, so a packed corpus is unaffected.
 
+A batch whose mask scores **nothing** is refused rather than run. The
+masked mean divides by `max(mask_sum, 1)` so a fully masked batch
+cannot produce `NaN` — which means it produces `0.0` instead, a step
+with no gradient reported as the best loss the run has seen and latched
+there for every checkpoint after it. "This batch is empty" and "this
+batch is perfect" are the same number, so the run stops on it.
+
 `opts.mask_pad = false` on the dataset turns this off, which is how a
 run recorded before the mask existed is reproduced.
 
@@ -1929,7 +1953,10 @@ Checkpoint before assembling the Card.
     and `val_dataset` is refused rather than left never to fire.
     A non-finite loss counts against patience, so a diverged run
     stops on the same rule. A stopped run writes its terminal
-    checkpoint and records `metrics.early_stop = 1`.
+    checkpoint and records `metrics.early_stop = 1`. The step it
+    stops on is still a step `on_ckpt` sees when that step is a
+    `ckpt_every` boundary — the last step of a run is the one a
+    selection hook most wants to be shown.
   - `eval_every` (integer, optional, default `0`) — score the
     held-out set every N optimizer steps. Requires
     `val_dataset`, and `val_dataset` requires this: either half
@@ -1943,7 +1970,11 @@ Checkpoint before assembling the Card.
     training dataset here is refused — the number it would
     produce is a training loss under another name. The result
     reaches `info.val_loss`, the Card's `metrics.val_loss`, and
-    `metrics.min_val_loss`.
+    `metrics.min_val_loss`. `run_lora_ft` and `run_distill` reach
+    no entry point that scores a held-out set, so the key is
+    refused there rather than read and dropped: a run that
+    silently trained unvalidated while its caller believed
+    otherwise is the failure this option exists to prevent.
   - `mask_disallowed_logits` (boolean, optional, default
     `false`) — score each target among the ids its position
     allowed instead of among the whole vocabulary. Requires

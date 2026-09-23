@@ -1803,17 +1803,37 @@ impl Gpt2Model {
         // The condition, if the caller passed one. Added here, beside
         // the positional embedding, so it is present at every position
         // instead of decaying with distance from a token at the front.
-        if let Some(cond) = cond {
-            // `[B, 1, D]` from a row selection, `[1, 1, D]` from a
-            // weighted combination — both broadcast over the sequence,
-            // and the second over the batch as well.
-            let cond_emb = match cond {
-                CondInput::Rows { conds, per_row } => {
-                    self.condition_embedding(conds, b, per_row)?
-                }
-                CondInput::Weights(weights) => self.weighted_condition_embedding(weights)?,
-            };
-            h = h.broadcast_add(&cond_emb)?;
+        match (&self.cond_wte, cond) {
+            (_, Some(cond)) => {
+                // `[B, 1, D]` from a row selection, `[1, 1, D]` from a
+                // weighted combination — both broadcast over the
+                // sequence, and the second over the batch as well.
+                let cond_emb = match cond {
+                    CondInput::Rows { conds, per_row } => {
+                        self.condition_embedding(conds, b, per_row)?
+                    }
+                    CondInput::Weights(weights) => self.weighted_condition_embedding(weights)?,
+                };
+                h = h.broadcast_add(&cond_emb)?;
+            }
+            // The silent direction, and the one this refusal exists
+            // for: a conditioning table left unfed adds the zero vector
+            // at every position, so the model runs in a state it never
+            // trained in and the output looks entirely ordinary. The
+            // allowed-id channel below has always refused this; the
+            // conditioning one did not, which let `handle:embed` and
+            // `handle:beam_search` run a conditioned model
+            // unconditioned.
+            (Some(_), None) => {
+                return Err(candle_core::Error::Msg(
+                    "gpt2 forward: this model was built with a conditioning table and reads a \
+                     row of it at every position; running it without one trains nothing and \
+                     answers from a state it never trained in — pass the condition to \
+                     forward_conditioned"
+                        .into(),
+                ))
+            }
+            (None, None) => {}
         }
         // The allowed-id input, beside the condition and for the same
         // reason: it belongs at every position, because every position
@@ -3498,6 +3518,33 @@ mod tests {
         CondIndex::new(row, slots).expect("row inside the table")
     }
 
+    /// A model carrying a conditioning table refuses to run without
+    /// one, the way a model carrying an allowed-id table already did.
+    ///
+    /// The asymmetry was the bug: `handle:embed` and
+    /// `handle:beam_search` drive the plain forward, so a conditioned
+    /// model answered them from a state it never trained in — the zero
+    /// vector added at every position — and the output looked entirely
+    /// ordinary.
+    #[test]
+    fn a_conditioned_model_refuses_to_run_unconditioned() {
+        let cfg = conditioning_cfg(Some(4));
+        let model = seeded_model(&cfg);
+        let ids = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+
+        let err = model.forward(&ids).unwrap_err().to_string();
+        assert!(err.contains("conditioning table"), "{err}");
+        assert!(err.contains("forward_conditioned"), "{err}");
+
+        // And with the condition it runs.
+        assert!(model.forward_conditioned(&ids, &[cond(0, 4)]).is_ok());
+
+        // A model with no table is unaffected.
+        let plain_cfg = tiny_cfg();
+        let plain = seeded_model(&plain_cfg);
+        assert!(plain.forward(&ids).is_ok());
+    }
+
     /// The claim is comparative. "The condition changes the output far
     /// from the front of the row" is true of a token at the front too —
     /// decayed, but non-zero — so on its own it does not distinguish
@@ -3521,17 +3568,14 @@ mod tests {
         let ids = Tensor::from_slice(&seq, (1, seq.len()), &cfg.device).unwrap();
         let at = |out: &Tensor, pos: usize| out.i((0, pos)).unwrap();
 
-        let plain = model.forward(&ids).unwrap();
         let low = model.forward_conditioned(&ids, &[cond(0, 4)]).unwrap();
         let high = model.forward_conditioned(&ids, &[cond(1, 4)]).unwrap();
 
-        let plain_vs_low = crate::arch::max_abs_diff_f32(&at(&plain, far), &at(&low, far)).unwrap();
-        assert!(
-            plain_vs_low > 1e-4,
-            "a condition that changes nothing at position {far} is not a condition \
-             (max abs diff {plain_vs_low})"
-        );
-
+        // No unconditioned baseline: running this model without its
+        // table is refused now, and the baseline was redundant anyway —
+        // "a condition that changes nothing is not a condition" is
+        // carried by the two-condition gap below, which is zero in
+        // every case the baseline would have caught.
         let far_gap = crate::arch::max_abs_diff_f32(&at(&low, far), &at(&high, far)).unwrap();
         assert!(
             far_gap > 1e-4,
@@ -3542,15 +3586,28 @@ mod tests {
 
         // The counterfactual: the same information carried by a token
         // at position 1.
+        //
+        // Both runs carry the *same* condition, so the only difference
+        // between them is that token — which isolates the prefix
+        // mechanism more exactly than the unconditioned pair this used
+        // to run, and is the only form available now that a model
+        // carrying a conditioning table refuses to run without one.
         let mut prefix_a = seq.clone();
         prefix_a[near] = 2;
         let mut prefix_b = seq.clone();
         prefix_b[near] = 3;
+        let held = [cond(0, 4)];
         let out_a = model
-            .forward(&Tensor::from_slice(&prefix_a, (1, seq.len()), &cfg.device).unwrap())
+            .forward_conditioned(
+                &Tensor::from_slice(&prefix_a, (1, seq.len()), &cfg.device).unwrap(),
+                &held,
+            )
             .unwrap();
         let out_b = model
-            .forward(&Tensor::from_slice(&prefix_b, (1, seq.len()), &cfg.device).unwrap())
+            .forward_conditioned(
+                &Tensor::from_slice(&prefix_b, (1, seq.len()), &cfg.device).unwrap(),
+                &held,
+            )
             .unwrap();
         let prefix_far = crate::arch::max_abs_diff_f32(&at(&out_a, far), &at(&out_b, far)).unwrap();
         let prefix_near =

@@ -242,7 +242,22 @@ fn is_small_vector(t: &Tensor) -> bool {
     t.dims().len() < 2
 }
 
+/// GGUF name of the language-model head.
+const OUTPUT_WEIGHT: &str = "output.weight";
+
+/// GGUF name of the token embedding.
+const TOKEN_EMBD_WEIGHT: &str = "token_embd.weight";
+
 /// The model's tensors under their GGUF names, in a stable order.
+///
+/// A model whose head is **tied** to its embedding — every GPT-2
+/// exportable from here, since an untied head is a custom-only option
+/// and a custom architecture is refused — registers no `lm_head`
+/// parameter, so nothing maps to `output.weight` and the file would
+/// carry no output projection at all. The embedding is written a second
+/// time under that name, which is what a conversion script does for a
+/// tied model and costs `vocab x dim` of file: GGUF names the two
+/// separately and has no way to say they are one tensor.
 fn collect_tensors(varmap: &VarMap, spec: &GgufSpec) -> Result<Vec<(String, Tensor)>, String> {
     let data = varmap
         .data()
@@ -262,6 +277,13 @@ fn collect_tensors(varmap: &VarMap, spec: &GgufSpec) -> Result<Vec<(String, Tens
                 "gguf export: two parameters map to `{gguf}`, which would silently drop one"
             ));
         }
+    }
+    if !out.contains_key(OUTPUT_WEIGHT) {
+        let embedding = out.get(TOKEN_EMBD_WEIGHT).cloned().ok_or(
+            "gguf export: the model has neither an output projection nor a token \
+                    embedding to tie one to, so the file would produce no logits",
+        )?;
+        out.insert(OUTPUT_WEIGHT.to_string(), embedding);
     }
     Ok(out.into_iter().collect())
 }
@@ -627,7 +649,27 @@ mod tests {
         assert!(names.contains(&"output_norm.weight"));
         assert!(names.contains(&"blk.0.attn_qkv.weight"));
         assert!(names.contains(&"blk.1.ffn_down.bias"));
-        assert_eq!(named.len(), vm.data().lock().unwrap().len());
+        // One more than the model registers: a tied head has no
+        // `lm_head` parameter, and the file needs an `output.weight`
+        // or it produces no logits.
+        assert!(names.contains(&"output.weight"));
+        assert_eq!(named.len(), vm.data().lock().unwrap().len() + 1);
+
+        let head = named
+            .iter()
+            .find(|(n, _)| n == "output.weight")
+            .map(|(_, t)| t.clone())
+            .unwrap();
+        let embedding = named
+            .iter()
+            .find(|(n, _)| n == "token_embd.weight")
+            .map(|(_, t)| t.clone())
+            .unwrap();
+        assert_eq!(
+            head.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            embedding.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
+            "the tied head is the embedding"
+        );
     }
 
     #[test]
@@ -650,7 +692,11 @@ mod tests {
         let spec = gpt2_spec();
         let report = export_gguf(&vm, &spec, GgmlDType::F32, None, &path).expect("export");
         assert!(!report.tokenizer, "no tokenizer was supplied");
-        assert_eq!(report.tensors, vm.data().lock().unwrap().len());
+        assert_eq!(
+            report.tensors,
+            vm.data().lock().unwrap().len() + 1,
+            "every parameter plus the tied head"
+        );
 
         let mut file = std::fs::File::open(&path).unwrap();
         let content = gguf_file::Content::read(&mut file).expect("the file is a GGUF");
@@ -683,7 +729,11 @@ mod tests {
         // round trip through this crate comes back in candle order —
         // the file itself holds ggml's.
         assert_eq!(info.shape.dims().to_vec(), expected);
-        assert_eq!(content.tensor_infos.len(), source.len());
+        assert_eq!(
+            content.tensor_infos.len(),
+            source.len() + 1,
+            "every parameter plus the tied head written as output.weight"
+        );
     }
 
     #[test]

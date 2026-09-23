@@ -153,10 +153,21 @@ impl ErasedSampler {
                 sampler.observe(token);
                 Ok(())
             }
-            Self::PenalizedConstrained(sampler) => {
-                sampler.observe(token);
-                Ok(())
-            }
+            // Refused, not half-applied: this shape keeps two pieces of
+            // state — the penalty's history and the constraint's
+            // prefix — and only the first can be told about a token
+            // from here. Advancing one of them leaves the grammar a
+            // token behind the sequence, so the next mask is the mask
+            // for a shorter prefix and the token it permits is legal
+            // for a sequence that is not the one being generated. No
+            // error would surface; the output would simply be off
+            // pattern.
+            Self::PenalizedConstrained(_) => Err(
+                "this sampler is penalised over a constrained one, and observe can reach only \
+                 the penalty history — the constraint would fall a token behind the \
+                 generation; splice the token by sampling it under a mask that admits only \
+                 it, or drop the constraint",
+            ),
             Self::Plain(_) | Self::Constrained(_) => Err(
                 "this sampler keeps no token history; build it with alc.nn.sampler.penalized \
                  to give it one",
@@ -787,6 +798,19 @@ mod tests {
             1,
             "the observed token has to weigh the same as a sampled one"
         );
+
+        // And refused where only half of the state could be advanced:
+        // the penalty would count the token while the constraint stayed
+        // a token behind the generation.
+        let inner = SamplerHandle::plain(GreedySampler);
+        let constraint = ConstraintHandle::new(StopTokensConstraint::new(vec![1]));
+        let constrained = constrained_impl(&inner, &constraint).expect("compose");
+        let both = penalized_impl(&constrained, Some(&opts)).expect("wrap");
+        let err = both
+            .observe(0)
+            .expect_err("half the state cannot be advanced")
+            .to_string();
+        assert!(err.contains("a token behind"), "{err}");
     }
 
     /// Wrapping twice is refused: two histories over one generation

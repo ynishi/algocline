@@ -10,6 +10,7 @@
 //! alc.nn.sampler.top_k_top_p(top_k, top_p, temp, seed)     -> Sampler
 //! alc.nn.sampler.lua(function(logits) ... end)             -> Sampler
 //! alc.nn.sampler.constrained(sampler, constraint)          -> Sampler
+//! alc.nn.sampler.penalized(sampler, opts?)                 -> Sampler
 //!
 //! alc.nn.constraint.stop_tokens({ id, ... })               -> Constraint
 //! alc.nn.constraint.allow_list({ id, ... })                -> Constraint
@@ -86,7 +87,8 @@ use std::sync::{Mutex, MutexGuard, TryLockError};
 
 use algocline_nn::sampling::{
     AllowListConstraint, ConstrainedSampler, Constraint, GreedySampler, JsonSchemaConstraint,
-    RegexConstraint, Sampler, StopTokensConstraint, TemperatureSampler, TopKTopPSampler,
+    PenalizedSampler, Penalties, RegexConstraint, Sampler, StopTokensConstraint,
+    TemperatureSampler, TopKTopPSampler,
 };
 use candle_core::{Result as CandleResult, Tensor};
 use mlua::prelude::*;
@@ -118,6 +120,15 @@ enum ErasedSampler {
     /// A Layer 2 composition, kept distinguishable so `is_done` / `reset`
     /// stay reachable.
     Constrained(ErasedConstrained),
+    /// A penalised sampler. Its own `reset` clears the token history,
+    /// which is why it is not erased into `Plain`.
+    Penalized(PenalizedSampler<BoxedSampler>),
+    /// Both, in the order the penalty wants: the penalty outside, so it
+    /// reads logits the constraint has already masked and never spends
+    /// itself on a token the constraint forbids. Two wrappers rather
+    /// than one arm apiece, because `is_done` lives on the inner
+    /// constrained sampler and has to stay reachable through the outer.
+    PenalizedConstrained(PenalizedSampler<ErasedConstrained>),
 }
 
 impl ErasedSampler {
@@ -125,6 +136,31 @@ impl ErasedSampler {
         match self {
             Self::Plain(sampler) => sampler.sample(logits),
             Self::Constrained(sampler) => sampler.sample(logits),
+            Self::Penalized(sampler) => sampler.sample(logits),
+            Self::PenalizedConstrained(sampler) => sampler.sample(logits),
+        }
+    }
+
+    /// Count a token this sampler did not produce.
+    ///
+    /// Only a penalised sampler has anywhere to put it; on the others
+    /// it is refused rather than ignored, since a caller feeding a
+    /// history to a sampler that keeps none is a caller who believes
+    /// the penalties are running.
+    fn observe(&mut self, token: u32) -> Result<(), &'static str> {
+        match self {
+            Self::Penalized(sampler) => {
+                sampler.observe(token);
+                Ok(())
+            }
+            Self::PenalizedConstrained(sampler) => {
+                sampler.observe(token);
+                Ok(())
+            }
+            Self::Plain(_) | Self::Constrained(_) => Err(
+                "this sampler keeps no token history; build it with alc.nn.sampler.penalized \
+                 to give it one",
+            ),
         }
     }
 
@@ -137,8 +173,9 @@ impl ErasedSampler {
     /// sampler.
     fn is_done(&self) -> bool {
         match self {
-            Self::Plain(_) => false,
+            Self::Plain(_) | Self::Penalized(_) => false,
             Self::Constrained(sampler) => sampler.is_done(),
+            Self::PenalizedConstrained(sampler) => sampler.inner().is_done(),
         }
     }
 
@@ -147,8 +184,14 @@ impl ErasedSampler {
     /// deliberately *not* an error, so a loop that resets between
     /// generations works with either kind of sampler.
     fn reset(&mut self) {
-        if let Self::Constrained(sampler) = self {
-            sampler.reset();
+        match self {
+            Self::Plain(_) => {}
+            Self::Constrained(sampler) => sampler.reset(),
+            Self::Penalized(sampler) => sampler.reset(),
+            Self::PenalizedConstrained(sampler) => {
+                sampler.reset();
+                sampler.inner_mut().reset();
+            }
         }
     }
 }
@@ -200,6 +243,15 @@ impl SamplerHandle {
         sampler.reset();
         Ok(())
     }
+
+    fn observe(&self, token: u32) -> LuaResult<()> {
+        const ENTRY: &str = "alc.nn sampler:observe";
+        let mut slot = lock_slot(&self.inner, ENTRY, "sampler")?;
+        let sampler = slot.as_mut().ok_or_else(|| moved_sampler(ENTRY))?;
+        sampler
+            .observe(token)
+            .map_err(|why| LuaError::external(format!("{ENTRY}: {why}")))
+    }
 }
 
 impl mlua::UserData for SamplerHandle {
@@ -214,6 +266,7 @@ impl mlua::UserData for SamplerHandle {
         });
         methods.add_method("is_done", |_, this, ()| this.is_done());
         methods.add_method("reset", |_, this, ()| this.reset());
+        methods.add_method("observe", |_, this, token: u32| this.observe(token));
     }
 }
 
@@ -371,6 +424,13 @@ pub(super) fn register_sampler_ns(
     )?;
     sampler_ns.set("constrained", constrained)?;
 
+    let penalized = lua.create_function(
+        |_, (inner, opts): (LuaUserDataRef<SamplerHandle>, Option<LuaTable>)| {
+            penalized_impl(&inner, opts.as_ref())
+        },
+    )?;
+    sampler_ns.set("penalized", penalized)?;
+
     nn_table.set("sampler", sampler_ns)?;
 
     let constraint_ns = lua.create_table()?;
@@ -453,10 +513,95 @@ fn constrained_impl(
     let sampler: BoxedSampler = match sampler {
         ErasedSampler::Plain(sampler) => sampler,
         ErasedSampler::Constrained(sampler) => Box::new(sampler),
+        // A penalised sampler constrained afterwards keeps its history
+        // and its penalties; the mask simply lands on logits it has
+        // already adjusted. The recommended order is the other way
+        // round (see `ErasedSampler::PenalizedConstrained`), but this
+        // one is coherent and is not worth refusing.
+        ErasedSampler::Penalized(sampler) => Box::new(sampler),
+        ErasedSampler::PenalizedConstrained(sampler) => Box::new(sampler),
     };
     Ok(SamplerHandle::new(ErasedSampler::Constrained(
         ConstrainedSampler::new(sampler, constraint),
     )))
+}
+
+/// Read `{ repetition, frequency, presence, window }` off a Lua table.
+///
+/// Every key is optional and every default is "off", so an omitted
+/// table is a wrapper that changes nothing — which is worth allowing,
+/// because it lets a caller build the sampler once and decide the
+/// penalties from configuration without branching on whether any were
+/// set.
+fn penalties_from_opts(entry: &str, opts: Option<&LuaTable>) -> LuaResult<Penalties> {
+    let mut p = Penalties::default();
+    let Some(t) = opts else {
+        return Ok(p);
+    };
+    if let Some(v) = t.get::<Option<f32>>("repetition")? {
+        p.repetition = v;
+    }
+    if let Some(v) = t.get::<Option<f32>>("frequency")? {
+        p.frequency = v;
+    }
+    if let Some(v) = t.get::<Option<f32>>("presence")? {
+        p.presence = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("window")? {
+        p.window = Some(v);
+    }
+    // The numeric refusals live in `Penalties::validate`, reached when
+    // the sampler is built; this one is about the shape of the table.
+    let _ = entry;
+    Ok(p)
+}
+
+/// `alc.nn.sampler.penalized(sampler, opts?)` — wrap a sampler so what
+/// it has already produced weighs on what it produces next.
+///
+/// Consumes the inner handle, exactly as
+/// [`constrained_impl`] does and for the same reason: two Lua handles
+/// onto one sampler would each hold half of a history.
+fn penalized_impl(inner: &SamplerHandle, opts: Option<&LuaTable>) -> LuaResult<SamplerHandle> {
+    const ENTRY: &str = "alc.nn.sampler.penalized";
+    let penalties = penalties_from_opts(ENTRY, opts)?;
+    let history: Vec<u32> = match opts {
+        Some(t) => t.get::<Option<Vec<u32>>>("history")?.unwrap_or_default(),
+        None => Vec::new(),
+    };
+
+    let mut slot = lock_slot(&inner.inner, ENTRY, "sampler")?;
+    if slot.is_none() {
+        return Err(moved_sampler(ENTRY));
+    }
+    let Some(sampler) = slot.take() else {
+        return Err(LuaError::external(format!(
+            "{ENTRY}: internal error: a handle emptied itself between the check and the move"
+        )));
+    };
+
+    let wrapped = match sampler {
+        // A constrained sampler keeps its own arm so `is_done` survives
+        // the wrap.
+        ErasedSampler::Constrained(constrained) => ErasedSampler::PenalizedConstrained(
+            PenalizedSampler::with_history(constrained, penalties, &history)
+                .map_err(|e| LuaError::external(format!("{ENTRY}: {e}")))?,
+        ),
+        ErasedSampler::Plain(plain) => ErasedSampler::Penalized(
+            PenalizedSampler::with_history(plain, penalties, &history)
+                .map_err(|e| LuaError::external(format!("{ENTRY}: {e}")))?,
+        ),
+        // Already penalised: refused rather than stacked. Two histories
+        // over one generation would each hold every token and the
+        // penalties would apply twice, which no caller means.
+        ErasedSampler::Penalized(_) | ErasedSampler::PenalizedConstrained(_) => {
+            return Err(LuaError::external(format!(
+                "{ENTRY}: this sampler is already penalised; set every penalty in one call \
+                 rather than wrapping twice, which would count each token in two histories"
+            )))
+        }
+    };
+    Ok(SamplerHandle::new(wrapped))
 }
 
 /// Resolve a constraint's vocabulary.
@@ -566,6 +711,97 @@ mod tests {
             1,
             "reset must leave a plain sampler usable"
         );
+    }
+
+    /// A penalised sampler pushes down what it has already produced,
+    /// and `reset` gives it a clean history.
+    #[test]
+    fn penalized_sampler_counts_its_own_output() {
+        let inner = SamplerHandle::plain(GreedySampler);
+        let lua = Lua::new();
+        let opts = lua.create_table().expect("opts");
+        opts.set("presence", 100.0).expect("presence");
+        let handle = penalized_impl(&inner, Some(&opts)).expect("wrap");
+
+        let row = logits(&[2.0, 1.0, 0.5]);
+        assert_eq!(handle.sample(&row).expect("first"), 0);
+        assert_eq!(
+            handle.sample(&row).expect("second"),
+            1,
+            "the first pick now carries the presence penalty"
+        );
+        handle.reset().expect("reset");
+        assert_eq!(
+            handle.sample(&row).expect("after reset"),
+            0,
+            "reset clears the history the penalties read"
+        );
+
+        let err = inner
+            .sample(&row)
+            .expect_err("the wrapped handle is spent")
+            .to_string();
+        assert!(err.contains("moved"), "unexpected error: {err}");
+    }
+
+    /// Wrapping a constrained sampler keeps `is_done` reachable — the
+    /// generation loop polls it, and losing it to the outer wrapper
+    /// would strand every constrained generation at its token budget.
+    #[test]
+    fn penalized_over_constrained_keeps_is_done() {
+        let inner = SamplerHandle::plain(GreedySampler);
+        let constraint = ConstraintHandle::new(StopTokensConstraint::new(vec![1]));
+        let constrained = constrained_impl(&inner, &constraint).expect("compose");
+        let lua = Lua::new();
+        let opts = lua.create_table().expect("opts");
+        opts.set("frequency", 0.5).expect("frequency");
+        let handle = penalized_impl(&constrained, Some(&opts)).expect("wrap");
+
+        assert!(!handle.is_done().expect("not done yet"));
+        assert_eq!(handle.sample(&logits(&[0.1, 3.2, 0.5])).expect("sample"), 1);
+        assert!(handle.is_done().expect("stop token reached"));
+        handle.reset().expect("reset");
+        assert!(!handle.is_done().expect("reset clears the prefix too"));
+    }
+
+    /// `observe` reaches a penalised sampler and is refused on one that
+    /// keeps no history — a caller feeding tokens to a sampler that
+    /// discards them believes the penalties are running.
+    #[test]
+    fn observe_needs_a_sampler_that_keeps_a_history() {
+        let plain = SamplerHandle::plain(GreedySampler);
+        let err = plain
+            .observe(0)
+            .expect_err("a plain sampler keeps nothing")
+            .to_string();
+        assert!(err.contains("keeps no token history"), "{err}");
+
+        let inner = SamplerHandle::plain(GreedySampler);
+        let lua = Lua::new();
+        let opts = lua.create_table().expect("opts");
+        opts.set("presence", 100.0).expect("presence");
+        let handle = penalized_impl(&inner, Some(&opts)).expect("wrap");
+        handle.observe(0).expect("observe");
+        assert_eq!(
+            handle.sample(&logits(&[2.0, 1.0])).expect("sample"),
+            1,
+            "the observed token has to weigh the same as a sampled one"
+        );
+    }
+
+    /// Wrapping twice is refused: two histories over one generation
+    /// would each hold every token and apply the penalties twice.
+    #[test]
+    fn a_sampler_is_not_penalised_twice() {
+        let inner = SamplerHandle::plain(GreedySampler);
+        let once = penalized_impl(&inner, None).expect("first wrap");
+        // `SamplerHandle` is deliberately not `Debug`, so the error is
+        // read out by hand rather than through `expect_err`.
+        let err = match penalized_impl(&once, None) {
+            Ok(_) => panic!("a second wrap must be refused"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("already penalised"), "{err}");
     }
 
     /// The move is observable from both sides: the composed sampler works

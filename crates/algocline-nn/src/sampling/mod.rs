@@ -48,6 +48,7 @@
 
 pub mod constraint;
 pub mod json_schema;
+pub mod penalty;
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
@@ -59,6 +60,7 @@ pub use constraint::{
     TokenMask,
 };
 pub use json_schema::JsonSchemaConstraint;
+pub use penalty::{apply_penalties, PenalizedSampler, Penalties};
 
 /// Next-token sampler.
 ///

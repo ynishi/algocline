@@ -1665,6 +1665,7 @@ impl mlua::UserData for Gpt2Handle {
         // `handle:embed(tokens, opts?)` — the pooled hidden state, so a
         // model trained here can be used as an encoder.
         super::nn_gen::add_gpt2_embed_method(methods);
+        super::nn_gen::add_gpt2_export_gguf_method(methods);
     }
 }
 
@@ -1723,6 +1724,30 @@ impl Gpt2Handle {
     /// stateless session history.
     pub(super) fn ctx(&self) -> usize {
         self.ctx
+    }
+
+    /// The shape and weights a GGUF export reads.
+    ///
+    /// One accessor rather than six: the exporter needs all of them
+    /// together and nothing else needs any of them, so widening the
+    /// handle's surface item by item would be the larger change.
+    pub(super) fn gguf_source(&self) -> super::nn_gen::GgufSource {
+        super::nn_gen::GgufSource {
+            family: "gpt2",
+            variant: self.variant.clone(),
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            // The reference GPT-2 MLP is 4x the hidden size. A custom
+            // spec may say otherwise, which is one reason the exporter
+            // refuses a custom variant.
+            ffn_dim: self.dim * 4,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            rope_theta: None,
+            varmap: self.varmap(),
+        }
     }
 
     /// Test-only: strip the `VarMap` off a from-scratch handle so it
@@ -2389,6 +2414,7 @@ impl mlua::UserData for LlamaHandle {
         // why a session (with its own KV cache) is the only decode
         // entry point exposed to Lua.
         super::nn_gen::add_generate_session_method(methods);
+        super::nn_gen::add_llama_export_gguf_method(methods);
     }
 }
 
@@ -2470,6 +2496,7 @@ impl mlua::UserData for TinyLlamaHandle {
         // Stateless-session mirror of the Gpt2Handle registration.
         super::nn_gen::add_tinyllama_generate_session_method(methods);
         super::nn_gen::add_tinyllama_embed_method(methods);
+        super::nn_gen::add_tinyllama_export_gguf_method(methods);
     }
 }
 
@@ -2511,6 +2538,39 @@ impl TinyLlamaHandle {
     /// Vocabulary size; mirrors [`Gpt2Handle::vocab`].
     pub(super) fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// The shape and weights a GGUF export reads. See
+    /// [`Gpt2Handle::gguf_source`].
+    pub(super) fn gguf_source(&self) -> LuaResult<super::nn_gen::GgufSource> {
+        Ok(super::nn_gen::GgufSource {
+            family: "tinyllama",
+            variant: self.variant.clone(),
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            ffn_dim: self.hidden_dim()?,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            // TinyLlama's reference `rope_theta`, which every preset
+            // here is built with.
+            rope_theta: Some(10_000.0),
+            varmap: self.varmap(),
+        })
+    }
+
+    /// SwiGLU intermediate size, read off the live model.
+    ///
+    /// Not a handle field: it is the one shape number the handle does
+    /// not carry, and the only caller (the GGUF export, which has to
+    /// write `llama.feed_forward_length`) can afford the lock.
+    pub(super) fn hidden_dim(&self) -> LuaResult<usize> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| LuaError::external(format!("alc.nn tinyllama handle: model lock: {e}")))?;
+        Ok(guard.config().hidden_dim)
     }
 
     /// Context window; mirrors [`Gpt2Handle::ctx`].
@@ -5843,6 +5903,10 @@ impl mlua::UserData for NnHandle {
         super::nn_gen::add_nn_handle_generate_session_method(methods);
         // `handle:embed(tokens, opts?)` on the union, for the same reason.
         super::nn_gen::add_nn_handle_embed_method(methods);
+        // `handle:export_gguf(path, opts?)` — the weights in the format
+        // llama.cpp / Ollama read, which is the only way anything
+        // trained here leaves this repository runnable.
+        super::nn_gen::add_nn_handle_export_gguf_method(methods);
     }
 }
 

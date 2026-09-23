@@ -1626,6 +1626,57 @@ fn eval_with_handle<T: mlua::FromLuaMulti>(lua: &Lua, body: &str, what: &str) ->
         .unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
+/// `handle:export_gguf` writes a file that reports what went into it,
+/// and refuses the handles that have nothing to write.
+#[test]
+fn alc_nn_handle_export_gguf_writes_and_reports() {
+    let lua = nn_vm();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("tiny.gguf");
+    let path_str = path.to_string_lossy().into_owned();
+    lua.globals().set("out_path", path_str.clone()).unwrap();
+
+    let (tensors, arch, has_tok): (usize, String, bool) = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local r = h:export_gguf(out_path)
+        assert(r.path == out_path, "the report names the file it wrote")
+        return r.tensors, r.architecture, r.tokenizer
+    "#,
+        )
+        .eval()
+        .expect("export_gguf");
+    assert!(tensors > 0, "a model has tensors");
+    assert_eq!(arch, "gpt2");
+    assert!(!has_tok, "no tokenizer was supplied");
+    assert!(path.exists(), "the file is on disk");
+
+    // The refusals this surface owns.
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local adapter = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+        return {
+            err(function() return h:export_gguf(out_path, { precision = "int4" }) end),
+            err(function() return h:export_gguf(out_path, { tokenizer = "/nope/none.json" }) end),
+            err(function() return adapter:export_gguf(out_path) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("export_gguf refusals");
+    assert!(errors[0].contains("unknown precision"), "{}", errors[0]);
+    assert!(errors[1].contains("names no file"), "{}", errors[1]);
+    assert!(errors[2].contains("nothing here to write"), "{}", errors[2]);
+}
+
 /// `handle:embed` answers with one vector per call, its length the
 /// model's hidden size, and the three poolings are three different
 /// answers rather than three names for one.

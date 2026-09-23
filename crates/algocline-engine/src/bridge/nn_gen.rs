@@ -99,10 +99,15 @@ use std::sync::{Arc, Mutex};
 use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
 use algocline_nn::arch::KvCache;
 use algocline_nn::arch::{AllowedSets, CondIndex, Gpt2Model, TinyLlamaModel};
+use std::path::Path;
+
+use algocline_nn::gguf::{export_gguf, parse_precision, GgufArch, GgufSpec, PRECISION_NAMES};
 use algocline_nn::pooling::{pool, Pooling};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
+use candle_nn::VarMap;
 use mlua::prelude::*;
 
 use super::nn_card::{Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle};
@@ -1273,6 +1278,221 @@ fn embed_tinyllama(
 
 /// Error prefix for the embedding surface.
 const EMBED_ERR_PREFIX: &str = "alc.nn handle:embed";
+
+/// Error prefix for the GGUF export surface.
+const GGUF_ERR_PREFIX: &str = "alc.nn handle:export_gguf";
+
+/// The shape and weights a GGUF export reads off a handle.
+///
+/// Built by each handle type, so this module needs none of their
+/// private fields and they need none of the export's vocabulary beyond
+/// this one struct.
+pub(super) struct GgufSource {
+    /// Architecture family, as the handle names it.
+    pub family: &'static str,
+    /// Full `family-variant`, recorded as the model's name.
+    pub variant: String,
+    pub layers: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub dim: usize,
+    pub ffn_dim: usize,
+    pub ctx: usize,
+    pub vocab: usize,
+    /// RoPE base, for architectures that rotate.
+    pub rope_theta: Option<f32>,
+    /// The weights, or `None` for a handle whose tensors live behind an
+    /// mmap this bridge never named.
+    pub varmap: Option<Arc<VarMap>>,
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the GPT-2 handle.
+pub(super) fn add_gpt2_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            export_gguf_impl(lua, this.gguf_source(), &path, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the TinyLlama handle.
+pub(super) fn add_tinyllama_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            export_gguf_impl(lua, this.gguf_source()?, &path, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the inference-only
+/// adapter handle, where it refuses.
+///
+/// Registered rather than left absent so the caller gets the reason
+/// instead of `attempt to call a nil value`.
+pub(super) fn add_llama_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<LlamaHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |_, _this, (_path, _opts): (String, Option<LuaTable>)| -> LuaResult<LuaTable> {
+            Err(LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: the llama adapter holds its weights behind an mmap this \
+                 bridge never named, so there is nothing here to write; export from a \
+                 trainable handle"
+            )))
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the union handle —
+/// what a Card reloaded through `alc.nn.card.load_handle` carries.
+pub(super) fn add_nn_handle_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<NnHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            let source = match this {
+                NnHandle::Gpt2(h) => h.gguf_source(),
+                NnHandle::TinyLlama(h) => h.gguf_source()?,
+                NnHandle::Llama(_) => {
+                    return Err(LuaError::external(format!(
+                        "{GGUF_ERR_PREFIX}: the llama adapter holds its weights behind an \
+                         mmap this bridge never named, so there is nothing here to write; \
+                         export from a trainable handle"
+                    )))
+                }
+            };
+            export_gguf_impl(lua, source, &path, opts.as_ref())
+        },
+    );
+}
+
+/// Write this handle's weights out as GGUF, and report what was
+/// written.
+fn export_gguf_impl(
+    lua: &Lua,
+    source: GgufSource,
+    path: &str,
+    opts: Option<&LuaTable>,
+) -> LuaResult<LuaTable> {
+    let precision = match opts
+        .map(|t| t.get::<Option<String>>("precision"))
+        .transpose()?
+    {
+        Some(Some(name)) => parse_precision(&name).ok_or_else(|| {
+            LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: unknown precision '{name}' (expected one of: {})",
+                PRECISION_NAMES.join(" / ")
+            ))
+        })?,
+        _ => GgmlDType::F32,
+    };
+    // A path to an HF `tokenizer.json`, not a preset name: a
+    // `UserData` method has no view of the app directory the preset
+    // cache lives under. The cache is at
+    // `<app>/nn/tokenizers/<preset>.json`, which is what a caller
+    // wanting the preset's own vocabulary points at.
+    //
+    // Refused if it does not exist, rather than writing a file with no
+    // vocabulary in it — llama.cpp will not load one, and the failure
+    // would surface there instead of here.
+    let tokenizer = match opts
+        .map(|t| t.get::<Option<String>>("tokenizer"))
+        .transpose()?
+    {
+        Some(Some(file)) => {
+            let file = PathBuf::from(file);
+            if !file.is_file() {
+                return Err(LuaError::external(format!(
+                    "{GGUF_ERR_PREFIX}: opts.tokenizer names no file at {}; pass the path to \
+                     an HF tokenizer.json (the preset cache is <app>/nn/tokenizers/<preset>.json)",
+                    file.display()
+                )));
+            }
+            Some(file)
+        }
+        _ => None,
+    };
+
+    let (spec, varmap) = gguf_spec(source)?;
+    let report = export_gguf(
+        &varmap,
+        &spec,
+        precision,
+        tokenizer.as_deref(),
+        Path::new(path),
+    )
+    .map_err(|e| LuaError::external(format!("{GGUF_ERR_PREFIX}: {e}")))?;
+
+    let out = lua.create_table()?;
+    out.set("path", path)?;
+    out.set("tensors", report.tensors)?;
+    out.set("metadata", report.metadata)?;
+    out.set("tokenizer", report.tokenizer)?;
+    out.set("architecture", spec.arch.name())?;
+    Ok(out)
+}
+
+/// A handle's source to the export spec and the weights.
+///
+/// Refused where the handle cannot answer: a handle built
+/// `pretrained = true` holds its tensors behind an mmap this bridge
+/// never named, so there is nothing here to write under the names GGUF
+/// wants. Exporting those means loading the weights into a
+/// from-scratch handle first, and the message says so rather than
+/// writing an empty file.
+fn gguf_spec(source: GgufSource) -> LuaResult<(GgufSpec, Arc<VarMap>)> {
+    let arch = match source.family {
+        "gpt2" => GgufArch::Gpt2,
+        "tinyllama" => GgufArch::Llama,
+        other => {
+            return Err(LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: no GGUF key set for architecture family `{other}`"
+            )))
+        }
+    };
+    if source.variant.contains("custom") {
+        return Err(LuaError::external(format!(
+            "{GGUF_ERR_PREFIX}: a custom architecture's shape is not one GGUF has a key set \
+             for — its feed-forward ratio, norm kind and position scheme are this crate's \
+             own, and a reader would assemble the reference graph instead"
+        )));
+    }
+    let varmap = source.varmap.clone().ok_or_else(|| {
+        LuaError::external(format!(
+            "{GGUF_ERR_PREFIX}: this handle was built with pretrained = true and carries no \
+             VarMap, so its tensors have no names here; load the weights into a \
+             from-scratch handle to export them"
+        ))
+    })?;
+    Ok((
+        GgufSpec {
+            arch,
+            layers: source.layers,
+            heads: source.heads,
+            kv_heads: source.kv_heads,
+            dim: source.dim,
+            ffn_dim: source.ffn_dim,
+            ctx: source.ctx,
+            vocab: source.vocab,
+            eps: 1e-5,
+            rope_theta: source.rope_theta,
+            name: source.variant,
+        },
+        varmap,
+    ))
+}
 
 /// Check an embedding input: non-empty, in vocabulary, inside the
 /// context window.

@@ -29,6 +29,7 @@
 
 pub mod arch;
 pub mod card;
+pub mod gguf;
 mod hub;
 pub mod merged;
 pub mod pooling;

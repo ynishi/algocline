@@ -3033,7 +3033,12 @@ mod tests {
         let loss = CrossEntropyLoss::new();
         let tmp = TempDir::new().unwrap();
 
-        let weights_after = |grad_checkpoint: bool, prefix: &str| -> BTreeMap<String, Vec<f32>> {
+        // `(before, after)` per run: a comparison of two runs that both
+        // failed to train agrees perfectly, which is what a version of
+        // this test that only compared the ends could not tell.
+        let weights_after = |grad_checkpoint: bool,
+                             prefix: &str|
+         -> (BTreeMap<String, Vec<f32>>, BTreeMap<String, Vec<f32>>) {
             let cfg = Gpt2Config {
                 layers: 2,
                 heads: 2,
@@ -3051,6 +3056,16 @@ mod tests {
             // difference at the end is the checkpointing.
             let vs = crate::arch::seeded_var_builder(&vm, 4711, cfg.dtype, &cfg.device);
             let model = Gpt2Model::new(&cfg, vs).unwrap();
+            let snapshot = |vm: &VarMap| -> BTreeMap<String, Vec<f32>> {
+                let data = vm.data().lock().unwrap();
+                data.iter()
+                    .map(|(name, var)| {
+                        let t = var.as_tensor().flatten_all().unwrap();
+                        (name.clone(), t.to_vec1::<f32>().unwrap())
+                    })
+                    .collect()
+            };
+            let before = snapshot(&vm);
             let mut ds = overfit_dataset();
             let ft = FullFtConfig {
                 lr: 5e-3,
@@ -3072,17 +3087,26 @@ mod tests {
                 None,
             )
             .expect("run");
-            let data = vm.data().lock().unwrap();
-            data.iter()
-                .map(|(name, var)| {
-                    let t = var.as_tensor().flatten_all().unwrap();
-                    (name.clone(), t.to_vec1::<f32>().unwrap())
-                })
-                .collect()
+            (before, snapshot(&vm))
         };
 
-        let plain = weights_after(false, "plain");
-        let checkpointed = weights_after(true, "ckpt");
+        let (plain_before, plain) = weights_after(false, "plain");
+        let (_, checkpointed) = weights_after(true, "ckpt");
+
+        // Four steps have to have moved something, or the agreement
+        // below is between two runs that did nothing.
+        let moved = plain_before
+            .iter()
+            .map(|(name, before)| {
+                let after = &plain[name];
+                before
+                    .iter()
+                    .zip(after)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-6, "training moved nothing: max change {moved}");
         assert_eq!(plain.len(), checkpointed.len());
         assert!(!plain.is_empty());
         for (name, values) in &plain {

@@ -116,7 +116,7 @@ impl SimpleBackend for SeededVarMap {
         // overwrite the value it was created with. `Init::Const(0.)`
         // rather than `h`, so the throwaway creation does not draw from
         // the device RNG this exists to bypass.
-        let placeholder = self.vm.get(s.clone(), name, Init::Const(0.), dtype, dev)?;
+        let registered = self.vm.get(s.clone(), name, Init::Const(0.), dtype, dev)?;
         let values = self.draw(&s, &h, dtype, dev)?;
         let data = self
             .vm
@@ -130,10 +130,20 @@ impl SimpleBackend for SeededVarMap {
         })?;
         var.set(&values)?;
         drop(data);
-        // The tensor the caller gets has to be the one the `Var` now
-        // holds, not the zeros handed back at registration.
-        let _ = placeholder;
-        Ok(values)
+        // **The registered tensor, not the drawn one.** `VarMap::get`
+        // hands back a clone of the `Var`'s own tensor: same storage,
+        // same id, and `is_variable`. `Var::set` writes through that
+        // storage, so `registered` already holds the drawn values.
+        //
+        // Returning `values` instead — a fresh `Tensor::from_vec`, with
+        // its own storage and `is_variable == false` — hands the model
+        // parameters that are not the map's `Var`s. Nothing errors:
+        // `backward` walks no node below a non-`Var` leaf, so no
+        // gradient is produced, the optimizer skips every slot, and the
+        // model trains not at all while reporting a loss and writing a
+        // checkpoint. Measured before this line was fixed: ten steps at
+        // `lr = 5e-2` moved the weights by exactly zero.
+        Ok(registered)
     }
 
     fn get_unchecked(&self, name: &str, dtype: DType, dev: &Device) -> CandleResult<Tensor> {
@@ -283,6 +293,96 @@ mod tests {
         let vs = seeded_var_builder(&vm, seed, cfg.dtype, &cfg.device);
         let _ = Gpt2Model::new(&cfg, vs).expect("build gpt2");
         vm
+    }
+
+    /// A seeded model has to be the map's own parameters, or it never
+    /// trains.
+    ///
+    /// The regression this exists for: the backend returned the tensor
+    /// it had drawn instead of the one the `VarMap` registered. The two
+    /// hold the same numbers and are not the same object — the drawn
+    /// one is not a `Var` and shares no storage with one — so the
+    /// backward walked nothing, the optimizer skipped every slot, and a
+    /// seeded run reported a loss and wrote a checkpoint while moving
+    /// the weights by exactly zero.
+    ///
+    /// Asserted here rather than left to the training tests, all of
+    /// which compared two seeded runs against each other and therefore
+    /// agreed perfectly while both did nothing.
+    #[test]
+    fn a_seeded_model_holds_the_maps_own_variables() {
+        let vm = build_with_seed(9);
+        let data = vm.data().lock().unwrap();
+        assert!(!data.is_empty());
+        for (name, var) in data.iter() {
+            assert!(
+                var.as_tensor().is_variable(),
+                "`{name}` is not a variable, so no gradient will reach it"
+            );
+        }
+    }
+
+    /// And the end-to-end statement of the same thing: a seeded run
+    /// moves its weights.
+    #[test]
+    fn a_seeded_model_trains() {
+        use crate::train::{
+            run_full_ft, CrossEntropyLoss, DatasetOpts, FullFtConfig, TokenizedDataset,
+            TrainingLease,
+        };
+        use std::sync::Arc;
+
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = seeded_var_builder(&vm, 4242, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).expect("build");
+        let before = flat(&vm);
+
+        let row: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| row.clone()).take(40).collect();
+        let mut ds = TokenizedDataset::new(
+            rows,
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                ..DatasetOpts::default()
+            },
+        );
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &FullFtConfig {
+                lr: 5e-2,
+                steps: 10,
+                warmup: 0,
+                ..FullFtConfig::default()
+            },
+            &CrossEntropyLoss::new(),
+            tmp.path(),
+            "seeded",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("run");
+
+        let after = flat(&vm);
+        let moved = before
+            .iter()
+            .map(|(name, values)| {
+                values
+                    .iter()
+                    .zip(&after[name])
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            moved > 1e-4,
+            "ten steps at lr 5e-2 moved the weights by {moved}"
+        );
     }
 
     /// The point of the whole module: same seed, same model.

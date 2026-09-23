@@ -161,8 +161,27 @@ where
     Ok((loss_value, grads))
 }
 
+/// How many of `vm`'s variables `grads` holds a gradient for.
+///
+/// Exists because [`max_grad_gap`] answers `0.0` when the two stores
+/// are *both* empty, which is a comparison that passes without
+/// comparing anything — and did, silently, while a bug upstream was
+/// producing no gradients at all. A test asserting the gap must assert
+/// this too.
+pub fn grad_coverage(vm: &VarMap, grads: &GradStore) -> usize {
+    let names = crate::train::optstate::names_by_tensor_id(vm);
+    names
+        .keys()
+        .filter(|id| grads.get_id(**id).is_some())
+        .count()
+}
+
 /// Sum of `|a - b|`'s maximum over every variable both stores hold, for
 /// a test comparing a checkpointed step against an ordinary one.
+///
+/// Answers `0.0` for two stores that hold nothing, so a caller has to
+/// pair it with [`grad_coverage`]; the pair is what makes "the two
+/// agree" mean something.
 ///
 /// Lives here rather than in the test module because both this crate's
 /// tests and a downstream one want the same comparison, and a second
@@ -318,6 +337,19 @@ mod tests {
         assert!(
             (value - plain_value).abs() < 1e-6,
             "loss differs: {value} vs {plain_value}"
+        );
+        // Both paths must actually have produced gradients: comparing
+        // two empty stores agrees perfectly and proves nothing.
+        let parameters = vm.data().lock().unwrap().len();
+        assert_eq!(
+            grad_coverage(&vm, &plain_grads),
+            parameters,
+            "the ordinary backward left some parameter without a gradient"
+        );
+        assert_eq!(
+            grad_coverage(&vm, &ckpt_grads),
+            parameters,
+            "the checkpointed backward left some parameter without a gradient"
         );
         let gap = max_grad_gap(&vm, &plain_grads, &ckpt_grads).unwrap();
         assert!(

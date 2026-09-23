@@ -160,11 +160,19 @@ pub fn beam_search<M: BeamModel>(
                     "beam_search: the model answered with an empty distribution".into(),
                 ));
             }
-            // Only the top `beams` continuations of each beam can
-            // survive the cut below, so the rest are not worth
-            // materialising — a full sort per beam over a 50k
-            // vocabulary would dominate the search.
-            for (id, score) in top_k(&log_probs, opts.beams) {
+            // Twice the width, not the width: a continuation that
+            // lands on `eos` is moved out of `live` after the cut, so
+            // taking exactly `beams` per beam lets finished beams eat
+            // the search's width and never give it back — a run whose
+            // first step finds one eos decays to `beams - 1` live
+            // beams for the rest of its length, and to greedy decoding
+            // in the limit. `2 * beams` guarantees `beams` non-eos
+            // candidates survive, which is what every reference
+            // implementation takes and for this reason.
+            //
+            // Still a partial selection rather than a full sort: the
+            // rest of a 50k-wide row cannot survive the cut either way.
+            for (id, score) in top_k(&log_probs, opts.beams * 2) {
                 let mut tokens = beam.tokens.clone();
                 tokens.push(id);
                 let ends = opts.eos == Some(id);
@@ -181,13 +189,16 @@ pub fn beam_search<M: BeamModel>(
                 .partial_cmp(&a.ranked(prompt_len, opts.length_penalty))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        candidates.truncate(opts.beams);
 
-        live = Vec::with_capacity(candidates.len());
+        // The cut keeps `beams` *live* beams, and takes finished ones
+        // as they come without charging them against that count — a
+        // finished beam is no longer being searched, so holding a slot
+        // for it would shrink the search.
+        live = Vec::with_capacity(opts.beams);
         for beam in candidates {
             if beam.finished {
                 finished.push(beam);
-            } else {
+            } else if live.len() < opts.beams {
                 live.push(beam);
             }
         }
@@ -360,6 +371,40 @@ mod tests {
         assert!(
             beams.iter().any(|b| !b.finished && b.tokens.len() == 4),
             "the unfinished beams ran to the budget: {beams:?}"
+        );
+    }
+
+    /// A finished beam must not consume the search's width.
+    ///
+    /// The regression: the cut kept `beams` candidates *including* the
+    /// ones that had reached `eos`, and those were then moved out of
+    /// `live`. A run whose first step found an eos therefore searched
+    /// with one beam fewer for the rest of its length, and never
+    /// recovered — a `beams = 2` search silently became greedy
+    /// decoding from step 1.
+    ///
+    /// Counted through the model's calls, which is the only place the
+    /// live width is observable from outside.
+    #[test]
+    fn a_finished_beam_does_not_shrink_the_search() {
+        // Token 0 is both the most likely continuation and the eos, so
+        // every step produces one finished candidate. Three tokens, not
+        // two: with a two-token vocabulary there is only one non-eos
+        // continuation per beam and the width cannot be held by any
+        // implementation, which would make this test pass on the bug.
+        let mut scripted = Scripted::new(fixed(vec![vec![-0.1, -2.0, -2.5]], 1));
+        let opts = BeamOptions {
+            beams: 2,
+            max_new: 3,
+            length_penalty: 0.0,
+            eos: Some(0),
+        };
+        beam_search(&mut scripted, &[9], &opts).unwrap();
+        assert_eq!(
+            scripted.calls, 5,
+            "one forward at step 0 and two at each of the next two steps; \
+             {} means the live width collapsed",
+            scripted.calls
         );
     }
 

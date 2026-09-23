@@ -142,7 +142,9 @@ pub struct GgufReport {
     pub tensors: usize,
     /// Metadata entries written.
     pub metadata: usize,
-    /// Precision every tensor was quantized to.
+    /// Precision that was **asked for**. Per-channel vectors stay F32
+    /// whatever it says — see the norm rule in [`export_gguf`] — so
+    /// this is the request, not a description of every tensor.
     pub precision: GgmlDType,
     /// Whether a tokenizer was embedded. Without one the file needs an
     /// external vocabulary, which most readers will not accept.
@@ -198,7 +200,21 @@ pub fn export_gguf(
     let mut metadata = architecture_metadata(spec);
     let embedded = match tokenizer_json {
         Some(json) => {
-            metadata.extend(tokenizer_metadata(json, spec.arch)?);
+            let (keys, tokens) = tokenizer_metadata(json)?;
+            // The two vocabularies have to be the same vocabulary. A
+            // tokenizer shorter than the model's head leaves ids the
+            // file cannot name; a longer one names ids the head cannot
+            // produce. Either way a reader gets a file whose two halves
+            // disagree, and the disagreement shows up as wrong text
+            // rather than as an error.
+            if tokens != spec.vocab {
+                return Err(format!(
+                    "gguf export: the tokenizer has {tokens} tokens and the model was built \
+                     at vocab {}; a GGUF carries one vocabulary and these are two",
+                    spec.vocab
+                ));
+            }
+            metadata.extend(keys);
             true
         }
         None => false,
@@ -358,6 +374,10 @@ fn architecture_metadata(spec: &GgufSpec) -> Vec<(String, gguf_file::Value)> {
             format!("{arch}.attention.head_count_kv"),
             Value::U32(spec.kv_heads as u32),
         ),
+        // Written whether or not a tokenizer is embedded: without it an
+        // export carries no vocabulary size anywhere, which is one of
+        // the numbers `GgufSpec`'s doc promises the file holds.
+        (format!("{arch}.vocab_size"), Value::U32(spec.vocab as u32)),
     ];
     // The epsilon key is named after the normalisation the architecture
     // uses, because a reader looks for the one its own graph needs.
@@ -382,10 +402,11 @@ fn architecture_metadata(spec: &GgufSpec) -> Vec<(String, gguf_file::Value)> {
 /// merge list is what GGUF wants and that crate does not hand it back —
 /// and because a BPE `tokenizer.json` carries both halves verbatim,
 /// so there is nothing to reconstruct.
-fn tokenizer_metadata(
-    json: &Path,
-    arch: GgufArch,
-) -> Result<Vec<(String, gguf_file::Value)>, String> {
+///
+/// Returns the keys and the token count, which the caller checks
+/// against the model's own vocabulary.
+#[allow(clippy::type_complexity)]
+fn tokenizer_metadata(json: &Path) -> Result<(Vec<(String, gguf_file::Value)>, usize), String> {
     use gguf_file::Value;
     let text = std::fs::read_to_string(json)
         .map_err(|e| format!("gguf export: read tokenizer {}: {e}", json.display()))?;
@@ -418,6 +439,7 @@ fn tokenizer_metadata(
         }
     }
     let tokens: Vec<String> = by_id.into_iter().map(|(_, t)| t).collect();
+    let token_count = tokens.len();
 
     let merges: Vec<String> = match model.get("merges").and_then(|m| m.as_array()) {
         Some(list) => list
@@ -427,9 +449,14 @@ fn tokenizer_metadata(
                 // and `["a", "b"]` in newer ones; GGUF wants the first.
                 serde_json::Value::String(s) => Ok(s.clone()),
                 serde_json::Value::Array(pair) if pair.len() == 2 => {
-                    let a = pair[0].as_str().unwrap_or_default();
-                    let b = pair[1].as_str().unwrap_or_default();
-                    Ok(format!("{a} {b}"))
+                    match (pair[0].as_str(), pair[1].as_str()) {
+                        (Some(a), Some(b)) => Ok(format!("{a} {b}")),
+                        // Silently blanking a malformed pair writes the
+                        // merge `" "`, which a reader applies.
+                        _ => Err(format!(
+                            "gguf export: merge pair is not two strings: {entry}"
+                        )),
+                    }
                 }
                 other => Err(format!("gguf export: unreadable merge entry {other}")),
             })
@@ -437,24 +464,60 @@ fn tokenizer_metadata(
         None => Vec::new(),
     };
 
-    // Every token is "normal" (type 1) unless the file marks it
-    // otherwise; added tokens are the ones that are not.
+    // Every token is "normal" (type 1) until the file says otherwise.
+    // An added token is CONTROL (3) when it is marked `special` and
+    // USER_DEFINED (4) when it is not — the two are different
+    // instructions to a reader, and typing a plain vocabulary entry as
+    // a control token tells it never to split there.
     let mut token_type = vec![1i32; tokens.len()];
     if let Some(added) = parsed.get("added_tokens").and_then(|a| a.as_array()) {
         for entry in added {
-            if let Some(id) = entry.get("id").and_then(|i| i.as_u64()) {
-                if let Some(slot) = token_type.get_mut(id as usize) {
-                    // 3 = control, the type llama.cpp gives a special
-                    // token it must not split.
-                    *slot = 3;
-                }
-            }
+            let Some(id) = entry.get("id").and_then(|i| i.as_u64()) else {
+                continue;
+            };
+            let special = entry
+                .get("special")
+                .and_then(|s| s.as_bool())
+                .unwrap_or(false);
+            let Some(slot) = token_type.get_mut(id as usize) else {
+                // Many tokenizers append their added tokens past the
+                // end of `model.vocab` (Qwen2, Llama-3). Those ids are
+                // part of the vocabulary and are not in `tokens`, so
+                // writing the file anyway would ship a vocabulary
+                // shorter than the model's — refused rather than
+                // truncated, since the truncation is invisible in the
+                // written file.
+                return Err(format!(
+                    "gguf export: added token id {id} is past the {} tokens in `model.vocab`; \
+                     this tokenizer keeps its added tokens outside the vocab map and this \
+                     writer does not merge them yet",
+                    tokens.len()
+                ));
+            };
+            *slot = if special { 3 } else { 4 };
         }
     }
 
-    let model_name = match arch {
-        GgufArch::Gpt2 => "gpt2",
-        GgufArch::Llama => "llama",
+    // Named after the tokenizer, not after the model. `tokenizer.ggml.model`
+    // says which tokenizer implementation a reader should run — `gpt2`
+    // is byte-level BPE, `llama` is SentencePiece — and those are
+    // different algorithms over different data. Deriving it from the
+    // architecture would label a BPE vocabulary as SentencePiece on
+    // every TinyLlama export, and the merges it ships with would be
+    // ignored.
+    let declared = model
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or_default();
+    let model_name = match declared {
+        "BPE" => "gpt2",
+        "Unigram" => "llama",
+        other => {
+            return Err(format!(
+                "gguf export: tokenizer.json declares `model.type = \"{other}\"`, which has \
+                 no GGUF tokenizer name here (BPE and Unigram do)"
+            ))
+        }
     };
     let mut out = vec![
         (
@@ -476,7 +539,11 @@ fn tokenizer_metadata(
             Value::Array(merges.into_iter().map(Value::String).collect()),
         ));
     }
-    Ok(out)
+    let count = match out.first() {
+        Some(_) => token_count,
+        None => 0,
+    };
+    Ok((out, count))
 }
 
 #[cfg(test)]
@@ -704,10 +771,22 @@ mod tests {
     fn a_tokenizer_is_embedded_when_one_is_given() {
         let tmp = tempfile::TempDir::new().unwrap();
         let tok = tmp.path().join("tokenizer.json");
+        // The vocabulary has to be the model's: the writer refuses a
+        // tokenizer and a head that disagree about how many ids exist.
+        let vocab: Vec<String> = (0..32).map(|i| format!("t{i}")).collect();
+        let entries: Vec<String> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, t)| format!("\"{t}\":{i}"))
+            .collect();
         std::fs::write(
             &tok,
-            r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"ab":2},
-               "merges":["a b"]},"added_tokens":[{"id":2,"content":"ab"}]}"#,
+            format!(
+                r#"{{"model":{{"type":"BPE","vocab":{{{}}},"merges":["t0 t1"]}},
+                   "added_tokens":[{{"id":2,"content":"t2","special":true}},
+                                   {{"id":3,"content":"t3","special":false}}]}}"#,
+                entries.join(",")
+            ),
         )
         .unwrap();
 
@@ -725,15 +804,104 @@ mod tests {
             .iter()
             .map(|v| v.to_string().unwrap().to_string())
             .collect::<Vec<_>>();
-        assert_eq!(tokens, vec!["a", "b", "ab"], "tokens are ordered by id");
+        assert_eq!(tokens.len(), 32, "every id has a token");
+        assert_eq!(tokens[0], "t0", "tokens are ordered by id");
+        assert_eq!(
+            content.metadata["tokenizer.ggml.model"]
+                .to_string()
+                .unwrap(),
+            "gpt2",
+            "named after the tokenizer's own type, not the architecture"
+        );
         let types = content.metadata["tokenizer.ggml.token_type"]
             .to_vec()
             .unwrap()
             .iter()
             .map(|v| v.to_i32().unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(types, vec![1, 1, 3], "the added token is marked control");
+        assert_eq!(types[1], 1, "an ordinary token stays normal");
+        assert_eq!(types[2], 3, "a special added token is control");
+        assert_eq!(types[3], 4, "a non-special added token is user-defined");
         assert!(content.metadata.contains_key("tokenizer.ggml.merges"));
+        assert_eq!(content.metadata["gpt2.vocab_size"].to_u32().unwrap(), 32);
+    }
+
+    #[test]
+    fn a_tokenizer_that_is_not_the_models_vocabulary_is_refused() {
+        // A GGUF carries one vocabulary. A tokenizer shorter than the
+        // head leaves ids the file cannot name; a longer one names ids
+        // the head cannot produce, and either way the two halves of the
+        // file disagree in a way that shows up as wrong text.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &tok,
+            r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1,"c":2},"merges":[]}}"#,
+        )
+        .unwrap();
+        let vm = tiny_gpt2();
+        let err = export_gguf(
+            &vm,
+            &gpt2_spec(),
+            GgmlDType::F32,
+            Some(&tok),
+            &tmp.path().join("mismatch.gguf"),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("3 tokens") && err.contains("vocab 32"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_tokenizer_type_with_no_gguf_name_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(&tok, r#"{"model":{"type":"WordPiece","vocab":{"a":0}}}"#).unwrap();
+        let err = tokenizer_metadata(&tok).unwrap_err();
+        assert!(err.contains("WordPiece"), "{err}");
+    }
+
+    #[test]
+    fn an_added_token_past_the_vocab_map_is_refused() {
+        // Qwen2 and Llama-3 keep their added tokens outside
+        // `model.vocab`; writing the file anyway ships a vocabulary
+        // shorter than the model's, and nothing in the file says so.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &tok,
+            r#"{"model":{"type":"BPE","vocab":{"a":0,"b":1},"merges":[]},
+               "added_tokens":[{"id":2,"content":"<eos>","special":true}]}"#,
+        )
+        .unwrap();
+        let err = tokenizer_metadata(&tok).unwrap_err();
+        assert!(err.contains("past the 2 tokens"), "{err}");
+    }
+
+    #[test]
+    fn a_malformed_merge_pair_is_refused_rather_than_blanked() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tok = tmp.path().join("tokenizer.json");
+        std::fs::write(
+            &tok,
+            r#"{"model":{"type":"BPE","vocab":{"a":0},"merges":[[1,2]]}}"#,
+        )
+        .unwrap();
+        let err = tokenizer_metadata(&tok).unwrap_err();
+        assert!(err.contains("not two strings"), "{err}");
+    }
+
+    #[test]
+    fn the_vocabulary_size_is_written_even_without_a_tokenizer() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("novocab.gguf");
+        let vm = tiny_gpt2();
+        export_gguf(&vm, &gpt2_spec(), GgmlDType::F32, None, &path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut file).unwrap();
+        assert_eq!(content.metadata["gpt2.vocab_size"].to_u32().unwrap(), 32);
     }
 
     #[test]
@@ -743,7 +911,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let tok = tmp.path().join("tokenizer.json");
         std::fs::write(&tok, r#"{"model":{"vocab":{"a":0,"c":2}}}"#).unwrap();
-        let err = tokenizer_metadata(&tok, GgufArch::Gpt2).unwrap_err();
+        let err = tokenizer_metadata(&tok).unwrap_err();
         assert!(err.contains("skips an id"), "{err}");
     }
 }

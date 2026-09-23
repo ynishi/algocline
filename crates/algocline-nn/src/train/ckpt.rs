@@ -25,7 +25,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use candle_core::safetensors::MmapedSafetensors;
 use candle_core::{DType, Tensor};
@@ -54,7 +53,8 @@ pub struct Candidate {
     /// two can never drift into disagreeing about the same step. The
     /// fields are flattened into the written line: `step`, `ckpt_path`,
     /// `train_loss`, `lr`, `grad_norm`, `elapsed_ms`, `min_train_loss`
-    /// sit at the top level next to `reason` and `values`.
+    /// — and `val_loss` on a run that held rows out — sit at the top
+    /// level next to `reason` and `values`.
     ///
     /// Carrying all of them, not just the loss, is what lets a later
     /// reader ask whether a keep was sound: the model-side numbers are
@@ -304,8 +304,15 @@ impl CheckpointStore {
     }
 
     /// Enumerate the step checkpoints currently on disk, oldest first.
+    ///
+    /// Ordered by the step in the filename rather than by mtime. Two
+    /// checkpoints written inside one filesystem timestamp tick — a
+    /// tiny model at `ckpt_every = 1` — otherwise sort by `read_dir`
+    /// order, which is arbitrary, and the rotation can delete the newer
+    /// one. The step number is already in the name and is a total
+    /// order; mtime is a tiebreak for nothing.
     pub fn list(&self) -> std::io::Result<Vec<PathBuf>> {
-        let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        let mut entries: Vec<(PathBuf, usize)> = Vec::new();
         let step_prefix = format!("{}-step", self.prefix);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -325,10 +332,18 @@ impl CheckpointStore {
             if name.ends_with(crate::train::optstate::OPT_SIDECAR_SUFFIX) {
                 continue;
             }
-            let mtime = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
-            entries.push((path, mtime));
+            // `<prefix>-step<N>.safetensors` → N. A name that does not
+            // carry one is not a checkpoint this store wrote.
+            let Some(step) = name
+                .strip_prefix(&step_prefix)
+                .and_then(|rest| rest.strip_suffix(".safetensors"))
+                .and_then(|digits| digits.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            entries.push((path, step));
         }
-        entries.sort_by_key(|(_, m)| *m);
+        entries.sort_by_key(|(_, step)| *step);
         Ok(entries.into_iter().map(|(p, _)| p).collect())
     }
 
@@ -443,13 +458,61 @@ impl BundleIdentity {
 /// distinguished from a header that exists and says something
 /// unexpected, which comes back as a map for the caller to judge.
 pub fn read_bundle_header(path: &Path) -> Result<Option<BTreeMap<String, String>>, String> {
-    let bytes = fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let (_size, metadata) = safetensors::SafeTensors::read_metadata(&bytes)
+    use std::io::Read;
+
+    // The header only. A bundle here reaches several gigabytes and this
+    // answers a question about a few kilobytes at the front of it.
+    //
+    // Parsed here rather than through `SafeTensors::read_metadata`,
+    // which takes the whole file as one slice and refuses a buffer that
+    // does not cover it exactly (`buffer_end + 8 + n != buffer_len` →
+    // `MetadataIncompleteBuffer`). The format is a little-endian u64
+    // length followed by that many bytes of JSON, and `__metadata__` is
+    // a plain string map inside it, so reading the front is the whole
+    // job.
+    let mut file = fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
         .map_err(|e| format!("read {}: {e}", path.display()))?;
-    Ok(metadata
-        .metadata()
-        .as_ref()
-        .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+    let header_len = u64::from_le_bytes(prefix);
+    // safetensors' own ceiling. Refusing past it keeps a corrupt or
+    // non-safetensors file from becoming an allocation.
+    const MAX_HEADER: u64 = 100_000_000;
+    if header_len > MAX_HEADER {
+        return Err(format!(
+            "read {}: header length {header_len} is past anything safetensors writes; \
+             this is not a checkpoint",
+            path.display()
+        ));
+    }
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| format!("read {}: header is not JSON: {e}", path.display()))?;
+    let Some(metadata) = parsed.get("__metadata__") else {
+        return Ok(None);
+    };
+    let Some(map) = metadata.as_object() else {
+        return Err(format!(
+            "read {}: `__metadata__` is not an object",
+            path.display()
+        ));
+    };
+    // The format's metadata is string → string; anything else came from
+    // a writer that is not following it, and guessing at a coercion
+    // would report a header the file does not carry.
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        let Some(text) = value.as_str() else {
+            return Err(format!(
+                "read {}: `__metadata__.{key}` is not a string",
+                path.display()
+            ));
+        };
+        out.insert(key.clone(), text.to_string());
+    }
+    Ok(Some(out))
 }
 
 /// Path of the sidecar describing the bundle at `path`.

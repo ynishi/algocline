@@ -153,6 +153,12 @@ impl JsonSchemaConstraint {
 }
 
 impl Constraint for JsonSchemaConstraint {
+    /// Delegated to the wrapped regex, which is where the
+    /// surface-string table lives — see [`Constraint::vocab`].
+    fn vocab(&self) -> Option<usize> {
+        self.inner.vocab()
+    }
+
     fn mask(&self, prefix: &[u32]) -> TokenMask {
         self.inner.mask(prefix)
     }

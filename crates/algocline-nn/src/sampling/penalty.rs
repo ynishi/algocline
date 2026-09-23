@@ -97,7 +97,7 @@ impl Penalties {
     fn validate(&self) -> CandleResult<()> {
         if !self.repetition.is_finite() || self.repetition <= 0.0 {
             return Err(candle_core::Error::Msg(format!(
-                "penalties: repetition must be a finite positive factor (got {}); \\
+                "penalties: repetition must be a finite positive factor (got {}); \
                  1.0 is off, and 0 or a negative would flip or erase the logits it touches",
                 self.repetition
             )));

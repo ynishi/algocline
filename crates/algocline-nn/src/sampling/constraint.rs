@@ -291,6 +291,19 @@ pub trait Constraint {
     /// [`ConstrainedSampler::is_done`].
     fn is_terminal(&self, prefix: &[u32]) -> bool;
 
+    /// The vocabulary this constraint reasons over, or `None` for one
+    /// that reasons over ids alone and so fits any width.
+    ///
+    /// [`ConstrainedSampler`] checks it against the logits row it is
+    /// handed. A constraint built from a token→string table cannot
+    /// judge an id past the end of that table, and under a wider row
+    /// those ids would come through permitted without ever having been
+    /// examined — plausible output drawn from the part of the
+    /// vocabulary the grammar never saw.
+    fn vocab(&self) -> Option<usize> {
+        None
+    }
+
     /// Fill `out` with the tokens permitted after `prefix`.
     ///
     /// The dense form of [`Self::mask`], and the one the decode loop
@@ -363,6 +376,10 @@ impl Constraint for Box<dyn Constraint + Send> {
 
     fn reset(&mut self) {
         (**self).reset()
+    }
+
+    fn vocab(&self) -> Option<usize> {
+        (**self).vocab()
     }
 }
 
@@ -452,6 +469,15 @@ impl<S: Sampler, C: Constraint> Sampler for ConstrainedSampler<S, C> {
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
         validate_logits(logits)?;
         let vocab = logits.dims()[0];
+        if let Some(declared) = self.constraint.vocab() {
+            if declared != vocab {
+                return Err(candle_core::Error::Msg(format!(
+                    "ConstrainedSampler: the constraint reasons over {declared} tokens and the \
+                     logits row is {vocab} wide; the ids in between would be permitted without \
+                     the constraint having examined them"
+                )));
+            }
+        }
         self.constraint
             .fill_mask(&self.prefix, vocab, &mut self.allowed)
             .map_err(|id| {
@@ -803,6 +829,12 @@ impl RegexConstraint {
 }
 
 impl Constraint for RegexConstraint {
+    /// The surface-string table this was built with — see
+    /// [`Self::mask`]'s note on the two vocabularies.
+    fn vocab(&self) -> Option<usize> {
+        Some(self.vocab.len())
+    }
+
     /// Advance the kept state by one token.
     ///
     /// This is what takes the per-token cost from `O(prefix)` to
@@ -866,6 +898,15 @@ impl Constraint for RegexConstraint {
         };
     }
 
+    /// # The two vocabularies
+    ///
+    /// This reasons over `self.vocab`, the surface strings it was built
+    /// with, while the mask is applied over the logits row's width. The
+    /// two are the same number for every shipped preset, and
+    /// [`ConstrainedSampler`] refuses a disagreement rather than
+    /// letting it pass — without that check, an id past the end of the
+    /// string list would be permitted without the DFA ever having
+    /// looked at it.
     fn mask(&self, prefix: &[u32]) -> TokenMask {
         let Some(state) = self.state_at(prefix) else {
             // Unreachable prefix. Permitting nothing routes this into the
@@ -1198,6 +1239,38 @@ mod tests {
         set.fill_from(&TokenMask::AllowAll, 64).unwrap();
         assert_eq!(set.allowed().len(), before);
         assert_eq!(set.vocab(), 64);
+    }
+
+    /// A constraint reasoning over a narrower vocabulary than the
+    /// logits row is refused: the ids in between would come through
+    /// permitted without the grammar ever having examined them.
+    #[test]
+    fn a_constraint_and_a_wider_logits_row_are_refused() {
+        let vocab: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let c = RegexConstraint::new("a+", vocab).unwrap();
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        // Five logits against a three-token table.
+        let err = s
+            .sample(&cpu_logits(&[0.1, 0.2, 0.3, 9.0, 0.4]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3 tokens") && err.contains("5 wide"), "{err}");
+
+        // The matching width goes through.
+        let vocab: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let c = RegexConstraint::new("a+", vocab).unwrap();
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        assert!(s.sample(&cpu_logits(&[0.1, 0.2, 0.3])).is_ok());
+    }
+
+    /// An id-only constraint declares no vocabulary and fits any width,
+    /// which is what lets an allow list work with a tokenizer this
+    /// crate has never seen.
+    #[test]
+    fn an_id_only_constraint_fits_any_width() {
+        let mut s =
+            ConstrainedSampler::new(GreedySampler, AllowListConstraint::new(vec![1, 2]).unwrap());
+        assert!(s.sample(&cpu_logits(&[0.1, 5.0, 0.3, 0.4, 0.5])).is_ok());
     }
 
     /// The kept state and the prefix walk must agree at every step —

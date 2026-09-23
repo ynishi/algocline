@@ -552,7 +552,8 @@ impl TokenizedDataset {
     pub fn split_off_holdout(&mut self, fraction: f64) -> Result<Self, DatasetError> {
         if self.conds.is_some() || self.allowed_ids.is_some() {
             return Err(DatasetError::HoldoutRefused {
-                reason: "a per-row side channel is attached, and its pairing is positional —                          split the rows before attaching it",
+                reason: "a per-row side channel is attached, and its pairing is positional — \
+                         split the rows before attaching it",
             });
         }
         if self.cursor > 0 {

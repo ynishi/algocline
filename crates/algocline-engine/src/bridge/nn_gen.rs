@@ -115,12 +115,11 @@ use super::nn_card::{Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle};
 
 /// The forward path a [`GenSession`] drives.
 ///
-/// `Llama` forwards incrementally through a per-session KV cache. The
-/// trainable arches (`Gpt2` / `TinyLlama`) have no KV cache — their
-/// `forward` is the training-loop full-sequence pass — so their arm
-/// re-forwards the whole token history each step instead (see the
-/// module-level "Sessions over trainable arches" section for the cost
-/// trade-off).
+/// Every arm forwards incrementally through a per-session KV cache:
+/// the adapter through its own, the trainable arches through
+/// [`KvCache`] (see the module-level "Sessions over trainable arches"
+/// section). What differs between them is only where the cache comes
+/// from.
 enum SessionBackend {
     Llama {
         /// Shared, read-only weights. Cloning the `Arc` is what lets
@@ -240,9 +239,10 @@ pub(super) struct GenSession {
     /// Vocabulary bound every caller-supplied token id is checked
     /// against.
     vocab: usize,
-    /// Model context window. Enforced on the stateless arms, whose
-    /// full-history re-forward would otherwise surface a positional
-    /// embedding error from deep inside candle.
+    /// Model context window. Enforced on the trainable arms by
+    /// [`GenSession::cached_step`], so the refusal names the session
+    /// and its history rather than surfacing a tensor dimension from
+    /// deep inside candle. The Llama adapter caps itself.
     ctx: usize,
     /// Prompt tokens followed by every token the caller appended.
     tokens: Vec<u32>,
@@ -1166,8 +1166,7 @@ where
 }
 
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the
-/// trainable GPT-2 handle's method table (stateless full-history
-/// backend).
+/// trainable GPT-2 handle's method table.
 pub(super) fn add_gpt2_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<Gpt2Handle>,
@@ -1303,12 +1302,36 @@ fn beam_options(opts: Option<&LuaTable>, vocab: usize) -> LuaResult<BeamOptions>
         return Ok(out);
     };
     if let Some(v) = t.get::<Option<usize>>("beams")? {
+        // Bounded, because the cost is `beams²` sequence clones per
+        // step and the number comes from Lua: an unbounded one is a
+        // hang rather than an error. The ceiling is far above any
+        // useful width — published work stops well before 50.
+        if v == 0 || v > MAX_BEAMS {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.beams must be between 1 and {MAX_BEAMS} (got {v})"
+            )));
+        }
         out.beams = v;
     }
     if let Some(v) = t.get::<Option<usize>>("max_new")? {
+        if v == 0 {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.max_new must be at least 1; a search that generates \
+                 nothing returns the prompt"
+            )));
+        }
         out.max_new = v;
     }
     if let Some(v) = t.get::<Option<f32>>("length_penalty")? {
+        // A negative exponent inverts the ranking and a non-finite one
+        // makes every comparison fall through to `Ordering::Equal`,
+        // which leaves the "best" beam to sort stability.
+        if !v.is_finite() || v < 0.0 {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.length_penalty must be finite and >= 0 (got {v}); \
+                 0 leaves raw score sums and 1 is the mean per token"
+            )));
+        }
         out.length_penalty = v;
     }
     if let Some(v) = t.get::<Option<i64>>("eos")? {
@@ -1316,6 +1339,12 @@ fn beam_options(opts: Option<&LuaTable>, vocab: usize) -> LuaResult<BeamOptions>
     }
     Ok(out)
 }
+
+/// Widest beam this surface accepts.
+///
+/// Not a property of the search — a bound on a number that arrives from
+/// Lua and multiplies the work quadratically.
+const MAX_BEAMS: usize = 64;
 
 /// Project the search's beams into the Lua array a caller gets back.
 fn beams_to_lua(lua: &Lua, beams: Vec<Beam>) -> LuaResult<LuaTable> {
@@ -1351,8 +1380,9 @@ where
         "beam_search",
         |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
             let vocab = this.vocab();
-            let ids = validate_beam_prompt(&prompt, vocab, this.ctx())?;
+            // Options first: the window check reads `max_new`.
             let options = beam_options(opts.as_ref(), vocab)?;
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx(), options.max_new)?;
             let model = this.model();
             let guard = model
                 .lock()
@@ -1379,8 +1409,9 @@ where
         "beam_search",
         |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
             let vocab = this.vocab();
-            let ids = validate_beam_prompt(&prompt, vocab, this.ctx())?;
+            // Options first: the window check reads `max_new`.
             let options = beam_options(opts.as_ref(), vocab)?;
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx(), options.max_new)?;
             let model = this.model();
             let guard = model
                 .lock()
@@ -1402,8 +1433,14 @@ where
 /// The window is checked against prompt plus budget rather than against
 /// the prompt alone: a search that would run past `ctx` half way
 /// through is better refused before it starts than after it has spent
-/// the forwards.
-fn validate_beam_prompt(prompt: &[i64], vocab: usize, ctx: usize) -> LuaResult<Vec<u32>> {
+/// the forwards — which is why `max_new` is a parameter here and the
+/// options are read before this is called.
+fn validate_beam_prompt(
+    prompt: &[i64],
+    vocab: usize,
+    ctx: usize,
+    max_new: usize,
+) -> LuaResult<Vec<u32>> {
     if prompt.is_empty() {
         return Err(LuaError::external(format!(
             "{BEAM_ERR_PREFIX}: prompt_tokens is empty; there is no sequence to continue"
@@ -1414,6 +1451,14 @@ fn validate_beam_prompt(prompt: &[i64], vocab: usize, ctx: usize) -> LuaResult<V
             "{BEAM_ERR_PREFIX}: a prompt of {} fills the model context window ({ctx}), \
              leaving nothing to generate",
             prompt.len()
+        )));
+    }
+    if prompt.len() + max_new > ctx {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: a prompt of {} plus max_new = {max_new} would reach {} \
+             positions, past the model context window ({ctx})",
+            prompt.len(),
+            prompt.len() + max_new
         )));
     }
     prompt
@@ -1698,8 +1743,7 @@ fn pooled_row(hidden: &Tensor, pooling: Pooling) -> LuaResult<Vec<f32>> {
 }
 
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the
-/// trainable TinyLlama handle's method table (stateless full-history
-/// backend).
+/// trainable TinyLlama handle's method table.
 pub(super) fn add_tinyllama_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<TinyLlamaHandle>,

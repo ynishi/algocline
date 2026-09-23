@@ -270,10 +270,17 @@ pub struct FullFtConfig {
     /// micro-batches before applying a single optimizer update, so the
     /// effective batch size is `batch_size * grad_accum`. Each
     /// micro-batch's loss is pre-scaled by `1 / grad_accum` before
-    /// `backward()` so the summed gradient equals the mean over the
-    /// full effective batch (canonical PyTorch form). `grad_accum = 0`
-    /// is refused as a config error; `grad_accum = 1` behaves exactly
+    /// `backward()` (canonical PyTorch form). `grad_accum = 0` is
+    /// refused as a config error; `grad_accum = 1` behaves exactly
     /// like the single-micro path.
+    ///
+    /// What that sum equals is the mean **of the per-micro means**, not
+    /// the mean over the effective batch's tokens: the loss divides by
+    /// each micro-batch's own scored-token count. The two coincide only
+    /// when every micro-batch scores the same number of positions,
+    /// which stopped being automatic when [`DatasetOpts::mask_pad`]
+    /// began excluding padding — a short final batch now carries more
+    /// weight per token than a full one.
     pub grad_accum: usize,
     /// Total optimizer steps to run.
     pub steps: usize,
@@ -731,7 +738,8 @@ pub enum TrainError {
     /// never evaluates, and a set with no period is a slice held out of
     /// training that nothing reads.
     #[error(
-        "validation is half-configured: {present} was given and {missing} was not —          eval_every and the validation dataset go together"
+        "validation is half-configured: {present} was given and {missing} was not — \
+         eval_every and the validation dataset go together"
     )]
     ValidationHalfConfigured {
         /// The half the caller supplied.
@@ -890,6 +898,13 @@ pub struct CkptInfo {
     /// this carries the most recent evaluation rather than one taken at
     /// this step. [`Self::step`] against
     /// [`FullFtConfig::eval_every`] is what says how stale it can be.
+    ///
+    /// Absent rather than `null` where a run held nothing out, so the
+    /// candidate record this flattens into follows the same rule the
+    /// metrics file does: a reader that sees the key can rely on it,
+    /// and two sibling JSONL files in one directory do not disagree
+    /// about how they spell "no value".
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub val_loss: Option<f32>,
 }
 
@@ -1459,13 +1474,11 @@ fn run_ft_core(
     }
 
     // AdamW picks up its `lr` from the config once and then follows
-    // `set_learning_rate` at each step. The optimizer flavour is
-    // driven by the parameter dtype (design §7.1): F32 keeps the
-    // stock candle-nn AdamW (bit-identical baseline), BF16 routes
-    // through the FP32-master [`MixedAdamW`]. Anything else is a
-    // loud error — stock AdamW on BF16 vars would keep its moments
-    // in BF16 and stall silently, and F16 needs a loss scaler that
-    // does not ship here.
+    // `set_learning_rate` at each step. Both F32 and BF16 route
+    // through the FP32-master `MixedAdamW` — see `FtOptimizer`, which
+    // records why the stock candle-nn AdamW was retired. Anything
+    // else is a loud error: an optimizer keeping BF16 moments stalls
+    // silently, and F16 needs a loss scaler that does not ship here.
     let adamw_params = ParamsAdamW {
         lr: cfg.lr,
         weight_decay: cfg.weight_decay,
@@ -1611,9 +1624,10 @@ fn run_ft_core(
         // Per-step observability. Emit through `tracing` so downstream
         // subscribers (RUST_LOG=algocline_nn=info) can collect the loss
         // trajectory without changing the return shape. `loss` is the
-        // mean per-micro loss (matches the equivalent single-micro
-        // `batch_size * grad_accum` run) and `grad_accum` is emitted as
-        // an additive field so post-hoc analysis can distinguish
+        // mean of the per-micro losses — see `grad_accum` for why that
+        // is not the same as one `batch_size * grad_accum` batch once
+        // padding is masked — and `grad_accum` is emitted as an
+        // additive field so post-hoc analysis can distinguish
         // accumulated steps from raw single-micro ones.
         tracing::info!(
             step = step,
@@ -1880,8 +1894,16 @@ fn clip_grad_norm_(
 /// runs.
 fn grad_l2_norm(opt_vm: &VarMap, grads: &GradStore) -> CandleResult<f32> {
     let data = opt_vm.data().lock().unwrap();
+    // Summed in name order, not `HashMap` order. f32 addition is not
+    // associative and `RandomState` reseeds per process, so iterating
+    // the map directly makes the norm differ in its last bits between
+    // two runs of the same configuration — and with `clip_grad_norm`
+    // set that difference scales every gradient, which is the one axis
+    // `arch::seeded` exists to close. The same reason `ckpt.rs` writes
+    // its tensors from a `BTreeMap`.
+    let ordered: BTreeMap<&String, &candle_core::Var> = data.iter().collect();
     let mut sum_sq: f32 = 0.0;
-    for var in data.values() {
+    for var in ordered.into_values() {
         if let Some(g) = grads.get(var.as_tensor()) {
             let g_f32 = if g.dtype() == DType::F32 {
                 g.clone()

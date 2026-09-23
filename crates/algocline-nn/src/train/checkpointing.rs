@@ -85,9 +85,14 @@ use crate::arch::blockwise::Checkpointable;
 /// the same arithmetic the uncheckpointed path performs, in the same
 /// order.
 ///
-/// The returned store holds gradients for the model's parameters. It
-/// also holds gradients for the checkpoints themselves, which no
-/// optimizer reads and which are dropped with the store.
+/// The returned store holds gradients for the model's parameters and
+/// nothing else. The temporary `Var`s this uses to re-enter the
+/// checkpoints receive gradients too — one activation-sized tensor per
+/// block — and those are removed before returning: a `Var`'s gradient
+/// survives candle's own pruning, so under `grad_accum > 1` they would
+/// be merged into the accumulating store and held until the optimizer
+/// step, which is `grad_accum` copies of exactly the memory this
+/// feature exists to free.
 pub fn checkpointed_step<F>(
     model: &dyn Checkpointable,
     xs: &Tensor,
@@ -125,6 +130,9 @@ where
     // ── backward, recomputing one block at a time ───────────────────
     // The gradient flowing into the last checkpoint, written by the
     // head's backward.
+    // Every temporary the two loops below create, so they can be taken
+    // back out of the store at the end.
+    let mut temporaries: Vec<Tensor> = vec![last.as_tensor().clone()];
     let mut incoming = grads.get(last.as_tensor()).cloned().ok_or_else(|| {
         candle_core::Error::Msg(
             "checkpointed_step: the head's backward left no gradient on the last checkpoint; \
@@ -137,6 +145,7 @@ where
         // A temporary tracked leaf holding the stored input. Dropped at
         // the end of this iteration; never registered anywhere.
         let input = Var::from_tensor(&inputs[index])?;
+        temporaries.push(input.as_tensor().clone());
         let recomputed = model.block_forward(index, input.as_tensor())?;
         // Σ(y ⊙ g) — see the module doc. `g` is detached already, so
         // the surrogate's graph is the block's alone.
@@ -157,6 +166,14 @@ where
     let embedded = model.embed_input(xs)?;
     let surrogate = embedded.mul(&incoming)?.sum_all()?;
     grads.extend(surrogate.backward()?)?;
+
+    // The checkpoints' own gradients leave with the checkpoints. Each
+    // is `[batch, seq, dim]`, no optimizer reads them, and an
+    // accumulating caller would otherwise hold one per block per
+    // micro-batch until the step.
+    for temporary in temporaries {
+        grads.remove(&temporary);
+    }
 
     Ok((loss_value, grads))
 }

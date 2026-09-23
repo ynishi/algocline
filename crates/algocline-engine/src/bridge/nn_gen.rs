@@ -1605,13 +1605,43 @@ fn export_gguf_impl(
     path: &str,
     opts: Option<&LuaTable>,
 ) -> LuaResult<LuaTable> {
+    let (precision, tokenizer) = parse_gguf_opts(GGUF_ERR_PREFIX, opts)?;
+
+    let (spec, varmap) = gguf_spec(GGUF_ERR_PREFIX, source)?;
+    let report = export_gguf(
+        &varmap,
+        &spec,
+        precision,
+        tokenizer.as_deref(),
+        Path::new(path),
+    )
+    .map_err(|e| LuaError::external(format!("{GGUF_ERR_PREFIX}: {e}")))?;
+
+    let out = lua.create_table()?;
+    out.set("path", path)?;
+    out.set("tensors", report.tensors)?;
+    out.set("metadata", report.metadata)?;
+    out.set("tokenizer", report.tokenizer)?;
+    out.set("architecture", spec.arch.name())?;
+    Ok(out)
+}
+
+/// Read a GGUF export's `{ precision, tokenizer }` opts.
+///
+/// Shared by `handle:export_gguf` and `alc.nn.card.export`'s
+/// `opts.gguf`, so the two accept and refuse the same values; `prefix`
+/// names the surface in the error.
+pub(super) fn parse_gguf_opts(
+    prefix: &str,
+    opts: Option<&LuaTable>,
+) -> LuaResult<(GgmlDType, Option<PathBuf>)> {
     let precision = match opts
         .map(|t| t.get::<Option<String>>("precision"))
         .transpose()?
     {
         Some(Some(name)) => parse_precision(&name).ok_or_else(|| {
             LuaError::external(format!(
-                "{GGUF_ERR_PREFIX}: unknown precision '{name}' (expected one of: {})",
+                "{prefix}: unknown precision '{name}' (expected one of: {})",
                 PRECISION_NAMES.join(" / ")
             ))
         })?,
@@ -1634,7 +1664,7 @@ fn export_gguf_impl(
             let file = PathBuf::from(file);
             if !file.is_file() {
                 return Err(LuaError::external(format!(
-                    "{GGUF_ERR_PREFIX}: opts.tokenizer names no file at {}; pass the path to \
+                    "{prefix}: opts.tokenizer names no file at {}; pass the path to \
                      an HF tokenizer.json (the preset cache is <app>/nn/tokenizers/<preset>.json)",
                     file.display()
                 )));
@@ -1643,24 +1673,7 @@ fn export_gguf_impl(
         }
         _ => None,
     };
-
-    let (spec, varmap) = gguf_spec(source)?;
-    let report = export_gguf(
-        &varmap,
-        &spec,
-        precision,
-        tokenizer.as_deref(),
-        Path::new(path),
-    )
-    .map_err(|e| LuaError::external(format!("{GGUF_ERR_PREFIX}: {e}")))?;
-
-    let out = lua.create_table()?;
-    out.set("path", path)?;
-    out.set("tensors", report.tensors)?;
-    out.set("metadata", report.metadata)?;
-    out.set("tokenizer", report.tokenizer)?;
-    out.set("architecture", spec.arch.name())?;
-    Ok(out)
+    Ok((precision, tokenizer))
 }
 
 /// A handle's source to the export spec and the weights.
@@ -1670,27 +1683,27 @@ fn export_gguf_impl(
 /// never named, so there is nothing here to write under the names GGUF
 /// wants. Exporting those means loading the weights into a
 /// from-scratch handle first, and the message says so rather than
-/// writing an empty file.
-fn gguf_spec(source: GgufSource) -> LuaResult<(GgufSpec, Arc<VarMap>)> {
+/// writing an empty file. `prefix` names the surface in the error.
+pub(super) fn gguf_spec(prefix: &str, source: GgufSource) -> LuaResult<(GgufSpec, Arc<VarMap>)> {
     let arch = match source.family {
         "gpt2" => GgufArch::Gpt2,
         "tinyllama" => GgufArch::Llama,
         other => {
             return Err(LuaError::external(format!(
-                "{GGUF_ERR_PREFIX}: no GGUF key set for architecture family `{other}`"
+                "{prefix}: no GGUF key set for architecture family `{other}`"
             )))
         }
     };
     if source.variant.contains("custom") {
         return Err(LuaError::external(format!(
-            "{GGUF_ERR_PREFIX}: a custom architecture's shape is not one GGUF has a key set \
+            "{prefix}: a custom architecture's shape is not one GGUF has a key set \
              for — its feed-forward ratio, norm kind and position scheme are this crate's \
              own, and a reader would assemble the reference graph instead"
         )));
     }
     let varmap = source.varmap.clone().ok_or_else(|| {
         LuaError::external(format!(
-            "{GGUF_ERR_PREFIX}: this handle was built with pretrained = true and carries no \
+            "{prefix}: this handle was built with pretrained = true and carries no \
              VarMap, so its tensors have no names here; load the weights into a \
              from-scratch handle to export them"
         ))

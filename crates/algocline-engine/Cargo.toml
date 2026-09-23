@@ -48,6 +48,9 @@ tempfile = { workspace = true }
 mlua-check = "0.3"
 mlua-lspec = "0.3"
 proptest = "1"
+# Recomputes an exported bundle's `alc.tensor_sha256` independently of
+# the exporter (`tests/nn_card_test.rs`).
+sha2 = { workspace = true }
 
 [features]
 test-support = []

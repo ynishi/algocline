@@ -172,6 +172,38 @@ pub fn export_gguf(
     tokenizer_json: Option<&Path>,
     path: &Path,
 ) -> Result<GgufReport, String> {
+    export_gguf_with_metadata(varmap, spec, precision, tokenizer_json, path, &[])
+}
+
+/// [`export_gguf`], with `extra` key-value entries written beside the
+/// architecture's own.
+///
+/// An extra key that the writer also produces **replaces** it in place
+/// rather than being written a second time: a GGUF reader keys its
+/// metadata by name, so a duplicate would leave which value it sees to
+/// the reader. That is how a caller puts its own `general.name` over
+/// the preset variant [`GgufSpec::name`] carries. A key the writer does
+/// not produce is appended.
+///
+/// # Errors
+///
+/// Everything [`export_gguf`] refuses, plus an `extra` that names one
+/// key twice — there is no telling which of the two was meant.
+pub fn export_gguf_with_metadata(
+    varmap: &VarMap,
+    spec: &GgufSpec,
+    precision: GgmlDType,
+    tokenizer_json: Option<&Path>,
+    path: &Path,
+    extra: &[(String, gguf_file::Value)],
+) -> Result<GgufReport, String> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (key, _) in extra {
+        if !seen.insert(key.as_str()) {
+            return Err(format!("gguf export: extra metadata names `{key}` twice"));
+        }
+    }
+
     let named = collect_tensors(varmap, spec)?;
 
     let mut quantized: Vec<(String, QTensor)> = Vec::with_capacity(named.len());
@@ -219,6 +251,12 @@ pub fn export_gguf(
         }
         None => false,
     };
+    for (key, value) in extra {
+        match metadata.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => metadata.push((key.clone(), value.clone())),
+        }
+    }
 
     let mut file = std::fs::File::create(path)
         .map_err(|e| format!("gguf export: create {}: {e}", path.display()))?;
@@ -952,6 +990,99 @@ mod tests {
         let mut file = std::fs::File::open(&path).unwrap();
         let content = gguf_file::Content::read(&mut file).unwrap();
         assert_eq!(content.metadata["gpt2.vocab_size"].to_u32().unwrap(), 32);
+    }
+
+    /// How many times `needle` occurs in the file's bytes. A GGUF key is
+    /// stored as its UTF-8 bytes, so a key written twice shows up twice
+    /// here even though `Content::read` would collapse the pair.
+    fn occurrences(path: &Path, needle: &str) -> usize {
+        let bytes = std::fs::read(path).unwrap();
+        bytes
+            .windows(needle.len())
+            .filter(|w| *w == needle.as_bytes())
+            .count()
+    }
+
+    #[test]
+    fn extra_metadata_is_written_and_replaces_a_base_key_in_place() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("extra.gguf");
+        let vm = tiny_gpt2();
+        let base = tmp.path().join("base.gguf");
+        let base_report = export_gguf(&vm, &gpt2_spec(), GgmlDType::F32, None, &base).unwrap();
+
+        let extra = vec![
+            (
+                "general.name".to_string(),
+                gguf_file::Value::String("my card".into()),
+            ),
+            (
+                "general.license".to_string(),
+                gguf_file::Value::String("mit".into()),
+            ),
+            (
+                "general.tags".to_string(),
+                gguf_file::Value::Array(vec![
+                    gguf_file::Value::String("algocline".into()),
+                    gguf_file::Value::String("candle".into()),
+                ]),
+            ),
+        ];
+        let report =
+            export_gguf_with_metadata(&vm, &gpt2_spec(), GgmlDType::F32, None, &path, &extra)
+                .expect("export");
+        // Two keys added, one replaced.
+        assert_eq!(report.metadata, base_report.metadata + 2);
+
+        let mut file = std::fs::File::open(&path).unwrap();
+        let content = gguf_file::Content::read(&mut file).unwrap();
+        assert_eq!(
+            content.metadata["general.name"].to_string().unwrap(),
+            "my card"
+        );
+        assert_eq!(
+            content.metadata["general.license"].to_string().unwrap(),
+            "mit"
+        );
+        let tags: Vec<String> = content.metadata["general.tags"]
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v| v.to_string().unwrap().clone())
+            .collect();
+        assert_eq!(tags, vec!["algocline", "candle"]);
+        // The architecture's own keys are untouched.
+        assert_eq!(content.metadata["gpt2.block_count"].to_u32().unwrap(), 2);
+        // Replaced, not duplicated.
+        assert_eq!(occurrences(&path, "general.name"), 1);
+        assert_eq!(occurrences(&base, "general.name"), 1);
+    }
+
+    #[test]
+    fn an_extra_key_named_twice_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("dup.gguf");
+        let extra = vec![
+            (
+                "general.name".to_string(),
+                gguf_file::Value::String("a".into()),
+            ),
+            (
+                "general.name".to_string(),
+                gguf_file::Value::String("b".into()),
+            ),
+        ];
+        let err = export_gguf_with_metadata(
+            &tiny_gpt2(),
+            &gpt2_spec(),
+            GgmlDType::F32,
+            None,
+            &path,
+            &extra,
+        )
+        .unwrap_err();
+        assert!(err.contains("twice"), "{err}");
+        assert!(!path.exists());
     }
 
     #[test]

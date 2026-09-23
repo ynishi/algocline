@@ -165,6 +165,34 @@ pub enum DatasetError {
         /// Which channel the caller was attaching.
         channel: String,
     },
+    /// A holdout split would have left one of its two sides with no
+    /// rows.
+    ///
+    /// Both empty outcomes are refused here rather than at the first
+    /// step that needs the missing side: a training set of zero rows
+    /// exhausts immediately, and a held-out set of zero rows reports no
+    /// validation loss — neither says what went wrong, and both are
+    /// hours away from the call that caused them.
+    #[error(
+        "a holdout of {fraction} over {rows} row(s) leaves {train} for training and {holdout}          held out; both sides need at least one row"
+    )]
+    HoldoutEmptySide {
+        /// Fraction the caller asked to hold out.
+        fraction: f64,
+        /// Rows the dataset held.
+        rows: usize,
+        /// Rows the split would have left for training.
+        train: usize,
+        /// Rows the split would have held out.
+        holdout: usize,
+    },
+    /// A holdout split was asked of a dataset that cannot be cut in two
+    /// without losing something the caller attached.
+    #[error("this dataset cannot be split for a holdout: {reason}")]
+    HoldoutRefused {
+        /// What stands in the way, phrased so the caller can act on it.
+        reason: &'static str,
+    },
 }
 
 /// Iterator config shared across dataset kinds.
@@ -479,6 +507,76 @@ impl TokenizedDataset {
     /// Rows currently held by this dataset.
     pub fn row_count(&self) -> usize {
         self.rows.len()
+    }
+
+    /// Take the last `fraction` of the rows out of this dataset and
+    /// hand them back as a second one, for use as the held-out set.
+    ///
+    /// The tail rather than a fresh sample: with
+    /// [`DatasetOpts::shuffle`] on, the rows were already re-ordered at
+    /// construction and the tail is that random draw; with it off, the
+    /// caller asked for the corpus order and the tail is the part of it
+    /// the training set never reaches. Drawing again here would make
+    /// the split depend on a second source of randomness that nothing
+    /// records.
+    ///
+    /// Both halves keep this dataset's [`DatasetOpts`], so the held-out
+    /// rows are batched, padded and masked exactly like the training
+    /// ones — a validation loss is only comparable to a training loss
+    /// if the two were measured the same way.
+    ///
+    /// # Errors
+    ///
+    /// - [`DatasetError::HoldoutEmptySide`] when the fraction is not in
+    ///   `(0, 1)` or rounds to an empty side.
+    /// - [`DatasetError::HoldoutRefused`] when a per-row side channel
+    ///   is attached (the pairing is positional and would not survive
+    ///   the cut) or when iteration has already begun (the rows already
+    ///   handed out would end up in neither half).
+    pub fn split_off_holdout(&mut self, fraction: f64) -> Result<Self, DatasetError> {
+        if self.conds.is_some() || self.allowed_ids.is_some() {
+            return Err(DatasetError::HoldoutRefused {
+                reason: "a per-row side channel is attached, and its pairing is positional —                          split the rows before attaching it",
+            });
+        }
+        if self.cursor > 0 {
+            return Err(DatasetError::HoldoutRefused {
+                reason: "iteration has already begun, so the rows already handed out would                          fall in neither half — split before the first batch",
+            });
+        }
+        let rows = self.rows.len();
+        // `floor`, so a fraction that rounds down to nothing is caught
+        // by the empty-side check below rather than silently rounded up
+        // into one row the caller never asked for.
+        let holdout = if fraction.is_finite() && fraction > 0.0 && fraction < 1.0 {
+            (rows as f64 * fraction).floor() as usize
+        } else {
+            0
+        };
+        let train = rows - holdout.min(rows);
+        if holdout == 0 || train == 0 {
+            return Err(DatasetError::HoldoutEmptySide {
+                fraction,
+                rows,
+                train,
+                holdout,
+            });
+        }
+        let tail = self.rows.split_off(train);
+        Ok(Self {
+            rows: tail,
+            conds: None,
+            conds_per_row: self.conds_per_row,
+            allowed_ids: None,
+            // The rows are already in the order this dataset settled
+            // on; re-ordering the tail again would only lose the
+            // correspondence to the split the caller was told about.
+            opts: DatasetOpts {
+                shuffle: false,
+                ..self.opts.clone()
+            },
+            cursor: 0,
+        })
     }
 
     /// Refuse a positional side channel on a dataset whose rows were
@@ -1574,6 +1672,74 @@ mod tests {
         let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, false));
         let batch = ds.next_batch().unwrap().unwrap();
         assert_eq!(batch.loss_mask, None);
+    }
+
+    #[test]
+    fn a_holdout_split_takes_the_tail_and_leaves_the_rest() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i, i, i, i]).collect();
+        let mut train = TokenizedDataset::new(rows, mask_pad_opts(10, 4, true));
+        let mut held = train.split_off_holdout(0.2).expect("2 of 10 rows");
+        assert_eq!(train.row_count(), 8);
+        assert_eq!(held.row_count(), 2);
+        let held_batch = held.next_batch().unwrap().unwrap();
+        assert_eq!(
+            held_batch.input_ids,
+            vec![vec![8, 8, 8, 8], vec![9, 9, 9, 9]],
+            "the held-out side is the tail, in the order this dataset settled on"
+        );
+        let train_batch = train.next_batch().unwrap().unwrap();
+        assert_eq!(train_batch.input_ids.len(), 8);
+        assert_eq!(train_batch.input_ids[0], vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_holdout_split_carries_the_opts_the_training_side_uses() {
+        // Both sides pad and mask identically, or the two losses would
+        // not be measuring the same thing.
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5], vec![6], vec![7, 8]];
+        let mut train = TokenizedDataset::new(rows, mask_pad_opts(4, 4, true));
+        let mut held = train.split_off_holdout(0.25).expect("1 of 4 rows");
+        let batch = held.next_batch().unwrap().unwrap();
+        assert_eq!(batch.input_ids, vec![vec![7, 8, 0, 0]]);
+        assert_eq!(batch.loss_mask, Some(vec![vec![1.0, 1.0, 0.0, 0.0]]));
+    }
+
+    #[test]
+    fn a_holdout_that_would_empty_a_side_is_refused() {
+        let rows: Vec<Vec<u32>> = (0..4u32).map(|i| vec![i]).collect();
+        for fraction in [0.0, 1.0, 1.5, -0.1, f64::NAN, 0.1] {
+            let mut ds = TokenizedDataset::new(rows.clone(), mask_pad_opts(1, 1, true));
+            let err = ds
+                .split_off_holdout(fraction)
+                .expect_err("fraction {fraction} must be refused");
+            assert!(
+                matches!(err, DatasetError::HoldoutEmptySide { .. }),
+                "fraction {fraction}: {err}"
+            );
+            assert_eq!(ds.row_count(), 4, "a refused split leaves the rows alone");
+        }
+    }
+
+    #[test]
+    fn a_holdout_is_refused_once_iteration_has_begun() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i]).collect();
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true));
+        let _ = ds.next_batch().unwrap().unwrap();
+        let err = ds.split_off_holdout(0.2).expect_err("rows already handed out");
+        assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_holdout_is_refused_while_a_positional_side_channel_is_attached() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i]).collect();
+        let conds: Vec<CondIndex> = (0..10)
+            .map(|_| CondIndex::new(0, 1).expect("single-slot condition"))
+            .collect();
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true))
+            .with_conditions(conds)
+            .expect("conditions attach to an unshuffled dataset");
+        let err = ds.split_off_holdout(0.2).expect_err("the pairing is positional");
+        assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
     }
 
     #[test]

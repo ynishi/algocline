@@ -186,6 +186,13 @@ fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
     t.set("grad_norm", info.grad_norm)?;
     t.set("elapsed_ms", info.elapsed_ms)?;
     t.set("min_train_loss", info.min_train_loss)?;
+    // Absent rather than a placeholder number on a run with no
+    // held-out set: `info.val_loss == nil` is the Lua reading of "this
+    // run measured no generalisation", and any stand-in value would be
+    // compared against as if it had.
+    if let Some(v) = info.val_loss {
+        t.set("val_loss", v)?;
+    }
     Ok(t)
 }
 
@@ -579,6 +586,12 @@ fn apply_optional_overrides(
     }
     if let Some(v) = opts.get::<Option<usize>>("ckpt_keep")? {
         cfg.ckpt_keep = v;
+    }
+    // Scoring period for the held-out set. The set itself comes in as
+    // `opts.val_dataset` (read by the trainer surface, not here); the
+    // loop refuses either half without the other.
+    if let Some(v) = opts.get::<Option<usize>>("eval_every")? {
+        cfg.eval_every = v;
     }
     // `init_from` names a checkpoint the model's variables are restored
     // from before the first step. An empty string is refused rather

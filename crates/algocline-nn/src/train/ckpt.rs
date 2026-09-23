@@ -874,6 +874,7 @@ mod tests {
             grad_norm: 0.5,
             elapsed_ms: 1_000 * step as u64,
             min_train_loss: train_loss,
+            val_loss: None,
         }
     }
 

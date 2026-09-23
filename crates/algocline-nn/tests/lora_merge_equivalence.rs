@@ -447,6 +447,7 @@ fn run_lora_ft_updates_lora_weights() {
         &model,
         &lora_vm,
         &mut ds,
+        None,
         &train_cfg,
         &loss_fn,
         tmp.path(),

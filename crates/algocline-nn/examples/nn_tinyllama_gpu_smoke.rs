@@ -185,6 +185,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         &ckpt_dir,

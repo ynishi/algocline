@@ -5320,6 +5320,7 @@ fn full_ft_impl(
         &*model,
         &vm_arc,
         ds_lock.as_mut(),
+        None,
         &cfg,
         &loss_fn,
         &ckpt_dir,

@@ -231,6 +231,21 @@ pub struct FullFtConfig {
     /// Number of rotating checkpoints kept (clamped to at least 1
     /// inside [`CheckpointStore`]).
     pub ckpt_keep: usize,
+    /// Score the held-out set every N optimizer steps, or `0`
+    /// (default) to run without one.
+    ///
+    /// Non-zero requires the caller to hand a validation dataset to the
+    /// entry point, and a validation dataset requires this to be
+    /// non-zero: either half alone is
+    /// [`TrainError::ValidationHalfConfigured`] rather than a run that
+    /// silently never evaluates, or one that pays for a held-out split
+    /// nothing reads.
+    ///
+    /// The held-out batches are drained once before the first step and
+    /// re-scored at each boundary, so every evaluation sees the same
+    /// rows and the sequence of values is a curve rather than a walk
+    /// through different data.
+    pub eval_every: usize,
     /// Checkpoint the model's variables are restored from before the
     /// first step, or `None` (default) to train from whatever the
     /// caller built.
@@ -291,6 +306,7 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            eval_every: 0,
             init_from: None,
             mask_disallowed_logits: false,
         }
@@ -398,6 +414,30 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
+    /// One half of the validation setup arrived without the other.
+    ///
+    /// [`FullFtConfig::eval_every`] and the entry point's validation
+    /// dataset are one decision expressed in two places, so either half
+    /// alone is a mistake with a quiet outcome: a period with no set
+    /// never evaluates, and a set with no period is a slice held out of
+    /// training that nothing reads.
+    #[error(
+        "validation is half-configured: {present} was given and {missing} was not —          eval_every and the validation dataset go together"
+    )]
+    ValidationHalfConfigured {
+        /// The half the caller supplied.
+        present: &'static str,
+        /// The half it needs.
+        missing: &'static str,
+    },
+    /// A validation dataset was handed over and produced no batch.
+    ///
+    /// Refused at the start rather than reported as an absent
+    /// `val_loss` later: a held-out split that came out empty is a
+    /// split that went wrong, and the run would otherwise spend its
+    /// whole length before saying so.
+    #[error("the validation dataset yielded no batch, so there is nothing to score")]
+    EmptyValidationSet,
     /// An `on_ckpt` hook returned an error.
     ///
     /// The error propagates immediately: no terminal
@@ -506,6 +546,22 @@ pub struct CkptInfo {
     /// terminal `metrics["min_train_loss"]` value if the run completes
     /// without an early break).
     pub min_train_loss: f32,
+    /// Loss on the held-out set at the most recent evaluation, or
+    /// `None` on a run with no held-out set
+    /// ([`FullFtConfig::eval_every`] unset).
+    ///
+    /// This is the number a keep decision wants: `train_loss` falls
+    /// whether the model is learning the task or the corpus, and the
+    /// two are indistinguishable from inside the training set. The
+    /// evaluation runs on the same forward path and the same loss the
+    /// training step uses, so the two are comparable.
+    ///
+    /// Evaluations happen every `eval_every` steps and checkpoints
+    /// every `ckpt_every` steps; when the two do not divide each other
+    /// this carries the most recent evaluation rather than one taken at
+    /// this step. [`Self::step`] against
+    /// [`FullFtConfig::eval_every`] is what says how stale it can be.
+    pub val_loss: Option<f32>,
 }
 
 /// Whether the trainer continues or breaks early after an
@@ -654,6 +710,13 @@ impl From<candle_core::Error> for TrainError {
 /// dedicated `<ckpt_prefix>` keeps concurrent (or historical) runs
 /// from colliding on filenames.
 ///
+/// `val` is the held-out set. `Some` requires
+/// [`FullFtConfig::eval_every`] to be non-zero and `None` requires it
+/// to be zero — see [`TrainError::ValidationHalfConfigured`]. With one
+/// in place the returned [`Checkpoint::val_loss`] and each
+/// [`CkptInfo::val_loss`] carry the loss on those rows, scored through
+/// the same forward path and loss as training.
+///
 /// `hook` is an optional [`CkptHook`] fired at each `ckpt_every`
 /// boundary (after `save_step`). Passing `None` retains the previous
 /// behaviour bit-identically; passing `Some(_)` lets the caller inspect
@@ -665,6 +728,7 @@ pub fn run_full_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -687,6 +751,7 @@ where
         varmap,
         varmap,
         dataset,
+        val,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -724,6 +789,7 @@ pub fn run_conditioned_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -745,6 +811,7 @@ where
         varmap,
         varmap,
         dataset,
+        val,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -783,6 +850,7 @@ pub fn run_allowed_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -804,6 +872,7 @@ where
         varmap,
         varmap,
         dataset,
+        val,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -890,6 +959,10 @@ type AllowedForwardPass<'a> = dyn FnMut(&Tensor, &AllowedSets) -> Result<Tensor,
 ///   demand of the model without this function knowing about any of
 ///   them, and it checks each batch against the variant rather than
 ///   letting a disagreement pass as a silent ignore.
+/// - `val` — the held-out set, drained once before the first step and
+///   re-scored every [`FullFtConfig::eval_every`] steps. `None` on a
+///   run without one; supplying one of the two without the other is
+///   [`TrainError::ValidationHalfConfigured`].
 /// - `opt_vm` — VarMap whose variables get optimizer updates. In a
 ///   Full FT run this is the same map as the model was constructed
 ///   against; in a LoRA run it is the fresh LoRA-only map returned by
@@ -906,6 +979,7 @@ fn run_ft_core(
     opt_vm: &VarMap,
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -919,6 +993,24 @@ fn run_ft_core(
     if cfg.grad_accum == 0 {
         return Err(TrainError::ZeroGradAccum);
     }
+    // The two halves of the validation setup, checked against each
+    // other before the lease is taken: both mismatches end in a run
+    // that looks configured and measures nothing.
+    let val = match (val, cfg.eval_every) {
+        (Some(_), 0) => {
+            return Err(TrainError::ValidationHalfConfigured {
+                present: "a validation dataset",
+                missing: "cfg.eval_every",
+            })
+        }
+        (None, n) if n > 0 => {
+            return Err(TrainError::ValidationHalfConfigured {
+                present: "cfg.eval_every",
+                missing: "a validation dataset",
+            })
+        }
+        (val, _) => val,
+    };
 
     let _lease = lease.acquire().ok_or(TrainError::LeaseHeld)?;
     // Fixed reference point for [`CkptInfo::elapsed_ms`]. Taken after
@@ -958,6 +1050,14 @@ fn run_ft_core(
         }
     };
 
+    // Drained before the first step so an empty or broken held-out
+    // split is a refusal at the start rather than a `val_loss` that
+    // never arrives.
+    let val_batches = match val {
+        Some(val) => Some(drain_validation(val)?),
+        None => None,
+    };
+
     // The store is always constructed: even without mid-run
     // checkpoints (`ckpt_every == 0`) the loop still writes the
     // terminal `<prefix>.safetensors` file through it.
@@ -967,6 +1067,10 @@ fn run_ft_core(
     let device = device.clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
+    // `None` until the first evaluation lands, which is also what a run
+    // without a held-out set reports for its whole length.
+    let mut last_val_loss: Option<f32> = None;
+    let mut min_val_loss = f32::INFINITY;
     // Checkpoints the hook asked to hold, in the order it asked.
     let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -994,85 +1098,7 @@ fn run_ft_core(
                 requested: cfg.steps,
             })?;
 
-            let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
-            // The allowed-id input, built only for the entry point that
-            // takes one: every other run would pay for a tensor it
-            // cannot read. The sets are shifted to line up with the
-            // model's inputs — see `allowed_input_sets`.
-            let allowed = match &forward {
-                ForwardPass::Allowed(_) => {
-                    allowed_input_sets(&batch, batch.input_ids[0].len(), &device)?
-                }
-                _ => None,
-            };
-            // The batch's own side channels against the caller's
-            // declared intent. Both disagreements are refused: a
-            // conditioned run over a conditionless batch would train
-            // unconditioned under a checkpoint labelled otherwise, and
-            // an unconditioned run over a conditioned batch would drop
-            // a condition the caller attached per row. `inputs` is the
-            // batch after the target shift, so its first dimension is
-            // still the row count.
-            let logits = match (&mut forward, batch.conds.as_deref(), allowed.as_ref()) {
-                (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
-                (ForwardPass::PerRow(per_row), Some(conds), _) => {
-                    per_row(&inputs, conds, batch.conds_per_row)?
-                }
-                (ForwardPass::Allowed(allowed_forward), None, Some(sets)) => {
-                    allowed_forward(&inputs, sets)?
-                }
-                (ForwardPass::Allowed(_), None, None) => {
-                    return Err(TrainError::MissingAllowedSets {
-                        rows: inputs.dim(0)?,
-                        needed: "the model reads them at every position",
-                    })
-                }
-                // Neither of these two takes a condition, so a batch
-                // carrying one is the same mistake at both.
-                (ForwardPass::Plain(_) | ForwardPass::Allowed(_), Some(conds), _) => {
-                    return Err(TrainError::UnexpectedConditions {
-                        rows: inputs.dim(0)?,
-                        conds: conds.len(),
-                    })
-                }
-                (ForwardPass::PerRow(_), None, _) => {
-                    return Err(TrainError::MissingConditions {
-                        rows: inputs.dim(0)?,
-                    })
-                }
-            };
-            // Mixed precision: the loss (log_softmax + NLL reduction)
-            // is always scored in F32 — BF16's 8 mantissa bits are too
-            // coarse for a mean over thousands of log-probs.
-            // `to_dtype` is differentiable, so the backward pass
-            // crosses back into the model's dtype at this boundary.
-            // F32 logits pass through untouched.
-            let logits = if logits.dtype() == DType::F32 {
-                logits
-            } else {
-                logits.to_dtype(DType::F32)?
-            };
-            // Remove the ids this target could not have taken, so the
-            // loss scores the choice among the ones it could. Applied
-            // after the F32 cast: a large negative penalty in BF16
-            // would not survive the conversion cleanly. Opt-in, and a
-            // batch that cannot honour the opt-in is refused rather
-            // than trained unmasked.
-            let logits = if cfg.mask_disallowed_logits {
-                match allowed_logit_mask(&batch, batch.input_ids[0].len(), logits.dim(2)?, &device)?
-                {
-                    Some(m) => logits.broadcast_add(&m)?,
-                    None => {
-                        return Err(TrainError::MissingAllowedSets {
-                            rows: inputs.dim(0)?,
-                            needed: "cfg.mask_disallowed_logits asks the loss to use them",
-                        })
-                    }
-                }
-            } else {
-                logits
-            };
-            let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
+            let loss = forward_loss(&mut forward, &batch, &device, cfg, loss_fn)?;
 
             let loss_val: f32 = loss.to_scalar()?;
             micro_loss_sum += loss_val;
@@ -1131,6 +1157,19 @@ fn run_ft_core(
 
         opt.step(&grads)?;
 
+        // Scored after the step, so the value belongs to the weights
+        // the checkpoint written just below actually holds.
+        if let Some(batches) = val_batches.as_ref() {
+            if (step + 1) % cfg.eval_every == 0 {
+                let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                last_val_loss = Some(v);
+                if v < min_val_loss {
+                    min_val_loss = v;
+                }
+                tracing::info!(step = step, val_loss = v, "eval_step");
+            }
+        }
+
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
             let ckpt_path = ckpt_store
                 .save_step(save_vm, step + 1)
@@ -1145,6 +1184,7 @@ fn run_ft_core(
                     grad_norm,
                     elapsed_ms: train_start.elapsed().as_millis() as u64,
                     min_train_loss: running_min_loss,
+                    val_loss: last_val_loss,
                 };
                 let control = hook_fn(&info).map_err(TrainError::Hook)?;
 
@@ -1189,9 +1229,17 @@ fn run_ft_core(
                         metrics.insert("min_train_loss".into(), running_min_loss);
                         metrics.insert("final_lr".into(), lr as f32);
                         metrics.insert("early_break".into(), 1.0);
-                        let mut ckpt =
-                            checkpoint_from_path(&final_path, step + 1, mean_loss, None, metrics)
-                                .map_err(TrainError::Ckpt)?;
+                        if last_val_loss.is_some() {
+                            metrics.insert("min_val_loss".into(), min_val_loss);
+                        }
+                        let mut ckpt = checkpoint_from_path(
+                            &final_path,
+                            step + 1,
+                            mean_loss,
+                            last_val_loss,
+                            metrics,
+                        )
+                        .map_err(TrainError::Ckpt)?;
                         ckpt.candidates = candidates;
                         return Ok(ckpt);
                     }
@@ -1208,9 +1256,28 @@ fn run_ft_core(
     let mut metrics: HashMap<String, f32> = HashMap::new();
     metrics.insert("min_train_loss".into(), running_min_loss);
     metrics.insert("final_lr".into(), scheduler.lr_at(cfg.steps - 1) as f32);
+    // A last evaluation whenever the final step was not one, so the
+    // returned record always carries the held-out loss of the weights
+    // it names rather than of some earlier step.
+    if let Some(batches) = val_batches.as_ref() {
+        if cfg.steps % cfg.eval_every != 0 {
+            let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+            last_val_loss = Some(v);
+            if v < min_val_loss {
+                min_val_loss = v;
+            }
+        }
+        metrics.insert("min_val_loss".into(), min_val_loss);
+    }
 
-    let mut ckpt = checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
-        .map_err(TrainError::Ckpt)?;
+    let mut ckpt = checkpoint_from_path(
+        &final_path,
+        cfg.steps,
+        last_train_loss,
+        last_val_loss,
+        metrics,
+    )
+    .map_err(TrainError::Ckpt)?;
     ckpt.candidates = candidates;
     Ok(ckpt)
 }
@@ -1289,6 +1356,14 @@ where
     if train_cfg.init_from.is_some() {
         return Err(TrainError::InitFromUnsupported);
     }
+    // No validation parameter reaches this entry point, so a period
+    // set here could never be honoured. Refused rather than ignored.
+    if train_cfg.eval_every > 0 {
+        return Err(TrainError::ValidationHalfConfigured {
+            present: "cfg.eval_every",
+            missing: "a validation dataset (this entry point takes none)",
+        });
+    }
 
     // Wrap first so we surface `LoraConfig` validation errors (unknown
     // target module, oversized rank) before the lease is acquired.
@@ -1321,6 +1396,7 @@ where
         &lora_vm,
         &lora_vm,
         dataset,
+        None,
         train_cfg,
         loss_fn,
         &nn_dir,
@@ -1410,6 +1486,9 @@ where
                 student,
                 varmap,
                 dataset,
+                // Distillation holds nothing out either; `eval_every`
+                // on the shared config is refused by the loop.
+                None,
                 &spec.hyperparams,
                 &loss,
                 ckpt_dir,
@@ -1419,6 +1498,145 @@ where
             )
         }
     }
+}
+
+/// One batch to its scalar loss: the target shift, the side-channel
+/// checks, the F32 cast and the optional allowed-id mask, in the order
+/// the training step needs them.
+///
+/// Held apart from the step itself because the evaluation pass has to
+/// score the held-out set exactly the way training scores a batch. A
+/// second copy of this sequence would let `val_loss` and `train_loss`
+/// drift apart under any later change to either — and two numbers that
+/// are compared have to be the same measurement.
+///
+/// Returns the loss tensor rather than its scalar value: the training
+/// step needs the node to call `backward()` on, and the evaluation pass
+/// simply never does.
+fn forward_loss(
+    forward: &mut ForwardPass<'_>,
+    batch: &Batch,
+    device: &Device,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+) -> Result<Tensor, TrainError> {
+    let (inputs, targets, mask) = batch_to_input_target(batch, device)?;
+    // The allowed-id input, built only for the entry point that takes
+    // one: every other run would pay for a tensor it cannot read. The
+    // sets are shifted to line up with the model's inputs — see
+    // `allowed_input_sets`.
+    let allowed = match &forward {
+        ForwardPass::Allowed(_) => allowed_input_sets(batch, batch.input_ids[0].len(), device)?,
+        _ => None,
+    };
+    // The batch's own side channels against the caller's declared
+    // intent. Both disagreements are refused: a conditioned run over a
+    // conditionless batch would train unconditioned under a checkpoint
+    // labelled otherwise, and an unconditioned run over a conditioned
+    // batch would drop a condition the caller attached per row.
+    // `inputs` is the batch after the target shift, so its first
+    // dimension is still the row count.
+    let logits = match (forward, batch.conds.as_deref(), allowed.as_ref()) {
+        (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
+        (ForwardPass::PerRow(per_row), Some(conds), _) => {
+            per_row(&inputs, conds, batch.conds_per_row)?
+        }
+        (ForwardPass::Allowed(allowed_forward), None, Some(sets)) => {
+            allowed_forward(&inputs, sets)?
+        }
+        (ForwardPass::Allowed(_), None, None) => {
+            return Err(TrainError::MissingAllowedSets {
+                rows: inputs.dim(0)?,
+                needed: "the model reads them at every position",
+            })
+        }
+        // Neither of these two takes a condition, so a batch carrying
+        // one is the same mistake at both.
+        (ForwardPass::Plain(_) | ForwardPass::Allowed(_), Some(conds), _) => {
+            return Err(TrainError::UnexpectedConditions {
+                rows: inputs.dim(0)?,
+                conds: conds.len(),
+            })
+        }
+        (ForwardPass::PerRow(_), None, _) => {
+            return Err(TrainError::MissingConditions {
+                rows: inputs.dim(0)?,
+            })
+        }
+    };
+    // Mixed precision: the loss (log_softmax + NLL reduction) is always
+    // scored in F32 — BF16's 8 mantissa bits are too coarse for a mean
+    // over thousands of log-probs. `to_dtype` is differentiable, so the
+    // backward pass crosses back into the model's dtype at this
+    // boundary. F32 logits pass through untouched.
+    let logits = if logits.dtype() == DType::F32 {
+        logits
+    } else {
+        logits.to_dtype(DType::F32)?
+    };
+    // Remove the ids this target could not have taken, so the loss
+    // scores the choice among the ones it could. Applied after the F32
+    // cast: a large negative penalty in BF16 would not survive the
+    // conversion cleanly. Opt-in, and a batch that cannot honour the
+    // opt-in is refused rather than trained unmasked.
+    let logits = if cfg.mask_disallowed_logits {
+        match allowed_logit_mask(batch, batch.input_ids[0].len(), logits.dim(2)?, device)? {
+            Some(m) => logits.broadcast_add(&m)?,
+            None => {
+                return Err(TrainError::MissingAllowedSets {
+                    rows: inputs.dim(0)?,
+                    needed: "cfg.mask_disallowed_logits asks the loss to use them",
+                })
+            }
+        }
+    } else {
+        logits
+    };
+    Ok(loss_fn.compute(&logits, &targets, mask.as_ref())?)
+}
+
+/// Drain a validation dataset into the batches every evaluation will
+/// re-score.
+///
+/// Held in memory rather than re-read: [`Dataset`] is a one-pass
+/// stream with no rewind, so a second evaluation would otherwise score
+/// different rows from the first and the sequence of values would stop
+/// being a curve. A held-out split is small by construction, which is
+/// what makes holding it affordable.
+fn drain_validation(val: &mut dyn Dataset) -> Result<Vec<Batch>, TrainError> {
+    let mut batches = Vec::new();
+    while let Some(batch) = val.next_batch()? {
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        return Err(TrainError::EmptyValidationSet);
+    }
+    Ok(batches)
+}
+
+/// Mean loss over the held-out batches, scored on the same forward path
+/// and the same loss the training step uses.
+///
+/// The mean is taken over batches rather than over tokens, matching how
+/// the training step reports its own loss across micro-batches. The two
+/// agree whenever the batches are equally sized, which they are except
+/// for a short final one.
+///
+/// No `backward()` is called, so nothing here touches the optimizer or
+/// the parameters.
+fn evaluate(
+    forward: &mut ForwardPass<'_>,
+    batches: &[Batch],
+    device: &Device,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+) -> Result<f32, TrainError> {
+    let mut sum = 0.0f32;
+    for batch in batches {
+        let loss = forward_loss(forward, batch, device, cfg, loss_fn)?;
+        sum += loss.to_scalar::<f32>()?;
+    }
+    Ok(sum / batches.len() as f32)
 }
 
 /// Break a [`Batch`] into `(inputs, targets, mask)` tensors on the
@@ -1657,6 +1875,7 @@ mod tests {
     use crate::train::data::{DatasetOpts, TokenizedDataset};
     use crate::train::loss::CrossEntropyLoss;
     use candle_nn::VarBuilder;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn tiny_cfg_and_model() -> (Gpt2Config, VarMap, Gpt2Model) {
@@ -1697,6 +1916,199 @@ mod tests {
         )
     }
 
+    /// A run with a held-out set reports its loss on the record, in
+    /// the metrics, and at every hook fire.
+    #[test]
+    fn a_held_out_set_is_scored_and_reaches_the_record_and_the_hook() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 4,
+            warmup: 1,
+            ckpt_every: 2,
+            eval_every: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let seen: Arc<Mutex<Vec<Option<f32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: CkptHook = Box::new(move |info: &CkptInfo| {
+            sink.lock().unwrap().push(info.val_loss);
+            Ok(CkptControl::CONTINUE)
+        });
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "val",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .expect("run with a held-out set");
+
+        let val_loss = ckpt.val_loss.expect("the record carries the held-out loss");
+        assert!(
+            val_loss.is_finite() && val_loss > 0.0,
+            "val_loss = {val_loss}"
+        );
+        let min = *ckpt
+            .metrics
+            .get("min_val_loss")
+            .expect("min_val_loss is recorded alongside min_train_loss");
+        assert!(min <= val_loss, "min_val_loss {min} > final {val_loss}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two checkpoint boundaries at ckpt_every = 2");
+        assert!(
+            seen.iter().all(|v| v.is_some()),
+            "every fire lands on an evaluation boundary here, so each carries a value: {seen:?}"
+        );
+    }
+
+    /// Without a held-out set the record says so rather than reporting
+    /// a number that came from the training rows.
+    #[test]
+    fn a_run_without_a_held_out_set_reports_no_val_loss() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 1,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "noval",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ckpt.val_loss, None);
+        assert!(!ckpt.metrics.contains_key("min_val_loss"));
+    }
+
+    /// Either half of the validation setup without the other is a
+    /// refusal, not a run that quietly measures nothing.
+    #[test]
+    fn half_a_validation_setup_is_refused_from_both_sides() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        let mut ds = overfit_dataset();
+        let period_only = FullFtConfig {
+            steps: 2,
+            eval_every: 1,
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &period_only,
+            &loss,
+            tmp.path(),
+            "half",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ValidationHalfConfigured {
+                    present: "cfg.eval_every",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let set_only = FullFtConfig {
+            steps: 2,
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &set_only,
+            &loss,
+            tmp.path(),
+            "half",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ValidationHalfConfigured {
+                    present: "a validation dataset",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// An empty held-out set is caught before the first step, not after
+    /// a whole run has gone by without a number.
+    #[test]
+    fn an_empty_held_out_set_is_refused_before_the_first_step() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = TokenizedDataset::new(
+            Vec::new(),
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                shuffle: false,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            eval_every: 1,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "empty",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrainError::EmptyValidationSet), "{err}");
+    }
+
     #[test]
     fn lease_rejects_second_concurrent_acquire() {
         let lease = Arc::new(TrainingLease::new());
@@ -1723,6 +2135,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1755,6 +2168,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1819,6 +2233,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1876,6 +2291,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1938,6 +2354,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2045,6 +2462,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2123,6 +2541,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2179,6 +2598,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2231,6 +2651,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2288,6 +2709,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2360,6 +2782,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2425,6 +2848,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2494,6 +2918,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2555,6 +2980,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2600,6 +3026,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2652,6 +3079,7 @@ mod tests {
             &model_a,
             &vm_a,
             &mut ds_a,
+            None,
             &base_cfg(),
             &loss,
             tmp_a.path(),
@@ -2672,6 +3100,7 @@ mod tests {
             &model_b,
             &vm_b,
             &mut ds_b,
+            None,
             &base_cfg(),
             &loss,
             tmp_b.path(),
@@ -2886,6 +3315,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(4),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2912,6 +3342,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2940,6 +3371,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2975,6 +3407,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(4),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3000,6 +3433,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3033,6 +3467,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3069,6 +3504,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3237,6 +3673,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3270,6 +3707,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3310,6 +3748,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),

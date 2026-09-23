@@ -1102,6 +1102,83 @@ local v = h:embed(alc.nn.tokenize("gpt2", "the cat sat"))
 local w = h:embed(alc.nn.tokenize("gpt2", "a cat sits"), { pooling = "last" })
 ```
 
+#### `handle:export_gguf(path, opts?)`
+
+Write the model's weights out as
+[GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) — the
+format llama.cpp, Ollama and LM Studio read.
+
+Everything trained here otherwise lands in safetensors, which the
+training side reads and nothing else does, so a model trained here can
+be evaluated here and nowhere else.
+
+**Parameters:**
+
+| name | type | required | notes |
+|------|------|----------|-------|
+| path | string | yes | file to write |
+| opts.precision | string | no | `f32` (default) / `f16` / `q8_0` / `q5_1` / `q5_0` / `q4_1` / `q4_0` / `q6k` / `q5k` / `q4k` / `q3k` / `q2k` |
+| opts.tokenizer | string | no | path to an HF `tokenizer.json` to embed (the preset cache is `<app>/nn/tokenizers/<preset>.json`) |
+
+**Returns** `{ path, tensors, metadata, tokenizer, architecture }` —
+what was written, including whether a tokenizer went in. Without one the
+file needs an external vocabulary, which most readers will not accept.
+
+**Quantization has a width requirement.** Every ggml block format stores
+a fixed number of values together — 32 for the `q*_0` / `q*_1` families,
+256 for the K-quants — and the last dimension has to be a multiple of
+it. A model whose hidden size is not is exportable at `f32` or `f16`
+and not below; the refusal names the tensor and the block size.
+
+**What is verified and what is not.** The file is asserted to read back
+as a GGUF with every tensor under its GGUF name and shape, the metadata
+it was asked for, and a quantized export inside its format's error.
+**That llama.cpp loads it is not asserted** — that takes llama.cpp,
+which this repository neither builds nor vendors. The naming and key set
+follow its documented convention and the remaining check is one
+`llama-cli -m <file>` where one is installed.
+
+Refused: a `pretrained = true` handle (its tensors live behind an mmap
+this bridge never named — load them into a from-scratch handle first), a
+custom architecture (its feed-forward ratio and position scheme are this
+crate's own, and a reader would assemble the reference graph instead),
+and the llama adapter.
+
+#### `handle:beam_search(prompt_tokens, opts?)`
+
+Search for the most likely continuation rather than sampling one.
+
+Every sampler commits to one token and never reconsiders, so a
+high-probability continuation reachable only through a mediocre first
+token is unreachable. This keeps `beams` partial sequences alive,
+extends all of them, and keeps the best `beams` of the result.
+
+It is a **different objective**, not a better sampler: sampling draws
+from the model's distribution, this approximates the most likely
+sequence under it. Right for a translation, a constrained field, a short
+structured answer; wrong for open text, where the most likely sequence
+is bland and repetitive.
+
+**opts:**
+
+| key | type | notes |
+|-----|------|-------|
+| `beams` | integer | sequences kept alive (default `4`); `1` is greedy decoding |
+| `max_new` | integer | tokens to add beyond the prompt (default `32`) |
+| `length_penalty` | number | divides the score by `length^α` (default `1.0`); `0.0` leaves raw sums and prefers short answers |
+| `eos` | integer | a beam reaching it is finished and stops being extended; it still competes for the ranking |
+
+**Returns** an array of `{ tokens, score, finished }`, best first.
+`tokens` includes the prompt; `score` is the sum of the generated
+tokens' log-probabilities — summed rather than multiplied because the
+product of a few hundred probabilities underflows and every beam would
+score zero.
+
+Longer sequences score lower for being longer, since every additional
+term is negative; `length_penalty = 1.0` makes the score the mean per
+token, which is why it is the default. The search re-forwards each
+candidate, so its cost is `beams` forwards per step.
+
 #### `alc.nn.sampler.penalized(sampler, opts?)`
 
 Wrap a sampler so what the generation has already produced weighs on
@@ -1816,6 +1893,19 @@ Checkpoint before assembling the Card.
     (multiplying by `max_norm / NaN` only spreads the NaN), and
     `info.grad_norm` keeps reporting the norm as measured rather
     than the cap. Zero or negative is refused.
+  - `grad_checkpoint` (boolean, optional, default `false`) —
+    recompute each block's activations during the backward pass
+    instead of keeping them from the forward. Keeps one
+    `[batch, seq, dim]` tensor per block and pays a second
+    forward pass — roughly a third more compute for a fraction
+    of the activation memory, which is what bounds context
+    length and batch size on a given card. The gradients are the
+    same gradients. Available on `run_full_ft` and only for
+    models that decompose into blocks: a conditioned or
+    allowed-id run, a mixture-of-experts model (whose blocks
+    return a load-balancing term that is part of the loss), and
+    a model reading an input channel are all refused rather than
+    run with the flag doing nothing.
   - `metrics_every` (integer, optional, default `0`) — append one
     line per N optimizer steps to `<card_id>-metrics.jsonl`
     beside the checkpoints: `{"step":…,"loss":…,"lr":…}`, plus

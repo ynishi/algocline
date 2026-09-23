@@ -2128,6 +2128,98 @@ impl Gpt2Model {
 
 /// Delegate to the inherent [`Gpt2Model::forward`] so the training
 /// loop can drive any `M: candle_nn::Module` uniformly.
+impl super::blockwise::Checkpointable for Gpt2Model {
+    fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn embed_input(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let (_b, t) = xs.dims2()?;
+        if t > self.cfg.ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "gpt2 forward: seq {t} exceeds ctx {}",
+                self.cfg.ctx
+            )));
+        }
+        let tok_emb = self.wte.forward(xs)?;
+        match &self.wpe {
+            Some(wpe) => {
+                let pos_ids = Tensor::arange(0u32, t as u32, xs.device())?;
+                let pos_emb = wpe.forward(&pos_ids)?;
+                let pos_emb = pos_emb.unsqueeze(0)?.broadcast_as(tok_emb.shape())?;
+                tok_emb + pos_emb
+            }
+            None => Ok(tok_emb),
+        }
+    }
+
+    fn block_forward(&self, index: usize, h: &Tensor) -> CandleResult<Tensor> {
+        let block = self.blocks.get(index).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "gpt2 block_forward: block {index} of {}",
+                self.blocks.len()
+            ))
+        })?;
+        let (_b, t, _d) = h.dims3()?;
+        // The per-forward positional tables, rebuilt per block rather
+        // than threaded in: they are narrows of cached tensors, and the
+        // blockwise driver calls this once per block per pass rather
+        // than in a tight loop.
+        let alibi_bias = match &self.alibi {
+            Some((slopes, dist)) => {
+                let dist_t = dist.i((..t, ..t))?.unsqueeze(0)?;
+                Some(slopes.broadcast_mul(&dist_t)?.neg()?)
+            }
+            None => None,
+        };
+        let pos_ctx = PosContext {
+            rope: self.rope.as_ref().map(|(c, s)| (c, s)),
+            alibi: alibi_bias.as_ref(),
+            offset: 0,
+        };
+        let (out, aux) = block.forward(h, &self.causal_mask, &pos_ctx, None, None)?;
+        if aux.is_some() {
+            // Guarded by `checkpointable` before the run starts; this
+            // is the builder-bug path, not a user-reachable one.
+            return Err(candle_core::Error::Msg(
+                "gpt2 block_forward: a mixture-of-experts block returned an auxiliary term \
+                 this surface cannot carry (guard bug)"
+                    .into(),
+            ));
+        }
+        Ok(out)
+    }
+
+    fn head_forward(&self, h: &Tensor) -> CandleResult<Tensor> {
+        let h = self.ln_f.apply(h)?;
+        let w = match &self.lm_head {
+            Some(w) => w,
+            None => self.wte.embeddings(),
+        };
+        h.broadcast_matmul(&w.t()?)
+    }
+
+    fn checkpointable(&self) -> Result<(), String> {
+        if self.cfg.moe.is_some() {
+            return Err(
+                "a mixture-of-experts model's blocks return a load-balancing term that is part \
+                 of the loss, and a blockwise driver cannot carry it; train this model without \
+                 grad_checkpoint"
+                    .into(),
+            );
+        }
+        if self.cond_wte.is_some() || self.allowed_wte.is_some() {
+            return Err(
+                "this model reads an input channel (a conditioning table or allowed-id sets) \
+                 that the blockwise surface does not take, and running without it would train \
+                 a model in a state it never trained in; train it without grad_checkpoint"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Module for Gpt2Model {
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         Gpt2Model::forward(self, xs)

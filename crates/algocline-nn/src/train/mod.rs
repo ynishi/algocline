@@ -28,6 +28,7 @@
 
 use std::collections::HashMap;
 
+pub mod checkpointing;
 pub mod ckpt;
 pub mod corpus;
 pub mod data;

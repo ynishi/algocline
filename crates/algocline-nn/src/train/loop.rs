@@ -27,7 +27,8 @@ use candle_core::TensorId;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
 use candle_nn::{Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
+use crate::arch::{AllowedSets, Checkpointable, CondIndex, LoraConfig, LoraWrappable};
+use crate::train::checkpointing::checkpointed_step;
 use crate::train::ckpt::{
     checkpoint_from_path, restore_into, Candidate, CheckpointStore, MetricPoint, RestoreError,
 };
@@ -363,6 +364,28 @@ pub struct FullFtConfig {
     /// measured before this scaling, so it says what the step actually
     /// produced rather than what the cap allowed through.
     pub clip_grad_norm: Option<f64>,
+    /// Recompute each block's activations during the backward pass
+    /// instead of keeping them from the forward.
+    ///
+    /// `false` (default) keeps every intermediate of every block alive
+    /// until the backward reads it, which is what bounds context length
+    /// and batch size on a given card. `true` keeps one
+    /// `[batch, seq, dim]` tensor per block and pays a second forward
+    /// pass for the rest — roughly a third more compute for a fraction
+    /// of the activation memory (Chen et al. 2016,
+    /// [arXiv:1604.06174](https://arxiv.org/abs/1604.06174)).
+    ///
+    /// The gradients are the same gradients: a checkpointed step is
+    /// asserted against an ordinary one parameter by parameter, not
+    /// merely shaped like it.
+    ///
+    /// Available on [`run_full_ft`] only, and only for models that can
+    /// be driven one block at a time
+    /// ([`crate::arch::Checkpointable::checkpointable`] says which).
+    /// Asking for it elsewhere is
+    /// [`TrainError::CheckpointingUnsupported`] rather than a flag that
+    /// silently does nothing.
+    pub grad_checkpoint: bool,
     /// Append one line per N optimizer steps to a
     /// `<prefix>-metrics.jsonl` file beside the checkpoints, or `0`
     /// (default) to write none.
@@ -476,6 +499,7 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            grad_checkpoint: false,
             metrics_every: 0,
             early_stop: None,
             save_optimizer_state: false,
@@ -699,6 +723,15 @@ pub enum TrainError {
         /// The half it needs.
         missing: &'static str,
     },
+    /// [`FullFtConfig::grad_checkpoint`] was set where it cannot be
+    /// honoured.
+    ///
+    /// Either the entry point does not take a blockwise view of the
+    /// model (the conditioned / allowed-id / LoRA paths), or the model
+    /// itself refuses one. A flag that silently did nothing would leave
+    /// a caller believing they had the memory headroom they asked for.
+    #[error("grad_checkpoint cannot be honoured here: {0}")]
+    CheckpointingUnsupported(String),
     /// [`FullFtConfig::early_stop`] was set on a run with nothing to
     /// watch.
     ///
@@ -1017,7 +1050,7 @@ pub fn run_full_ft<M>(
     hook: Option<CkptHook>,
 ) -> Result<Checkpoint, TrainError>
 where
-    M: Module + DeviceView,
+    M: Module + DeviceView + Checkpointable,
 {
     // `run_full_ft` optimises every variable registered against
     // `varmap` — the full-fine-tune baseline. It shares its inner
@@ -1032,6 +1065,11 @@ where
         varmap,
         dataset,
         val,
+        // The same model, as the blockwise view `grad_checkpoint`
+        // needs. Only this entry point has one: the conditioned and
+        // allowed-id passes read a channel the blockwise surface does
+        // not take.
+        Some(model),
         cfg,
         loss_fn,
         ckpt_dir,
@@ -1092,6 +1130,10 @@ where
         varmap,
         dataset,
         val,
+        // No blockwise view: this pass reads an input channel the
+        // blockwise surface does not take, so `grad_checkpoint` is
+        // refused here rather than quietly dropping the channel.
+        None,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -1153,6 +1195,10 @@ where
         varmap,
         dataset,
         val,
+        // No blockwise view: this pass reads an input channel the
+        // blockwise surface does not take, so `grad_checkpoint` is
+        // refused here rather than quietly dropping the channel.
+        None,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -1300,6 +1346,10 @@ type AllowedForwardPass<'a> = dyn FnMut(&Tensor, &AllowedSets) -> Result<Tensor,
 ///   demand of the model without this function knowing about any of
 ///   them, and it checks each batch against the variant rather than
 ///   letting a disagreement pass as a silent ignore.
+/// - `blockwise` — the model again, as something that can be driven one
+///   block at a time, for [`FullFtConfig::grad_checkpoint`]. `None` on
+///   the entry points that have no such view, where asking for
+///   checkpointing is refused rather than ignored.
 /// - `val` — the held-out set, drained once before the first step and
 ///   re-scored every [`FullFtConfig::eval_every`] steps. `None` on a
 ///   run without one; supplying one of the two without the other is
@@ -1321,6 +1371,7 @@ fn run_ft_core(
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
     val: Option<&mut dyn Dataset>,
+    blockwise: Option<&dyn Checkpointable>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -1342,6 +1393,23 @@ fn run_ft_core(
     // The two halves of the validation setup, checked against each
     // other before the lease is taken: both mismatches end in a run
     // that looks configured and measures nothing.
+    // Checked before the lease, like the other config disagreements.
+    let blockwise = match (cfg.grad_checkpoint, blockwise) {
+        (false, _) => None,
+        (true, Some(model)) => {
+            model
+                .checkpointable()
+                .map_err(TrainError::CheckpointingUnsupported)?;
+            Some(model)
+        }
+        (true, None) => {
+            return Err(TrainError::CheckpointingUnsupported(
+                "this entry point drives the model through a forward it cannot decompose; \
+                 grad_checkpoint is available on run_full_ft"
+                    .into(),
+            ))
+        }
+    };
     if cfg.early_stop.is_some() && cfg.eval_every == 0 {
         return Err(TrainError::EarlyStopWithoutValidation);
     }
@@ -1468,19 +1536,43 @@ fn run_ft_core(
                 requested: cfg.steps,
             })?;
 
-            let loss = forward_loss(&mut forward, &batch, &device, cfg, loss_fn)?;
-
-            let loss_val: f32 = loss.to_scalar()?;
-            micro_loss_sum += loss_val;
-
             // Pre-backward `1 / grad_accum` scaling — the canonical
             // form. Scalar multiplication is linear w.r.t. the backward
             // pass, so `sum_i grad(loss_i / N) == grad(mean_i loss_i)`
             // and the reported grad equals the mean over the effective
             // batch. For `grad_accum == 1` this reduces to `scale = 1`
-            // and the multiply is a no-op numerically.
-            let scaled = (&loss * scale)?;
-            let grads = scaled.backward()?;
+            // and the multiply is a no-op numerically. Both paths apply
+            // it before any backward runs, so they scale identically.
+            let (loss_val, grads) = match blockwise {
+                Some(model) => {
+                    let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
+                    let (value, grads) = checkpointed_step(
+                        model,
+                        &inputs,
+                        |logits| {
+                            loss_from_logits(
+                                logits.clone(),
+                                &batch,
+                                &targets,
+                                mask.as_ref(),
+                                cfg,
+                                loss_fn,
+                                &device,
+                            )
+                            .map_err(|e| candle_core::Error::Msg(e.to_string()))
+                        },
+                        scale,
+                    )?;
+                    (value, grads)
+                }
+                None => {
+                    let loss = forward_loss(&mut forward, &batch, &device, cfg, loss_fn)?;
+                    let loss_val: f32 = loss.to_scalar()?;
+                    let scaled = (&loss * scale)?;
+                    (loss_val, scaled.backward()?)
+                }
+            };
+            micro_loss_sum += loss_val;
             match accum.as_mut() {
                 Some(store) => store.extend(grads)?,
                 None => accum = Some(grads),
@@ -1874,6 +1966,9 @@ where
         &lora_vm,
         dataset,
         None,
+        // No blockwise view: the wrapped model's blocks are not the
+        // ones this entry holds a map for.
+        None,
         train_cfg,
         loss_fn,
         &nn_dir,
@@ -1951,7 +2046,7 @@ pub fn run_distill<M>(
     lease: Arc<TrainingLease>,
 ) -> Result<Checkpoint, TrainError>
 where
-    M: Module + DeviceView,
+    M: Module + DeviceView + Checkpointable,
 {
     match spec.loss_kind {
         DistillLossKind::Ce => {
@@ -2041,6 +2136,26 @@ fn forward_loss(
             })
         }
     };
+    loss_from_logits(logits, batch, &targets, mask.as_ref(), cfg, loss_fn, device)
+}
+
+/// A model's logits to the scalar loss: the F32 cast, the optional
+/// allowed-id mask, and the loss itself.
+///
+/// The tail of [`forward_loss`], split off because the
+/// gradient-checkpointed path produces its logits elsewhere and has to
+/// score them the same way. Two copies of this sequence would let a
+/// checkpointed run and an ordinary one optimise slightly different
+/// objectives while reporting the same number.
+fn loss_from_logits(
+    logits: Tensor,
+    batch: &Batch,
+    targets: &Tensor,
+    mask: Option<&Tensor>,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    device: &Device,
+) -> Result<Tensor, TrainError> {
     // Mixed precision: the loss (log_softmax + NLL reduction) is always
     // scored in F32 — BF16's 8 mantissa bits are too coarse for a mean
     // over thousands of log-probs. `to_dtype` is differentiable, so the
@@ -2061,7 +2176,7 @@ fn forward_loss(
             Some(m) => logits.broadcast_add(&m)?,
             None => {
                 return Err(TrainError::MissingAllowedSets {
-                    rows: inputs.dim(0)?,
+                    rows: logits.dim(0)?,
                     needed: "cfg.mask_disallowed_logits asks the loss to use them",
                 })
             }
@@ -2069,7 +2184,7 @@ fn forward_loss(
     } else {
         logits
     };
-    Ok(loss_fn.compute(&logits, &targets, mask.as_ref())?)
+    Ok(loss_fn.compute(&logits, targets, mask)?)
 }
 
 /// Drain a validation dataset into the batches every evaluation will
@@ -2890,6 +3005,153 @@ mod tests {
             seen.iter().all(|v| v.is_some()),
             "every fire lands on an evaluation boundary here, so each carries a value: {seen:?}"
         );
+    }
+
+    /// A checkpointed run is the same run: after the same steps on the
+    /// same data from the same initialisation, the parameters match.
+    #[test]
+    fn a_checkpointed_run_lands_where_the_ordinary_one_does() {
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        let weights_after = |grad_checkpoint: bool, prefix: &str| -> BTreeMap<String, Vec<f32>> {
+            let cfg = Gpt2Config {
+                layers: 2,
+                heads: 2,
+                dim: 16,
+                ctx: 8,
+                vocab: 32,
+                dtype: DType::F32,
+                device: Device::Cpu,
+                eps: 1e-5,
+                moe: None,
+                custom: None,
+            };
+            let vm = VarMap::new();
+            // Seeded, so the two runs start from one model and a
+            // difference at the end is the checkpointing.
+            let vs = crate::arch::seeded_var_builder(&vm, 4711, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(&cfg, vs).unwrap();
+            let mut ds = overfit_dataset();
+            let ft = FullFtConfig {
+                lr: 5e-3,
+                steps: 4,
+                warmup: 1,
+                grad_checkpoint,
+                ..FullFtConfig::default()
+            };
+            run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &ft,
+                &loss,
+                tmp.path(),
+                prefix,
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .expect("run");
+            let data = vm.data().lock().unwrap();
+            data.iter()
+                .map(|(name, var)| {
+                    let t = var.as_tensor().flatten_all().unwrap();
+                    (name.clone(), t.to_vec1::<f32>().unwrap())
+                })
+                .collect()
+        };
+
+        let plain = weights_after(false, "plain");
+        let checkpointed = weights_after(true, "ckpt");
+        assert_eq!(plain.len(), checkpointed.len());
+        assert!(!plain.is_empty());
+        for (name, values) in &plain {
+            let other = checkpointed.get(name).expect("same parameter set");
+            let gap = values
+                .iter()
+                .zip(other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(gap < 1e-4, "`{name}` diverged by {gap} after 4 steps");
+        }
+    }
+
+    /// An entry point with no blockwise view refuses the flag rather
+    /// than ignoring it — a caller who believed they had the memory
+    /// headroom would find out from an allocator, much later.
+    #[test]
+    fn checkpointing_is_refused_where_it_cannot_be_honoured() {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: 8,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(crate::arch::Gpt2Custom {
+                cond_slots: Some(2),
+                ..Default::default()
+            }),
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        let ft = FullFtConfig {
+            steps: 2,
+            grad_checkpoint: true,
+            ..FullFtConfig::default()
+        };
+
+        // The conditioned entry point has no blockwise view at all.
+        let mut ds = overfit_dataset()
+            .with_conditions(vec![CondIndex::new(0, 2).unwrap(); 400])
+            .unwrap();
+        let err = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &ft,
+            &loss,
+            tmp.path(),
+            "cond",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::CheckpointingUnsupported(_)),
+            "{err}"
+        );
+
+        // And the model itself refuses, because its forward reads a
+        // channel the blockwise surface does not take.
+        let mut ds = overfit_dataset();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &ft,
+            &loss,
+            tmp.path(),
+            "chan",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::CheckpointingUnsupported(why) => {
+                assert!(why.contains("input channel"), "{why}")
+            }
+            other => panic!("expected a checkpointing refusal, got {other}"),
+        }
     }
 
     /// Early stopping ends the run where the held-out loss stopped

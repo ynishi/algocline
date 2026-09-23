@@ -594,6 +594,11 @@ fn apply_optional_overrides(
     if let Some(v) = opts.get::<Option<bool>>("save_optimizer_state")? {
         cfg.save_optimizer_state = v;
     }
+    // Recompute activations instead of keeping them. Refused by the
+    // loop where it cannot be honoured, rather than ignored.
+    if let Some(v) = opts.get::<Option<bool>>("grad_checkpoint")? {
+        cfg.grad_checkpoint = v;
+    }
     // Per-step curve. Writes `<card_id>-metrics.jsonl` beside the
     // checkpoints; `0` (default) writes none.
     if let Some(v) = opts.get::<Option<usize>>("metrics_every")? {

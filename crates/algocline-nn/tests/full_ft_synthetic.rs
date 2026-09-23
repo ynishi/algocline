@@ -214,6 +214,11 @@ impl algocline_nn::train::DeviceView for UnigramModel {
     }
 }
 
+/// This fixture has no blocks to recompute, so it takes the trait's
+/// refusing defaults: `grad_checkpoint` against it is an error, which
+/// is the honest answer for a model with one parameter and no depth.
+impl algocline_nn::arch::Checkpointable for UnigramModel {}
+
 /// Mixed-precision loop fence (design §7.1): BF16 parameters train
 /// through `run_full_ft` → `MixedAdamW` on CPU. Loss must drop toward
 /// the corpus marginal entropy, the parameter must stay BF16, and the

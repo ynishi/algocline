@@ -15,6 +15,7 @@
 //! with the same variable names used at construction time.
 
 pub mod adapter;
+pub mod blockwise;
 pub mod custom;
 pub mod gpt2;
 pub mod kv;
@@ -46,6 +47,7 @@ pub(crate) fn softmax_last_dim_slow(
     candle_nn::ops::softmax(xs, candle_core::D::Minus1)
 }
 
+pub use blockwise::Checkpointable;
 pub use custom::{
     Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind, ALLOWED_TABLE_PREFIX,
     ALLOWED_TABLE_TENSOR, COND_TABLE_PREFIX, COND_TABLE_TENSOR,

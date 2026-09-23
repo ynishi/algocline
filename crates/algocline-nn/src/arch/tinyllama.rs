@@ -926,6 +926,52 @@ impl TinyLlamaModel {
 
 /// Delegate to the inherent [`TinyLlamaModel::forward`] so the training
 /// loop can drive any `M: candle_nn::Module` uniformly.
+impl super::blockwise::Checkpointable for TinyLlamaModel {
+    fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    fn embed_input(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        let (_b, t) = xs.dims2()?;
+        if t > self.cfg.ctx {
+            return Err(candle_core::Error::Msg(format!(
+                "tinyllama forward: seq {t} exceeds ctx {}",
+                self.cfg.ctx
+            )));
+        }
+        self.embed_tokens.forward(xs)
+    }
+
+    fn block_forward(&self, index: usize, h: &Tensor) -> CandleResult<Tensor> {
+        let block = self.blocks.get(index).ok_or_else(|| {
+            candle_core::Error::Msg(format!(
+                "tinyllama block_forward: block {index} of {}",
+                self.blocks.len()
+            ))
+        })?;
+        block.forward(
+            h,
+            &self.rope_cos,
+            &self.rope_sin,
+            &self.causal_mask,
+            0,
+            None,
+        )
+    }
+
+    fn head_forward(&self, h: &Tensor) -> CandleResult<Tensor> {
+        let h = apply_slow_rms_norm(&self.norm, h)?;
+        self.lm_head.forward(&h)
+    }
+
+    /// Nothing to refuse: TinyLlama has no mixture-of-experts variant
+    /// and no input channel, so every model of this architecture can be
+    /// driven blockwise.
+    fn checkpointable(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 impl Module for TinyLlamaModel {
     fn forward(&self, xs: &Tensor) -> CandleResult<Tensor> {
         TinyLlamaModel::forward(self, xs)

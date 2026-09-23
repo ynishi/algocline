@@ -13,6 +13,7 @@
 //! logits:vocab()                         -> n
 //! logits:top(n)                          -> { { id = i, value = v }, ... }
 //! logits:argmax()                        -> id
+//! handle:embed(tokens, opts?)            -> { number, ... }
 //! alc.nn.logits.mix(a, b, beta, opts?)   -> LogitsHandle
 //! alc.nn.tokenize(preset, text)          -> { id, ... }
 //! alc.nn.detokenize(preset, ids)         -> string
@@ -98,6 +99,7 @@ use std::sync::{Arc, Mutex};
 use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
 use algocline_nn::arch::KvCache;
 use algocline_nn::arch::{AllowedSets, CondIndex, Gpt2Model, TinyLlamaModel};
+use algocline_nn::pooling::{pool, Pooling};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
 use candle_core::{DType, Device, Tensor};
@@ -1176,6 +1178,159 @@ where
             )
         },
     );
+}
+
+/// Register `handle:embed(tokens, opts?)` on the trainable GPT-2
+/// handle's method table.
+pub(super) fn add_gpt2_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            embed_gpt2(this, &tokens, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:embed(tokens, opts?)` on the trainable TinyLlama
+/// handle's method table.
+pub(super) fn add_tinyllama_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            embed_tinyllama(this, &tokens, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:embed(tokens, opts?)` on the union handle — what a
+/// Card reloaded through `alc.nn.card.load_handle` carries.
+pub(super) fn add_nn_handle_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<NnHandle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            let opts = opts.as_ref();
+            match this {
+                NnHandle::Gpt2(h) => embed_gpt2(h, &tokens, opts),
+                NnHandle::TinyLlama(h) => embed_tinyllama(h, &tokens, opts),
+                // The adapter architectures expose logits and nothing
+                // else: their forward returns the head's output and
+                // there is no hidden state to reach behind it. Refused
+                // by name rather than answered with the logits row,
+                // which is a different quantity of a different width.
+                NnHandle::Llama(_) => Err(LuaError::external(format!(
+                    "{EMBED_ERR_PREFIX}: the llama adapter exposes logits only, so it has no \
+                     hidden state to pool; embed with a gpt2 / tinyllama handle"
+                ))),
+            }
+        },
+    );
+}
+
+/// The embedding of `tokens` under a GPT-2 handle.
+fn embed_gpt2(this: &Gpt2Handle, tokens: &[i64], opts: Option<&LuaTable>) -> LuaResult<Vec<f32>> {
+    let ids = validate_embed_input(tokens, this.vocab(), this.ctx())?;
+    let pooling = extract_pooling(opts)?;
+    let model = this.model();
+    let guard = model
+        .lock()
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: model lock: {e}")))?;
+    let input = Tensor::from_slice(&ids, (1, ids.len()), guard.device())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    let hidden = guard
+        .hidden(&input)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled_row(&hidden, pooling)
+}
+
+/// The embedding of `tokens` under a TinyLlama handle.
+fn embed_tinyllama(
+    this: &TinyLlamaHandle,
+    tokens: &[i64],
+    opts: Option<&LuaTable>,
+) -> LuaResult<Vec<f32>> {
+    let ids = validate_embed_input(tokens, this.vocab(), this.ctx())?;
+    let pooling = extract_pooling(opts)?;
+    let model = this.model();
+    let guard = model
+        .lock()
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: model lock: {e}")))?;
+    let input = Tensor::from_slice(&ids, (1, ids.len()), guard.device())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    let hidden = guard
+        .hidden(&input)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled_row(&hidden, pooling)
+}
+
+/// Error prefix for the embedding surface.
+const EMBED_ERR_PREFIX: &str = "alc.nn handle:embed";
+
+/// Check an embedding input: non-empty, in vocabulary, inside the
+/// context window.
+///
+/// The window is checked here rather than left to the forward pass for
+/// the same reason the session checks it: the message then names the
+/// input the caller wrote instead of a tensor dimension.
+fn validate_embed_input(tokens: &[i64], vocab: usize, ctx: usize) -> LuaResult<Vec<u32>> {
+    if tokens.is_empty() {
+        return Err(LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: tokens is empty; an embedding of nothing is not a vector \
+             of zeros, it is a question with no subject"
+        )));
+    }
+    if tokens.len() > ctx {
+        return Err(LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: {} tokens exceed the model context window ({ctx}); \
+             split the input or embed a window of it",
+            tokens.len()
+        )));
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, id)| check_token(*id, vocab, &format!("tokens[{}]", i + 1)))
+        .collect()
+}
+
+/// Read `opts.pooling`, defaulting to the mean.
+fn extract_pooling(opts: Option<&LuaTable>) -> LuaResult<Pooling> {
+    let Some(t) = opts else {
+        return Ok(Pooling::default());
+    };
+    let Some(name) = t.get::<Option<String>>("pooling")? else {
+        return Ok(Pooling::default());
+    };
+    Pooling::parse(&name).ok_or_else(|| {
+        LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: unknown pooling '{name}' (expected one of: {})",
+            Pooling::NAMES.join(" / ")
+        ))
+    })
+}
+
+/// Pool a `[1, seq, dim]` hidden state into the flat Lua array a caller
+/// gets back.
+///
+/// A plain array of numbers rather than an opaque handle: an embedding
+/// is consumed by whatever the caller already has — a distance, a store,
+/// a file — and none of those would take a handle this crate defines.
+fn pooled_row(hidden: &Tensor, pooling: Pooling) -> LuaResult<Vec<f32>> {
+    let pooled = pool(hidden, pooling, None)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled
+        .squeeze(0)
+        .and_then(|row| row.to_dtype(DType::F32))
+        .and_then(|row| row.to_vec1::<f32>())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))
 }
 
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the

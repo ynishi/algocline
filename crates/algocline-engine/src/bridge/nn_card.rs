@@ -1662,6 +1662,9 @@ impl mlua::UserData for Gpt2Handle {
         // backend (no KV cache on the trainable arch); see nn_gen's
         // module doc §"Sessions over trainable arches".
         super::nn_gen::add_gpt2_generate_session_method(methods);
+        // `handle:embed(tokens, opts?)` — the pooled hidden state, so a
+        // model trained here can be used as an encoder.
+        super::nn_gen::add_gpt2_embed_method(methods);
     }
 }
 
@@ -2466,6 +2469,7 @@ impl mlua::UserData for TinyLlamaHandle {
         add_meta_methods(methods, TinyLlamaHandle::meta);
         // Stateless-session mirror of the Gpt2Handle registration.
         super::nn_gen::add_tinyllama_generate_session_method(methods);
+        super::nn_gen::add_tinyllama_embed_method(methods);
     }
 }
 
@@ -5827,6 +5831,8 @@ impl mlua::UserData for NnHandle {
         // `handle:generate_session(prompt)` on the union — this is what
         // lets a Card reloaded via `alc.nn.card.load_handle` generate.
         super::nn_gen::add_nn_handle_generate_session_method(methods);
+        // `handle:embed(tokens, opts?)` on the union, for the same reason.
+        super::nn_gen::add_nn_handle_embed_method(methods);
     }
 }
 

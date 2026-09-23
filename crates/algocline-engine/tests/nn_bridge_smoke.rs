@@ -1626,6 +1626,85 @@ fn eval_with_handle<T: mlua::FromLuaMulti>(lua: &Lua, body: &str, what: &str) ->
         .unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
+/// `handle:embed` answers with one vector per call, its length the
+/// model's hidden size, and the three poolings are three different
+/// answers rather than three names for one.
+#[test]
+fn alc_nn_handle_embed_pools_the_hidden_state() {
+    let lua = nn_vm();
+    let out: Vec<f32> = lua
+        .load(
+            r#"
+        -- A trainable handle: the llama adapter exposes logits only and
+        -- refuses this call by name.
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local mean = h:embed({ 1, 2, 3 })
+        local last = h:embed({ 1, 2, 3 }, { pooling = "last" })
+        local max  = h:embed({ 1, 2, 3 }, { pooling = "max" })
+        assert(#mean == #last and #last == #max, "one length for every pooling")
+        assert(#mean > 0, "an embedding must have a width")
+
+        -- The same input twice is the same vector: the model is not
+        -- being re-initialised between calls.
+        local again = h:embed({ 1, 2, 3 })
+        for i = 1, #mean do
+            assert(mean[i] == again[i], "embedding " .. i .. " is not stable")
+        end
+
+        -- A different input is a different vector, or the embedding
+        -- carries nothing about what it read.
+        local other = h:embed({ 9, 8, 7 })
+        local moved = false
+        for i = 1, #mean do
+            if math.abs(mean[i] - other[i]) > 1e-6 then moved = true end
+        end
+        assert(moved, "two inputs embedded identically")
+
+        -- The poolings disagree.
+        local differs = false
+        for i = 1, #mean do
+            if math.abs(mean[i] - last[i]) > 1e-6 then differs = true end
+        end
+        assert(differs, "mean and last pooling returned the same vector")
+
+        return { #mean, #last, #max }
+    "#,
+        )
+        .eval()
+        .expect("handle:embed pools the hidden state");
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0], out[1]);
+    assert_eq!(out[1], out[2]);
+}
+
+/// The refusals the embedding surface owns: nothing to embed, a token
+/// the model has no row for, an unknown pooling name.
+#[test]
+fn alc_nn_handle_embed_refuses_what_it_cannot_answer() {
+    let lua = nn_vm();
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        return {
+            err(function() return h:embed({}) end),
+            err(function() return h:embed({ 999999 }) end),
+            err(function() return h:embed({ 1 }, { pooling = "cls" }) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("handle:embed refusals");
+    assert!(errors[0].contains("empty"), "{}", errors[0]);
+    assert!(errors[1].contains("vocab"), "{}", errors[1]);
+    assert!(errors[2].contains("pooling"), "{}", errors[2]);
+}
+
 /// Every factory produces a sampler a decode loop can drive: each draws
 /// an in-vocabulary token, and an unconstrained sampler never reports
 /// itself done (termination is the constraint layer's business).

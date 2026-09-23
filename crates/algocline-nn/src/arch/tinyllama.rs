@@ -771,7 +771,17 @@ impl TinyLlamaModel {
         self.forward_inner(xs, Some(cache))
     }
 
-    fn forward_inner(&self, xs: &Tensor, mut kv: Option<&mut KvCache>) -> CandleResult<Tensor> {
+    fn forward_inner(&self, xs: &Tensor, kv: Option<&mut KvCache>) -> CandleResult<Tensor> {
+        let (b, t) = xs.dims2()?;
+        let h = self.hidden_inner(xs, kv)?;
+        let logits = self.lm_head.forward(&h)?;
+        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        Ok(logits)
+    }
+
+    /// Everything [`Self::forward_inner`] does except the language-model
+    /// head. See [`Self::hidden`].
+    fn hidden_inner(&self, xs: &Tensor, mut kv: Option<&mut KvCache>) -> CandleResult<Tensor> {
         let (b, t) = xs.dims2()?;
         // Read once, before any layer runs: the cache only advances
         // after the last one.
@@ -809,12 +819,20 @@ impl TinyLlamaModel {
             )?;
         }
         let h = apply_slow_rms_norm(&self.norm, &h)?;
-        let logits = self.lm_head.forward(&h)?;
-        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
         if let Some(cache) = kv {
             cache.advance(b, t);
         }
-        Ok(logits)
+        Ok(h)
+    }
+
+    /// The `[batch, seq, dim]` hidden state the language-model head
+    /// reads, after the final norm.
+    ///
+    /// See [`crate::arch::Gpt2Model::hidden`]: the same output, for the
+    /// same reason, and the tensor [`crate::pooling`] turns into an
+    /// embedding.
+    pub fn hidden(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        self.hidden_inner(xs, None)
     }
 
     /// Canonical LoRA target-module set for TinyLlama: attention

@@ -1378,6 +1378,34 @@ impl Gpt2Model {
             .map(|(logits, _)| logits)
     }
 
+    /// The `[batch, seq, dim]` hidden state the language-model head
+    /// reads, after the final norm.
+    ///
+    /// This is what "last hidden state" means everywhere it appears, and
+    /// it is the tensor an embedding is pooled from
+    /// ([`crate::pooling`]). It cannot be recovered from the logits: the
+    /// head projects `dim` onto a vocabulary and that projection is not
+    /// invertible.
+    ///
+    /// A model trained here can therefore be used as an encoder — which
+    /// it could not be while the only output was logits.
+    pub fn hidden(&self, xs: &Tensor) -> CandleResult<Tensor> {
+        self.hidden_inner(xs, None, None, None, None)
+            .map(|(h, _)| h)
+    }
+
+    /// [`Self::hidden`] with the condition the model was built to read.
+    pub fn hidden_conditioned(&self, xs: &Tensor, conds: &[CondIndex]) -> CandleResult<Tensor> {
+        self.hidden_inner(
+            xs,
+            Some(CondInput::Rows { conds, per_row: 1 }),
+            None,
+            None,
+            None,
+        )
+        .map(|(h, _)| h)
+    }
+
     /// An empty [`KvCache`] sized to this model.
     ///
     /// One per generation: the entries are positions of one particular
@@ -1703,6 +1731,33 @@ impl Gpt2Model {
         xs: &Tensor,
         cond: Option<CondInput<'_>>,
         allowed: Option<&AllowedSets>,
+        probs_sink: Option<&mut Vec<Tensor>>,
+        kv: Option<&mut KvCache>,
+    ) -> CandleResult<(Tensor, Option<Tensor>)> {
+        let (b, t) = xs.dims2()?;
+        let (h, aux) = self.hidden_inner(xs, cond, allowed, probs_sink, kv)?;
+        // LM head: tied reuses wte; untied has its own Var.
+        let w = match &self.lm_head {
+            Some(w) => w,
+            None => self.wte.embeddings(), // [V, D]
+        };
+        let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
+        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
+        Ok((logits, aux))
+    }
+
+    /// Everything [`Self::forward_inner`] does except the language-model
+    /// head: the `[batch, seq, dim]` hidden state after the final norm.
+    ///
+    /// Split out because that tensor is a model output in its own right
+    /// — it is what an embedding is pooled from — and re-deriving it by
+    /// inverting the head is not possible: the head projects `dim` down
+    /// to a vocabulary and the projection is not invertible.
+    fn hidden_inner(
+        &self,
+        xs: &Tensor,
+        cond: Option<CondInput<'_>>,
+        allowed: Option<&AllowedSets>,
         mut probs_sink: Option<&mut Vec<Tensor>>,
         mut kv: Option<&mut KvCache>,
     ) -> CandleResult<(Tensor, Option<Tensor>)> {
@@ -1826,19 +1881,12 @@ impl Gpt2Model {
             }
         }
         let h = self.ln_f.apply(&h)?; // [B, T, D]
-                                      // LM head: tied reuses wte; untied has its own Var.
-        let w = match &self.lm_head {
-            Some(w) => w,
-            None => self.wte.embeddings(), // [V, D]
-        };
-        let logits = h.broadcast_matmul(&w.t()?)?; // [B, T, V]
-        debug_assert_eq!(logits.dims(), &[b, t, self.cfg.vocab]);
-        // After every layer has pushed its entries, so the offset each
-        // of them read was the same one.
+                                      // After every layer has pushed its entries, so the offset each
+                                      // of them read was the same one.
         if let Some(cache) = kv {
             cache.advance(b, t);
         }
-        Ok((logits, aux_sum))
+        Ok((h, aux_sum))
     }
 
     /// The per-row condition vectors, shaped `[batch, 1, dim]` so they
@@ -2743,6 +2791,65 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// `hidden` returns the tensor the language-model head reads: its
+    /// own projection through the head has to reproduce `forward`.
+    #[test]
+    fn the_hidden_state_is_what_the_head_reads() {
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = crate::arch::seeded_var_builder(&vm, 5150, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let ids = Tensor::from_slice(&[1u32, 2, 3, 4], (1, 4), &cfg.device).unwrap();
+
+        let hidden = model.hidden(&ids).unwrap();
+        assert_eq!(hidden.dims(), &[1, 4, cfg.dim]);
+
+        // The tiny preset ties the head to `wte`, so the projection is
+        // the embedding table transposed.
+        let w = model.wte.embeddings();
+        let from_hidden = hidden.broadcast_matmul(&w.t().unwrap()).unwrap();
+        let logits = model.forward(&ids).unwrap();
+        let gap = (from_hidden - logits)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(gap < 1e-5, "hidden @ Wᵀ diverged from forward by {gap}");
+    }
+
+    /// Pooling the hidden state gives one vector per sequence, which is
+    /// the encoder use the logits-only surface could not serve.
+    #[test]
+    fn a_pooled_hidden_state_is_one_vector_for_the_sequence() {
+        use crate::pooling::{pool, Pooling};
+
+        let cfg = tiny_cfg();
+        let vm = VarMap::new();
+        let vs = crate::arch::seeded_var_builder(&vm, 616, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let a = Tensor::from_slice(&[1u32, 2, 3], (1, 3), &cfg.device).unwrap();
+        let b = Tensor::from_slice(&[9u32, 8, 7], (1, 3), &cfg.device).unwrap();
+
+        let va = pool(&model.hidden(&a).unwrap(), Pooling::Mean, None).unwrap();
+        let vb = pool(&model.hidden(&b).unwrap(), Pooling::Mean, None).unwrap();
+        assert_eq!(va.dims(), &[1, cfg.dim]);
+
+        // Two different sequences must not pool to the same vector, or
+        // the embedding carries nothing about its input.
+        let gap = (va - vb)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max_all()
+            .unwrap()
+            .to_scalar::<f32>()
+            .unwrap();
+        assert!(gap > 1e-6, "two inputs pooled to the same vector");
     }
 
     /// The same equivalence with a conditioning table attached: the

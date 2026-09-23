@@ -4207,6 +4207,12 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
         if let Some(v) = t.get::<Option<u32>>("pad_id")? {
             d.pad_id = v;
         }
+        // Opt-out only: the mask is on by default, and the reason to
+        // name it here is to reproduce a run recorded before it
+        // existed. See `DatasetOpts::mask_pad`.
+        if let Some(v) = t.get::<Option<bool>>("mask_pad")? {
+            d.mask_pad = v;
+        }
         if let Some(v) = t.get::<Option<String>>("text_field")? {
             d.text_field = v;
         }
@@ -7613,6 +7619,7 @@ mod load_ckpt_tests {
                 ctx_len: 16,
                 shuffle: false,
                 pad_id: 0,
+                mask_pad: true,
                 text_field: "text".into(),
             },
         );

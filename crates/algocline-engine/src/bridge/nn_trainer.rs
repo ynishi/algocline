@@ -1101,6 +1101,7 @@ mod run_ft_bridge_tests {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         };
         let ds = TokenizedDataset::new(rows, dopts);
@@ -1572,6 +1573,7 @@ mod run_ft_bridge_tests {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         };
         let ds = TokenizedDataset::new(rows, dopts)

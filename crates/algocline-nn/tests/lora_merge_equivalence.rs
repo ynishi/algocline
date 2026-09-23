@@ -166,6 +166,7 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -305,6 +306,7 @@ fn run_lora_ft_reduces_loss_on_overfit_corpus() {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -416,6 +418,7 @@ fn run_lora_ft_updates_lora_weights() {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );

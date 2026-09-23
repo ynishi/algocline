@@ -1691,6 +1691,7 @@ mod tests {
                 ctx_len: 8,
                 shuffle: false,
                 pad_id: 0,
+                mask_pad: true,
                 text_field: "text".into(),
             },
         )
@@ -2861,6 +2862,7 @@ mod tests {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
+        mask_pad: true,
             text_field: "text".into(),
         }
     }
@@ -3164,6 +3166,41 @@ mod tests {
         assert!(allowed_input_sets(&batch, 3, &Device::Cpu)
             .unwrap()
             .is_none());
+    }
+
+    /// The pad mask a dataset attaches survives the target shift with
+    /// the meaning it was built with: entry `k` gates the prediction of
+    /// `input_ids[k + 1]`, so the position that first holds filler is
+    /// the first one excluded.
+    #[test]
+    fn the_pad_mask_lines_up_with_the_targets_after_the_shift() {
+        let mut ds = TokenizedDataset::new(
+            vec![vec![1u32, 2, 3]],
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 5,
+                shuffle: false,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.input_ids[0], vec![1, 2, 3, 0, 0]);
+        let (_, targets, mask) = batch_to_input_target(&batch, &Device::Cpu).unwrap();
+        let targets: Vec<u32> = targets.i(0).unwrap().to_vec1().unwrap();
+        let mask: Vec<f32> = mask
+            .expect("a padded batch reaches the loss with a mask")
+            .i(0)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(targets, vec![2, 3, 0, 0]);
+        assert_eq!(
+            mask,
+            vec![1.0, 1.0, 0.0, 0.0],
+            "predicting token 3 is scored; predicting the filler behind it is not"
+        );
     }
 
     /// `init_from` puts the checkpoint's weights in place before the

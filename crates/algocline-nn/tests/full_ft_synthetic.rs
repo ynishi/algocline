@@ -71,6 +71,7 @@ fn dataset_opts_for_seq_batched(ctx_len: usize, batch_size: usize) -> DatasetOpt
         ctx_len,
         shuffle: false,
         pad_id: 0,
+    mask_pad: true,
         text_field: "text".into(),
     }
 }

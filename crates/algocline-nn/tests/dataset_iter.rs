@@ -28,6 +28,7 @@ fn opts_with_batch_ctx(batch_size: usize, ctx_len: usize) -> DatasetOpts {
         ctx_len,
         shuffle: false,
         pad_id: 0,
+    mask_pad: true,
         text_field: "text".into(),
     }
 }

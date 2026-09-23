@@ -129,8 +129,10 @@ pub enum DatasetError {
     /// [`crate::train::allowed_logit_mask`] scores the target among the
     /// ids its set names, so a target its own set excludes is scored as
     /// a disallowed id and contributes the penalty — roughly `1e9`,
-    /// which nothing gates here (a [`TokenizedDataset`] batch carries
-    /// no `loss_mask`). Refused where the caller can still fix it, for
+    /// which nothing gates at a position the row really occupies (the
+    /// only `loss_mask` a [`TokenizedDataset`] batch carries is
+    /// [`DatasetOpts::mask_pad`]'s, and that one covers the padding
+    /// behind the row, not the row). Refused where the caller can still fix it, for
     /// the same reason [`Self::AllowedRaggedRows`] is.
     #[error(
         "allowed-id row {row} position {position} excludes token {token}, which is the token \
@@ -183,6 +185,33 @@ pub struct DatasetOpts {
     /// Defaults to `0` which is the GPT-2 `<|endoftext|>` id and
     /// matches the nanoGPT convention.
     pub pad_id: u32,
+    /// Keep the padding a short row was filled with out of the loss.
+    ///
+    /// `true` (default) makes every batch carry a [`Batch::loss_mask`]
+    /// whenever at least one of its rows is shorter than `ctx_len`:
+    /// `1.0` over the tokens the row actually held, `0.0` over the
+    /// [`Self::pad_id`] filler behind them. Without it the filler is a
+    /// target like any other and the run spends part of its gradient
+    /// learning to predict padding — the loss then reads lower than the
+    /// model's real next-token loss by whatever share of the batch was
+    /// padding, which is a property of the row lengths rather than of
+    /// the model.
+    ///
+    /// Position-wise rather than token-wise: the mask is derived from
+    /// how long the row was before padding, so a `pad_id` occurring
+    /// *inside* a row is scored normally. That is the distinction a
+    /// token-equality test would lose, and it matters at the default
+    /// `pad_id = 0`, which is GPT-2's `<|endoftext|>`.
+    ///
+    /// A row that should teach where it ends has to carry its own end
+    /// token: the first padded position is masked out with the rest, so
+    /// nothing here trains the model to stop. That is the same contract
+    /// as a `-100` label fill.
+    ///
+    /// Batches whose rows all reach `ctx_len` carry no mask either way
+    /// — a packed corpus is unaffected by this switch. Set to `false`
+    /// to reproduce a run recorded before the mask existed.
+    pub mask_pad: bool,
     /// JSONL / Parquet source field to tokenize. Defaults to `"text"`.
     pub text_field: String,
 }
@@ -194,6 +223,7 @@ impl Default for DatasetOpts {
             ctx_len: 128,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         }
     }
@@ -476,6 +506,7 @@ impl TokenizedDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&self.rows[start..end], ctx, self.opts.mask_pad);
         // The side channels follow their rows. `conds` is row-major at
         // `conds_per_row` per row, so the row range scales; the counts
         // were checked against the row count when they were attached.
@@ -490,7 +521,7 @@ impl TokenizedDataset {
             .map(|all| all[start..end].to_vec());
         Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: end == self.rows.len(),
             allowed_ids,
             conds,
@@ -642,9 +673,10 @@ impl Dataset for JsonlDataset {
                 .iter()
                 .map(|row| pad_or_truncate(row, ctx, pad))
                 .collect();
+            let loss_mask = pad_loss_mask(&self.buffer[start..end], ctx, self.opts.mask_pad);
             return Ok(Some(Batch {
                 input_ids,
-                loss_mask: None,
+                loss_mask,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
@@ -664,9 +696,10 @@ impl Dataset for JsonlDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&rows, ctx, self.opts.mask_pad);
         Ok(Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
@@ -886,9 +919,10 @@ impl Dataset for ParquetDataset {
                 .iter()
                 .map(|row| pad_or_truncate(row, ctx, pad))
                 .collect();
+            let loss_mask = pad_loss_mask(&self.buffer[start..end], ctx, self.opts.mask_pad);
             return Ok(Some(Batch {
                 input_ids,
-                loss_mask: None,
+                loss_mask,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
@@ -908,9 +942,10 @@ impl Dataset for ParquetDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&rows, ctx, self.opts.mask_pad);
         Ok(Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
@@ -935,6 +970,34 @@ fn pad_or_truncate(row: &[u32], ctx: usize, pad: u32) -> Vec<u32> {
         out.resize(ctx, pad);
         out
     }
+}
+
+/// Per-row loss mask marking which of the `ctx` positions each row
+/// actually filled, or `None` when no row was padded.
+///
+/// `None` rather than an all-ones mask on the unpadded case: the loss
+/// treats a missing mask as uniform, so the two mean the same thing and
+/// the cheaper one keeps a packed corpus paying nothing for a switch it
+/// does not need. It also keeps `Batch::loss_mask == Some(..)` reading
+/// as "some position here is excluded".
+///
+/// Derived from `row.len()`, not from comparing tokens against
+/// `pad_id`: a row may legitimately hold the pad id (at the default
+/// `pad_id = 0` it is GPT-2's `<|endoftext|>`), and those occurrences
+/// are content, not filler.
+fn pad_loss_mask(rows: &[Vec<u32>], ctx: usize, mask_pad: bool) -> Option<Vec<Vec<f32>>> {
+    if !mask_pad || rows.iter().all(|row| row.len() >= ctx) {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .map(|row| {
+                let mut mask = vec![1.0f32; row.len().min(ctx)];
+                mask.resize(ctx, 0.0);
+                mask
+            })
+            .collect(),
+    )
 }
 
 /// Pad `mask` up to `ctx` with `0.0` (positions past the real content
@@ -1089,6 +1152,7 @@ mod tests {
             ctx_len: 4,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         };
         let mut ds = TokenizedDataset::new(rows, opts);
@@ -1449,5 +1513,80 @@ mod tests {
     fn pad_or_truncate_trims_long_rows() {
         let trimmed = pad_or_truncate(&[1, 2, 3, 4, 5], 3, 0);
         assert_eq!(trimmed, vec![1, 2, 3]);
+    }
+
+    /// Opts with `mask_pad` on and a pad id that is *not* 0, so a test
+    /// can tell "this position was filler" from "this position held the
+    /// pad id as content".
+    fn mask_pad_opts(batch_size: usize, ctx_len: usize, mask_pad: bool) -> DatasetOpts {
+        DatasetOpts {
+            batch_size,
+            ctx_len,
+            shuffle: false,
+            pad_id: 0,
+            mask_pad,
+            text_field: "text".into(),
+        }
+    }
+
+    #[test]
+    fn a_padded_batch_carries_a_mask_that_covers_only_the_padding() {
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(
+            batch.loss_mask,
+            Some(vec![vec![1.0, 1.0, 1.0, 0.0], vec![1.0, 1.0, 0.0, 0.0]]),
+            "the mask must be 1 over the tokens each row held and 0 over the filler behind them"
+        );
+    }
+
+    #[test]
+    fn a_pad_id_inside_a_row_is_still_scored() {
+        // Row 0 holds the pad id at position 1 as content and is then
+        // padded from position 3. A token-equality test would zero both
+        // and stop training the model on its own `<|endoftext|>`.
+        let rows = vec![vec![1u32, 0, 3], vec![4, 5, 6, 7]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        let mask = batch.loss_mask.expect("row 0 is short, so a mask is built");
+        assert_eq!(
+            mask[0],
+            vec![1.0, 1.0, 1.0, 0.0],
+            "position 1 holds the pad id as content and must stay scored"
+        );
+        assert_eq!(mask[1], vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_batch_whose_rows_all_reach_ctx_len_carries_no_mask() {
+        // A packed corpus pays nothing for the switch: `None` and an
+        // all-ones mask mean the same thing to the loss.
+        let rows = vec![vec![1u32, 2, 3, 4], vec![5, 6, 7, 8]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.loss_mask, None);
+    }
+
+    #[test]
+    fn mask_pad_off_reproduces_the_run_that_scored_its_padding() {
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, false));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.loss_mask, None);
+    }
+
+    #[test]
+    fn the_jsonl_and_parquet_paths_mask_their_padding_too() {
+        // Same contract on the streaming adapters; asserted through the
+        // helper both of them call, since standing up a tokenizer here
+        // would test the tokenizer instead.
+        let rows = vec![vec![1u32, 2], vec![3, 4, 5]];
+        assert_eq!(
+            pad_loss_mask(&rows, 3, true),
+            Some(vec![vec![1.0, 1.0, 0.0], vec![1.0, 1.0, 1.0]])
+        );
+        assert_eq!(pad_loss_mask(&rows, 2, true), None, "nothing is padded at ctx 2");
+        assert_eq!(pad_loss_mask(&rows, 3, false), None);
     }
 }

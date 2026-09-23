@@ -67,6 +67,7 @@ fn wrap_and_train_briefly() -> (Gpt2Model, VarMap, Gpt2Config) {
             ctx_len: 8,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );

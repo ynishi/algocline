@@ -66,6 +66,7 @@ fn run_lora_ft_tinyllama_leaves_base_weights_bit_identical() {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -194,6 +195,7 @@ fn run_lora_ft_tinyllama_reduces_loss_on_overfit_corpus() {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -284,6 +286,7 @@ fn run_lora_ft_tinyllama_updates_lora_weights() {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -369,6 +372,7 @@ fn run_lora_ft_tinyllama_saves_delta_with_expected_var_count() {
             ctx_len: 16,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );

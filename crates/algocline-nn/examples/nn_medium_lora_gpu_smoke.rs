@@ -278,6 +278,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             ctx_len: ctx,
             shuffle: false,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );

@@ -25,10 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
 
 use candle_core::safetensors::MmapedSafetensors;
-use candle_core::DType;
+use candle_core::{DType, Tensor};
 use candle_nn::VarMap;
 use serde::Serialize;
 
@@ -54,7 +53,8 @@ pub struct Candidate {
     /// two can never drift into disagreeing about the same step. The
     /// fields are flattened into the written line: `step`, `ckpt_path`,
     /// `train_loss`, `lr`, `grad_norm`, `elapsed_ms`, `min_train_loss`
-    /// sit at the top level next to `reason` and `values`.
+    /// — and `val_loss` on a run that held rows out — sit at the top
+    /// level next to `reason` and `values`.
     ///
     /// Carrying all of them, not just the loss, is what lets a later
     /// reader ask whether a keep was sound: the model-side numbers are
@@ -89,6 +89,10 @@ pub struct Candidate {
 /// concurrent runs (should they ever be allowed) do not collide.
 #[derive(Debug, Clone)]
 pub struct CheckpointStore {
+    /// What every bundle this store writes says about itself, or `None`
+    /// for a store whose caller did not say. Absent, the files carry
+    /// the header they always carried: none.
+    identity: Option<BundleIdentity>,
     dir: PathBuf,
     prefix: String,
     keep: usize,
@@ -108,10 +112,78 @@ impl CheckpointStore {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         Ok(Self {
+            identity: None,
             dir,
             prefix: prefix.into(),
             keep: keep.max(1),
             pinned: BTreeSet::new(),
+        })
+    }
+
+    /// Say what the bundles this store writes are, so each one carries
+    /// a header and a sidecar describing itself.
+    ///
+    /// Without it the files are what they were: tensors and no
+    /// description. The store cannot supply the description itself —
+    /// it holds a `VarMap`, from which the architecture and the
+    /// vocabulary are not recoverable.
+    pub fn with_identity(mut self, identity: BundleIdentity) -> Self {
+        self.identity = Some(identity);
+        self
+    }
+
+    /// Write `varmap` to `path`, with this store's identity header and
+    /// sidecar when it has one.
+    ///
+    /// The header goes in through `safetensors` directly:
+    /// `VarMap::save` calls the same writer with no metadata, and there
+    /// is no candle entry point that takes some.
+    fn write_bundle(&self, varmap: &VarMap, path: &Path, step: usize) -> candle_core::Result<()> {
+        let Some(identity) = self.identity.as_ref() else {
+            // No identity to write, and no stale one to leave behind: a
+            // sidecar from an earlier writer would describe a model
+            // this file no longer holds, and `read_bundle_header` would
+            // answer `None` while the `.json` beside it answered
+            // confidently.
+            let sidecar = identity_sidecar_path(path);
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(candle_core::Error::Msg(format!(
+                        "checkpoint save: stale sidecar {}: {e}",
+                        sidecar.display()
+                    )))
+                }
+            }
+            return varmap.save(path);
+        };
+        let header = identity.header(step);
+        {
+            let data = varmap.data().lock().map_err(|_| {
+                candle_core::Error::Msg("checkpoint save: VarMap lock poisoned".into())
+            })?;
+            // Ordered, so two saves of one map produce byte-identical
+            // files rather than differing by hash iteration order.
+            let tensors: BTreeMap<String, Tensor> = data
+                .iter()
+                .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
+                .collect();
+            safetensors::serialize_to_file(
+                tensors.iter().map(|(k, v)| (k.clone(), v)),
+                Some(header.clone().into_iter().collect()),
+                path,
+            )
+            .map_err(|e| candle_core::Error::Msg(format!("checkpoint save: {e}")))?;
+        }
+        // The same map again as JSON, for a reader with no safetensors
+        // parser. One value serialised twice, so the two cannot say
+        // different things.
+        let sidecar = identity_sidecar_path(path);
+        let json = serde_json::to_string_pretty(&header)
+            .map_err(|e| candle_core::Error::Msg(format!("checkpoint sidecar: {e}")))?;
+        fs::write(&sidecar, json).map_err(|e| {
+            candle_core::Error::Msg(format!("checkpoint sidecar {}: {e}", sidecar.display()))
         })
     }
 
@@ -190,6 +262,34 @@ impl CheckpointStore {
         self.keep
     }
 
+    /// Path of the per-step metrics file for this run.
+    ///
+    /// `<prefix>-metrics.jsonl`, beside the checkpoints, so a run's
+    /// curve travels with the weights it describes.
+    pub fn metrics_path(&self) -> PathBuf {
+        self.dir.join(format!("{}-metrics.jsonl", self.prefix))
+    }
+
+    /// Append one step's numbers to the metrics file.
+    ///
+    /// JSON Lines: one object per line, appended and flushed as the run
+    /// goes. An interrupted run therefore leaves a file that is valid up
+    /// to its last complete line, which a single JSON array would not —
+    /// and the point of a curve is most often to look at it while the
+    /// run is still going.
+    ///
+    /// Fields absent rather than null where a run does not have them: a
+    /// `grad_norm` of zero and no gradient norm at all are different
+    /// facts, and a reader that sees the key can rely on it.
+    pub fn append_metrics(&self, point: &MetricPoint) -> std::io::Result<()> {
+        let line = serde_json::to_string(point).map_err(std::io::Error::other)?;
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.metrics_path())?;
+        writeln!(file, "{line}")
+    }
+
     /// Path a `step` checkpoint would be written to.
     pub fn path_for_step(&self, step: usize) -> PathBuf {
         self.dir
@@ -200,7 +300,7 @@ impl CheckpointStore {
     /// files down to `keep` entries.
     pub fn save_step(&self, varmap: &VarMap, step: usize) -> candle_core::Result<PathBuf> {
         let path = self.path_for_step(step);
-        varmap.save(&path)?;
+        self.write_bundle(varmap, &path, step)?;
         self.prune()
             .map_err(|e| candle_core::Error::Msg(format!("ckpt prune: {e}")))?;
         Ok(path)
@@ -210,15 +310,25 @@ impl CheckpointStore {
     /// suffix). The trainer calls this at the end of a run so the
     /// last-good weights sit under a stable filename that downstream
     /// consumers can reference without knowing the step count.
-    pub fn save_final(&self, varmap: &VarMap) -> candle_core::Result<PathBuf> {
+    /// `step` is what the header records; the caller passes the step
+    /// the run ended at, which is not derivable from the filename the
+    /// way a rotating checkpoint's is.
+    pub fn save_final(&self, varmap: &VarMap, step: usize) -> candle_core::Result<PathBuf> {
         let path = self.dir.join(format!("{}.safetensors", self.prefix));
-        varmap.save(&path)?;
+        self.write_bundle(varmap, &path, step)?;
         Ok(path)
     }
 
     /// Enumerate the step checkpoints currently on disk, oldest first.
+    ///
+    /// Ordered by the step in the filename rather than by mtime. Two
+    /// checkpoints written inside one filesystem timestamp tick — a
+    /// tiny model at `ckpt_every = 1` — otherwise sort by `read_dir`
+    /// order, which is arbitrary, and the rotation can delete the newer
+    /// one. The step number is already in the name and is a total
+    /// order; mtime is a tiebreak for nothing.
     pub fn list(&self) -> std::io::Result<Vec<PathBuf>> {
-        let mut entries: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+        let mut entries: Vec<(PathBuf, usize)> = Vec::new();
         let step_prefix = format!("{}-step", self.prefix);
         for entry in fs::read_dir(&self.dir)? {
             let entry = entry?;
@@ -230,10 +340,26 @@ impl CheckpointStore {
             if !name.starts_with(&step_prefix) || !name.ends_with(".safetensors") {
                 continue;
             }
-            let mtime = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
-            entries.push((path, mtime));
+            // A `<checkpoint>.opt.safetensors` sidecar shares both the
+            // prefix and the extension, and it is not a checkpoint.
+            // Counted here it would fill the rotation window and push
+            // live checkpoints out to make room for the state of
+            // checkpoints that had already gone.
+            if name.ends_with(crate::train::optstate::OPT_SIDECAR_SUFFIX) {
+                continue;
+            }
+            // `<prefix>-step<N>.safetensors` → N. A name that does not
+            // carry one is not a checkpoint this store wrote.
+            let Some(step) = name
+                .strip_prefix(&step_prefix)
+                .and_then(|rest| rest.strip_suffix(".safetensors"))
+                .and_then(|digits| digits.parse::<usize>().ok())
+            else {
+                continue;
+            };
+            entries.push((path, step));
         }
-        entries.sort_by_key(|(_, m)| *m);
+        entries.sort_by_key(|(_, step)| *step);
         Ok(entries.into_iter().map(|(p, _)| p).collect())
     }
 
@@ -255,9 +381,191 @@ impl CheckpointStore {
         let drop_count = rotating.len() - self.keep;
         for path in rotating.into_iter().take(drop_count) {
             fs::remove_file(&path)?;
+            // The optimizer-state sidecar belongs to the checkpoint it
+            // sits beside and is useless without it, so it leaves with
+            // it. Absent on runs that did not ask for one, which is why
+            // a missing file is not an error here.
+            for sidecar in [
+                crate::train::optstate::sidecar_path(&path),
+                identity_sidecar_path(&path),
+            ] {
+                match fs::remove_file(&sidecar) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         Ok(())
     }
+}
+
+/// What a checkpoint says about itself.
+///
+/// A bare `.safetensors` file is a bag of named tensors: it carries no
+/// architecture, no vocabulary and no dtype, and the safetensors format
+/// [states outright](https://github.com/huggingface/safetensors/blob/main/docs/source/metadata_parsing.mdx)
+/// that anything of the sort lives in a header the writer has to
+/// supply. candle's `VarMap::save` supplies none. Everything that
+/// identified a bundle here therefore lived in its Card, in the card
+/// store, which does not travel with the file — so a copied checkpoint
+/// was unidentifiable by either route, and a checkpoint from a run
+/// whose Card was lost was unidentifiable at all.
+///
+/// The fields are the ones needed to *rebuild the model that loads it*.
+/// Hyperparameters are deliberately absent: they describe the run, the
+/// Card records them, and a reader trying to load these weights does
+/// not need to know the learning rate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct BundleIdentity {
+    /// Architecture and variant, as the preset names it
+    /// (`"gpt2-medium"`, `"tinyllama-1.1b"`, `"gpt2-custom"`).
+    pub architecture: String,
+    /// Vocabulary size the head was trained at. The one number a
+    /// reader cannot infer from the tensors without knowing which
+    /// tensor is the head.
+    pub vocab: usize,
+    /// Context window the positional machinery was built for.
+    pub ctx: usize,
+    /// Parameter dtype, as candle names it (`"f32"`, `"bf16"`).
+    pub dtype: String,
+    /// The run that wrote it — a Card id, conventionally. `None` for a
+    /// run that has no identifier of its own.
+    pub run: Option<String>,
+}
+
+/// Metadata key naming the writer, so a reader can tell these files
+/// from anyone else's before trusting the rest of the header.
+const FORMAT_KEY: &str = "format";
+
+/// Value of [`FORMAT_KEY`] for a bundle this crate wrote.
+pub const BUNDLE_FORMAT: &str = "algocline-nn";
+
+impl BundleIdentity {
+    /// The header this identity writes, at `step`.
+    ///
+    /// Strings throughout, because safetensors metadata is
+    /// `string → string` and nothing else. Numbers therefore go in
+    /// decimal and a reader parses them back — which is the format's
+    /// constraint, not a choice.
+    pub fn header(&self, step: usize) -> BTreeMap<String, String> {
+        let mut out = BTreeMap::new();
+        out.insert(FORMAT_KEY.into(), BUNDLE_FORMAT.into());
+        out.insert(
+            "algocline_version".into(),
+            env!("CARGO_PKG_VERSION").to_string(),
+        );
+        out.insert("architecture".into(), self.architecture.clone());
+        out.insert("vocab".into(), self.vocab.to_string());
+        out.insert("ctx".into(), self.ctx.to_string());
+        out.insert("dtype".into(), self.dtype.clone());
+        out.insert("step".into(), step.to_string());
+        if let Some(run) = self.run.as_ref() {
+            out.insert("run".into(), run.clone());
+        }
+        out
+    }
+}
+
+/// Read the header a bundle carries.
+///
+/// `None` for a file with no header at all, which is every checkpoint
+/// written before this existed and every bundle from anywhere else —
+/// distinguished from a header that exists and says something
+/// unexpected, which comes back as a map for the caller to judge.
+pub fn read_bundle_header(path: &Path) -> Result<Option<BTreeMap<String, String>>, String> {
+    use std::io::Read;
+
+    // The header only. A bundle here reaches several gigabytes and this
+    // answers a question about a few kilobytes at the front of it.
+    //
+    // Parsed here rather than through `SafeTensors::read_metadata`,
+    // which takes the whole file as one slice and refuses a buffer that
+    // does not cover it exactly (`buffer_end + 8 + n != buffer_len` →
+    // `MetadataIncompleteBuffer`). The format is a little-endian u64
+    // length followed by that many bytes of JSON, and `__metadata__` is
+    // a plain string map inside it, so reading the front is the whole
+    // job.
+    let mut file = fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let mut prefix = [0u8; 8];
+    file.read_exact(&mut prefix)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let header_len = u64::from_le_bytes(prefix);
+    // safetensors' own ceiling. Refusing past it keeps a corrupt or
+    // non-safetensors file from becoming an allocation.
+    const MAX_HEADER: u64 = 100_000_000;
+    if header_len > MAX_HEADER {
+        return Err(format!(
+            "read {}: header length {header_len} is past anything safetensors writes; \
+             this is not a checkpoint",
+            path.display()
+        ));
+    }
+    let mut header = vec![0u8; header_len as usize];
+    file.read_exact(&mut header)
+        .map_err(|e| format!("read {}: {e}", path.display()))?;
+    let parsed: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| format!("read {}: header is not JSON: {e}", path.display()))?;
+    let Some(metadata) = parsed.get("__metadata__") else {
+        return Ok(None);
+    };
+    let Some(map) = metadata.as_object() else {
+        return Err(format!(
+            "read {}: `__metadata__` is not an object",
+            path.display()
+        ));
+    };
+    // The format's metadata is string → string; anything else came from
+    // a writer that is not following it, and guessing at a coercion
+    // would report a header the file does not carry.
+    let mut out = BTreeMap::new();
+    for (key, value) in map {
+        let Some(text) = value.as_str() else {
+            return Err(format!(
+                "read {}: `__metadata__.{key}` is not a string",
+                path.display()
+            ));
+        };
+        out.insert(key.clone(), text.to_string());
+    }
+    Ok(Some(out))
+}
+
+/// Path of the sidecar describing the bundle at `path`.
+///
+/// `<stem>.json`, beside it. The same facts as the header, for a reader
+/// that has no safetensors parser to hand — the pair is what the
+/// surrounding ecosystem expects (a `config.json` next to the weights),
+/// and both are written from one value so they cannot disagree.
+pub fn identity_sidecar_path(bundle: &Path) -> PathBuf {
+    let stem = bundle
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    bundle.with_file_name(format!("{stem}.json"))
+}
+
+/// One step of a run, as the metrics file records it.
+///
+/// Flat and small on purpose: this is written once per step (or per
+/// `metrics_every` steps) and read by whatever plots it.
+#[derive(Debug, Clone, Serialize)]
+pub struct MetricPoint {
+    /// Optimizer step, 1-indexed, matching the checkpoint filenames.
+    pub step: usize,
+    /// Mean per-micro training loss on that step.
+    pub loss: f32,
+    /// Learning rate the step was taken at.
+    pub lr: f64,
+    /// Gradient norm, when the run was computing one (a hook or a
+    /// gradient cap asks for it; a run with neither pays nothing to
+    /// produce a number nobody asked for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grad_norm: Option<f32>,
+    /// Held-out loss at the most recent evaluation, on a run that has
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_loss: Option<f32>,
 }
 
 /// Build a [`Checkpoint`] record from a save path and per-run metrics.
@@ -874,6 +1182,7 @@ mod tests {
             grad_norm: 0.5,
             elapsed_ms: 1_000 * step as u64,
             min_train_loss: train_loss,
+            val_loss: None,
         }
     }
 
@@ -1083,11 +1392,140 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_with_an_identity_says_what_it_is() {
+        let tmp = TempDir::new().unwrap();
+        let vm = small_varmap();
+        let identity = BundleIdentity {
+            architecture: "gpt2-tiny".into(),
+            vocab: 64,
+            ctx: 16,
+            dtype: "f32".into(),
+            run: Some("alc_nn_demo_1".into()),
+        };
+        let store = CheckpointStore::new(tmp.path(), "ident", 3)
+            .unwrap()
+            .with_identity(identity.clone());
+        let path = store.save_final(&vm, 42).unwrap();
+
+        let header = read_bundle_header(&path)
+            .expect("readable")
+            .expect("a bundle written with an identity carries a header");
+        assert_eq!(
+            header.get("format").map(String::as_str),
+            Some(BUNDLE_FORMAT)
+        );
+        assert_eq!(
+            header.get("architecture").map(String::as_str),
+            Some("gpt2-tiny")
+        );
+        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
+        assert_eq!(header.get("ctx").map(String::as_str), Some("16"));
+        assert_eq!(header.get("dtype").map(String::as_str), Some("f32"));
+        assert_eq!(header.get("step").map(String::as_str), Some("42"));
+        assert_eq!(header.get("run").map(String::as_str), Some("alc_nn_demo_1"));
+        assert!(header.contains_key("algocline_version"));
+
+        // The sidecar says the same thing, because it is the same map.
+        let sidecar = identity_sidecar_path(&path);
+        let text = std::fs::read_to_string(&sidecar).expect("the sidecar exists");
+        let parsed: BTreeMap<String, String> = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, header);
+    }
+
+    /// The weights are still the weights: adding a header must not
+    /// disturb what a restore reads back.
+    #[test]
+    fn an_identified_bundle_restores_like_any_other() {
+        let tmp = TempDir::new().unwrap();
+        let vm = varmap_with(&[("a", 2, 3), ("b", 4, 1)]);
+        let before = flat_values(&vm);
+        let store = CheckpointStore::new(tmp.path(), "round", 3)
+            .unwrap()
+            .with_identity(BundleIdentity {
+                architecture: "gpt2-tiny".into(),
+                vocab: 8,
+                ctx: 4,
+                dtype: "f32".into(),
+                run: None,
+            });
+        let path = store.save_final(&vm, 1).unwrap();
+
+        let target = varmap_with(&[("a", 2, 3), ("b", 4, 1)]);
+        let report = restore_into(&target, &path).expect("restore");
+        assert!(report.is_complete());
+        assert_eq!(flat_values(&target), before);
+    }
+
+    /// A bundle written without one carries no header, which is what
+    /// every checkpoint from before this looks like.
+    #[test]
+    fn a_bundle_without_an_identity_carries_no_header() {
+        let tmp = TempDir::new().unwrap();
+        let vm = small_varmap();
+        let store = CheckpointStore::new(tmp.path(), "plain", 3).unwrap();
+        let path = store.save_final(&vm, 1).unwrap();
+        assert_eq!(read_bundle_header(&path).unwrap(), None);
+        assert!(!identity_sidecar_path(&path).exists());
+    }
+
+    /// Overwriting an identified bundle from a store that has no
+    /// identity clears the sidecar: leaving it would describe a model
+    /// the file no longer holds, with nothing saying so.
+    #[test]
+    fn an_identity_less_write_clears_a_stale_sidecar() {
+        let tmp = TempDir::new().unwrap();
+        let vm = small_varmap();
+        let identified = CheckpointStore::new(tmp.path(), "over", 3)
+            .unwrap()
+            .with_identity(BundleIdentity {
+                architecture: "gpt2-tiny".into(),
+                vocab: 8,
+                ctx: 4,
+                dtype: "f32".into(),
+                run: None,
+            });
+        let path = identified.save_final(&vm, 1).unwrap();
+        assert!(identity_sidecar_path(&path).exists());
+
+        let plain = CheckpointStore::new(tmp.path(), "over", 3).unwrap();
+        plain.save_final(&vm, 2).unwrap();
+        assert_eq!(read_bundle_header(&path).unwrap(), None);
+        assert!(
+            !identity_sidecar_path(&path).exists(),
+            "the sidecar describes a bundle that is no longer there"
+        );
+    }
+
+    /// A rotated-out checkpoint takes its sidecar with it, the same way
+    /// it takes its optimizer state.
+    #[test]
+    fn rotation_drops_the_identity_sidecar_too() {
+        let tmp = TempDir::new().unwrap();
+        let vm = small_varmap();
+        let store = CheckpointStore::new(tmp.path(), "rot", 1)
+            .unwrap()
+            .with_identity(BundleIdentity {
+                architecture: "gpt2-tiny".into(),
+                vocab: 8,
+                ctx: 4,
+                dtype: "f32".into(),
+                run: None,
+            });
+        let first = store.save_step(&vm, 1).unwrap();
+        store.save_step(&vm, 2).unwrap();
+        assert!(!first.exists(), "step 1 rotated out");
+        assert!(
+            !identity_sidecar_path(&first).exists(),
+            "its sidecar must go with it"
+        );
+    }
+
+    #[test]
     fn save_final_writes_stable_filename_without_step() {
         let tmp = TempDir::new().unwrap();
         let store = CheckpointStore::new(tmp.path(), "run", 3).unwrap();
         let vm = small_varmap();
-        let path = store.save_final(&vm).unwrap();
+        let path = store.save_final(&vm, 7).unwrap();
         assert_eq!(
             path.file_name().unwrap().to_str().unwrap(),
             "run.safetensors"

@@ -980,11 +980,13 @@ against a list of known mistakes, so `padid` or `batchsize` is refused
 instead of silently leaving the default in place.
 
 **`pad_id`** fills every row short of `ctx_len`, and rows are stored
-unpadded, so it is trained on. It is checked against the
+unpadded, so it reaches the model as input. It is checked against the
 `meta.vocab_size` the corpora declare — the one id that reaches
 training without coming out of a file — because a pad id inside the
-model's vocabulary but outside the corpus's would train the model to
-emit an id the corpus says does not exist.
+model's vocabulary but outside the corpus's would put an id the corpus
+says does not exist in front of the model at every padded position.
+It is **not scored**: every dataset attaches a loss mask covering the
+filler behind each short row (see *Padding and the loss* below).
 
 **Several files are merged round-robin**, not concatenated: source 1
 row 1, source 2 row 1, source 1 row 2, … with a source dropping out of
@@ -1055,6 +1057,187 @@ declared `vocab_size`, a `batch_size` or `epochs` of zero, an `epochs`
 past 10000, a numeric option that is not whole or is above 4294967295
 (the same ceiling whichever of Lua's two number carriers it arrives
 in), and any key this entry does not read.
+
+#### `handle:embed(tokens, opts?)`
+
+One vector for a token sequence: the model's hidden state, pooled.
+
+The generation surface returns logits, which are a distribution over the
+next token and not a description of the input. The hidden state is the
+tensor the language-model head reads, and it cannot be recovered from
+the head's output — the projection from `dim` onto a vocabulary is not
+invertible. This returns it, pooled to a single vector, which is what
+makes a model trained here usable as an encoder.
+
+**Parameters:**
+
+| name   | type            | required | notes |
+|--------|-----------------|----------|-------|
+| tokens | array of integer | yes     | non-empty, in vocabulary, no longer than `ctx` |
+| opts   | table           | no       | `{ pooling = "mean" \| "last" \| "max" }` — default `"mean"` |
+
+**Returns:** a flat array of numbers, one per hidden dimension. An
+array rather than a handle, because an embedding is consumed by a
+distance, a store or a file, none of which would take a handle this
+crate defines.
+
+**Which pooling** is a real choice, not a detail:
+
+- **`"mean"`** averages every position. The usual default for a
+  sequence embedding.
+- **`"last"`** takes the final position — what a decoder-only model's
+  own objective builds, since that position is the only one that has
+  read the whole sequence.
+- **`"max"`** keeps the strongest activation of each feature rather
+  than its average.
+
+Available on the trainable handles (`gpt2` / `tinyllama`) and on the
+union a reloaded Card carries. The llama adapter refuses it by name: its
+forward returns the head's output and there is no hidden state behind it
+to pool. A handle built with a conditioning table refuses it too: there
+is no unconditioned forward pass through such a model, and an embedding
+taken with the channel dropped would describe a model the caller did not
+build.
+
+```lua
+local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+local v = h:embed(alc.nn.tokenize("gpt2", "the cat sat"))
+local w = h:embed(alc.nn.tokenize("gpt2", "a cat sits"), { pooling = "last" })
+```
+
+#### `handle:export_gguf(path, opts?)`
+
+Write the model's weights out as
+[GGUF](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) — the
+format llama.cpp, Ollama and LM Studio read.
+
+Everything trained here otherwise lands in safetensors, which the
+training side reads and nothing else does, so a model trained here can
+be evaluated here and nowhere else.
+
+**Parameters:**
+
+| name | type | required | notes |
+|------|------|----------|-------|
+| path | string | yes | file to write |
+| opts.precision | string | no | `f32` (default) / `f16` / `q8_0` / `q5_1` / `q5_0` / `q4_1` / `q4_0` / `q6k` / `q5k` / `q4k` / `q3k` / `q2k` |
+| opts.tokenizer | string | no | path to an HF `tokenizer.json` to embed (the preset cache is `<app>/nn/tokenizers/<preset>.json`) |
+
+A model whose output projection is tied to its embedding is written
+with that matrix under **both** names — `token_embd.weight` and
+`output.weight` — because GGUF has a slot for the head and a reader
+finding it empty has no output projection to apply.
+
+**Returns** `{ path, tensors, metadata, tokenizer, architecture }` —
+what was written, including whether a tokenizer went in. Without one the
+file needs an external vocabulary, which most readers will not accept.
+
+**Quantization has a width requirement.** Every ggml block format stores
+a fixed number of values together — 32 for the `q*_0` / `q*_1` families,
+256 for the K-quants — and the last dimension has to be a multiple of
+it. A model whose hidden size is not is exportable at `f32` or `f16`
+and not below; the refusal names the tensor and the block size.
+
+**What is verified and what is not.** The file is asserted to read back
+as a GGUF with every tensor under its GGUF name and shape, the metadata
+it was asked for, and a quantized export inside its format's error.
+**That llama.cpp loads it is not asserted** — that takes llama.cpp,
+which this repository neither builds nor vendors. The naming and key set
+follow its documented convention and the remaining check is one
+`llama-cli -m <file>` where one is installed.
+
+Refused: a `pretrained = true` handle (its tensors live behind an mmap
+this bridge never named — load them into a from-scratch handle first), a
+custom architecture (its feed-forward ratio and position scheme are this
+crate's own, and a reader would assemble the reference graph instead),
+and the llama adapter.
+
+#### `handle:beam_search(prompt_tokens, opts?)`
+
+Search for the most likely continuation rather than sampling one.
+
+Every sampler commits to one token and never reconsiders, so a
+high-probability continuation reachable only through a mediocre first
+token is unreachable. This keeps `beams` partial sequences alive,
+extends all of them, and keeps the best `beams` of the result.
+
+It is a **different objective**, not a better sampler: sampling draws
+from the model's distribution, this approximates the most likely
+sequence under it. Right for a translation, a constrained field, a short
+structured answer; wrong for open text, where the most likely sequence
+is bland and repetitive.
+
+**opts:**
+
+| key | type | notes |
+|-----|------|-------|
+| `beams` | integer | sequences kept alive (default `4`); `1` is greedy decoding |
+| `max_new` | integer | tokens to add beyond the prompt (default `32`) |
+| `length_penalty` | number | divides the score by `length^α` (default `1.0`); `0.0` leaves raw sums and prefers short answers |
+| `eos` | integer | a beam reaching it is finished and stops being extended; it still competes for the ranking |
+
+**Returns** an array of `{ tokens, score, finished }`, best first.
+`tokens` includes the prompt; `score` is the sum of the generated
+tokens' log-probabilities — summed rather than multiplied because the
+product of a few hundred probabilities underflows and every beam would
+score zero.
+
+Longer sequences score lower for being longer, since every additional
+term is negative; `length_penalty = 1.0` makes the score the mean per
+token, which is why it is the default. The search re-forwards each
+candidate, so its cost is `beams` forwards per step.
+
+#### `alc.nn.sampler.penalized(sampler, opts?)`
+
+Wrap a sampler so what the generation has already produced weighs on
+what it produces next.
+
+Every other sampler reads one logits row and nothing else, so none of
+them can tell a token the model has emitted six times from one it has
+never emitted — and a model that starts repeating keeps repeating.
+
+**opts** (every key optional, every default off):
+
+| key | type | notes |
+|-----|------|-------|
+| `repetition` | number | CTRL-style factor on any token in the history; `1.0` is off, `1.2` is the value that paper reports. Divides a positive logit and multiplies a negative one — one rule for both signs would *raise* the negative logit and reward the repeat |
+| `frequency` | number | subtracted once per occurrence, so pressure accumulates |
+| `presence` | number | subtracted once for any occurrence at all, which pushes towards new vocabulary rather than away from repetition as such |
+| `window` | integer | count only the last N tokens; without it a long generation accumulates a penalty against every word it has used |
+| `history` | array of integer | tokens already counted, usually the prompt |
+
+The prompt is **not** counted unless `history` says so. Penalising it
+discourages a summary from reusing the words it was given, which is
+sometimes exactly wrong and sometimes exactly right, and is not a choice
+this bridge makes silently.
+
+**Consumes the sampler handle**, as `alc.nn.sampler.constrained` does:
+two Lua handles onto one sampler would each hold half of a history. The
+composed sampler carries `sample` / `is_done` / `reset` as before, plus
+`observe(id)` for a loop that decides some steps elsewhere (a forced
+prefix, a spliced tool call) and still wants them to weigh.
+
+`observe` is **refused on a penalised-over-constrained sampler**: the
+verb reaches the penalty history and nothing else, and the constraint's
+prefix would stay a token behind the generation, so every later mask
+would be the mask for a shorter sequence. The token it then permits is
+legal — for a sequence that is not the one being generated, which is
+the one failure no error would surface. Splice such a token by sampling
+it under a mask that admits only it, so both halves of the state move
+together.
+
+Wrap the *constrained* sampler in this one rather than the reverse: the
+penalty then reads logits the mask has already applied and is never
+spent on a token the constraint forbids. Wrapping twice is refused —
+two histories over one generation would count every token in both.
+
+```lua
+local s = alc.nn.sampler.penalized(
+    alc.nn.sampler.constrained(
+        alc.nn.sampler.temperature(0.8, 42),
+        alc.nn.constraint.stop_tokens({ 50256 })),
+    { repetition = 1.15, frequency = 0.1, window = 256 })
+```
 
 #### `alc.nn.logits.mix(a, b, beta, opts?)`
 
@@ -1465,6 +1648,46 @@ arch-directional error.
 `dataset` must be a `DatasetHandle` produced by
 `alc.nn.data.jsonl` / `.from_card` / `.synthetic` / `.parquet`.
 
+**Padding and the loss.** A row shorter than `ctx_len` is filled with
+`pad_id`, and those positions are excluded from the loss: the batch
+carries a mask that is `1` over the tokens the row held and `0` over
+the filler. Without it the run spends part of its gradient learning to
+predict padding and the reported loss sits below the model's real
+next-token loss by whatever share of the batch was filler — a property
+of the row lengths rather than of the model.
+
+The mask is derived from how long each row was, not from comparing
+tokens against `pad_id`: a row may hold the pad id as content (at the
+default `pad_id = 0` it is GPT-2's `<|endoftext|>`), and a
+token-equality test would stop training the model on its own end
+token. A row that should teach where it ends carries that token
+itself; the filler behind it is not scored. Batches whose rows all
+reach `ctx_len` carry no mask at all, so a packed corpus is unaffected.
+
+A batch whose mask scores **nothing** is refused rather than run. The
+masked mean divides by `max(mask_sum, 1)` so a fully masked batch
+cannot produce `NaN` — which means it produces `0.0` instead, a step
+with no gradient reported as the best loss the run has seen and latched
+there for every checkpoint after it. "This batch is empty" and "this
+batch is perfect" are the same number, so the run stops on it.
+
+`opts.mask_pad = false` on the dataset turns this off, which is how a
+run recorded before the mask existed is reproduced.
+
+**Repeatability.** Two runs of one config differ in two places, and
+both have a seed:
+
+- `opts.seed` on the dataset fixes the `shuffle` order.
+- `opts.seed` on `alc.nn.preset.gpt2` / `.tinyllama` fixes the
+  parameter initialisation. It is refused together with
+  `pretrained = true`, where nothing is drawn.
+
+What stays outside a seed's reach is reduction order on the GPU, cuDNN
+algorithm selection, and any sampling inside a forward pass — the same
+position PyTorch takes. Fixing both seeds makes a CPU run repeatable
+and makes a GPU run differ only in the last bits, which over a few
+thousand steps can still become visible.
+
 `opts` (required, table) — LoRA config + train config in one flat
 table:
 
@@ -1668,6 +1891,90 @@ Checkpoint before assembling the Card.
     kept some parameters at their initial values cannot be
     told from a real one once training is under way. An empty
     string is refused rather than read as "no checkpoint".
+    Whether this is a **resume** or a **warm start** depends on
+    what sits beside the file — see `save_optimizer_state`.
+  - `save_optimizer_state` (boolean, optional, default `false`)
+    — write the optimizer's own state to a
+    `<checkpoint>.opt.safetensors` sidecar beside every
+    checkpoint. With one in place, a later `init_from` restores
+    the moments and the step count, the schedule continues from
+    that step, and `steps` reads as the **total** the run is
+    working towards rather than a count of further steps.
+    Without one, `init_from` restores weights into a zeroed
+    optimizer — the first updates after the restart are the
+    updates of a fresh run, the loss curve bends, and nothing in
+    the record says why. Off by default because AdamW's state is
+    roughly three times the parameters again. A resume into a
+    total already reached is refused. Not resumed either way:
+    the data order, which a one-pass dataset has no position to
+    restore.
+  - `clip_grad_norm` (number, optional) — cap the joint L2 norm
+    of the gradient before each optimizer step, scaling every
+    parameter's gradient by `max_norm / norm` when it is over.
+    Global-norm, so the direction is untouched and only the
+    length changes; `1.0` is where most transformer recipes sit.
+    Uncapped when absent. A non-finite norm is left unscaled
+    (multiplying by `max_norm / NaN` only spreads the NaN), and
+    `info.grad_norm` keeps reporting the norm as measured rather
+    than the cap. Zero or negative is refused.
+  - `grad_checkpoint` (boolean, optional, default `false`) —
+    recompute each block's activations during the backward pass
+    instead of keeping them from the forward. Keeps one
+    `[batch, seq, dim]` tensor per block and pays a second
+    forward pass — roughly a third more compute for a fraction
+    of the activation memory, which is what bounds context
+    length and batch size on a given card. The gradients are the
+    same gradients. Available on `run_full_ft` and only for
+    models that decompose into blocks: a conditioned or
+    allowed-id run, a mixture-of-experts model (whose blocks
+    return a load-balancing term that is part of the loss), and
+    a model reading an input channel are all refused rather than
+    run with the flag doing nothing.
+  - `metrics_every` (integer, optional, default `0`) — append one
+    line per N optimizer steps to `<card_id>-metrics.jsonl`
+    beside the checkpoints: `{"step":…,"loss":…,"lr":…}`, plus
+    `grad_norm` and `val_loss` where the run has them. Converged,
+    stalled, diverged and still-descending-when-it-ran-out are
+    four different runs with the same final loss, and none of
+    them is legible from it. JSON Lines, appended as the run
+    goes, so an interrupted run leaves a file valid up to its
+    last complete line. A key is absent rather than null where
+    the run has no number for it — a `grad_norm` of zero and no
+    gradient norm at all are different facts.
+  - `early_stop` (table, optional) —
+    `{ patience = N, min_delta = x }`, ending the run when the
+    held-out loss has not improved for `patience` evaluations.
+    Both keys are required: `patience` alone stops on noise and
+    `min_delta` alone never stops a run creeping down by
+    nothing, so neither is supplied on the caller's behalf. It
+    watches the held-out loss and nothing else — stopping on the
+    training loss would stop when the model stopped fitting the
+    data it is being fitted to — so a rule without `eval_every`
+    and `val_dataset` is refused rather than left never to fire.
+    A non-finite loss counts against patience, so a diverged run
+    stops on the same rule. A stopped run writes its terminal
+    checkpoint and records `metrics.early_stop = 1`. The step it
+    stops on is still a step `on_ckpt` sees when that step is a
+    `ckpt_every` boundary — the last step of a run is the one a
+    selection hook most wants to be shown.
+  - `eval_every` (integer, optional, default `0`) — score the
+    held-out set every N optimizer steps. Requires
+    `val_dataset`, and `val_dataset` requires this: either half
+    alone is an error rather than a run that looks configured
+    and measures nothing.
+  - `val_dataset` (`alc.nn.dataset`, optional) — the held-out
+    rows. Scored through the same forward path and the same loss
+    as training, so the two numbers are comparable; the batches
+    are drained once and re-scored at each boundary, so the
+    sequence of values is a curve over fixed rows. Passing the
+    training dataset here is refused — the number it would
+    produce is a training loss under another name. The result
+    reaches `info.val_loss`, the Card's `metrics.val_loss`, and
+    `metrics.min_val_loss`. `run_lora_ft` and `run_distill` reach
+    no entry point that scores a held-out set, so the key is
+    refused there rather than read and dropped: a run that
+    silently trained unvalidated while its caller believed
+    otherwise is the failure this option exists to prevent.
   - `mask_disallowed_logits` (boolean, optional, default
     `false`) — score each target among the ids its position
     allowed instead of among the whole vocabulary. Requires
@@ -1698,7 +2005,12 @@ Checkpoint before assembling the Card.
 **Checkpoint search.** `on_ckpt` is where a caller measures the
 model mid-run and decides what to do about what it measured. The
 `info` table carries `step`, `ckpt_path`, `train_loss`, `lr`,
-`grad_norm`, `elapsed_ms` and `min_train_loss`; the checkpoint at
+`grad_norm`, `elapsed_ms`, `min_train_loss` and — on a run with a
+held-out set — `val_loss` (absent otherwise, rather than a
+stand-in number). `val_loss` is the reading a keep decision
+usually wants: `train_loss` falls whether the model is learning
+the task or the corpus, and from inside the training set the two
+are indistinguishable. The checkpoint at
 `info.ckpt_path` is already on disk, so a hook can load it
 (`alc.nn.card.load_ckpt`) and evaluate it while the run waits.
 
@@ -2038,50 +2350,6 @@ as `load_handle` during the deprecation window). The old `load`
 name continues to work as an alias for `load_vars` until the
 deprecation cycle closes; new callers should use `load_vars`
 explicitly.
-
-#### `alc.nn.metric.bootstrap_ci(clusters, opts) -> table`
-
-Put a 95% confidence interval around the mean of a sample whose
-observations arrive in groups that are not independent of each other.
-
-`clusters` is an array of observation arrays: `clusters[i]` holds every
-number belonging to group `i`. The resampling unit is the **group**,
-not the observation — a bootstrap that drew observations would treat
-two readings from one group as two independent facts and return an
-interval narrower than the sample supports. Which readings belong
-together is something only the caller knows, so it is stated rather
-than inferred.
-
-**opts:**
-
-| key | type | notes |
-|-----|------|-------|
-| `seed` | integer | **required** — the same seed over the same sample reproduces the interval exactly |
-| `draws` | integer | resamples, default `2000` |
-
-`seed` has no default on purpose: an interval nothing can reproduce
-looks exactly like one that can.
-
-**Returns** a table with `point` (the statistic on the sample as
-walked, no resampling), `low` / `high` (the percentile bounds), `draws`
-(resamples that produced a usable value), `undefined_draws` (those that
-did not, reported rather than swallowed — dropping draws biases the
-interval), `clusters`, and `seed`.
-
-**Errors** (prefixed `alc.nn.metric.bootstrap_ci:`): an empty cluster
-list, a cluster that is not an array of numbers, a non-finite
-observation, `draws = 0`, a statistic undefined on the whole sample,
-and one that survives the whole sample but no resample of it (which
-means it rests on too few clusters to resample).
-
-```lua
-local ci = alc.nn.metric.bootstrap_ci(
-    { { 1, 0, 1 }, { 0, 0 }, { 1, 1, 1 } },   -- three groups
-    { draws = 2000, seed = 42 })
-if ci.low > 0 then
-    -- the whole interval lies above zero
-end
-```
 
 ---
 

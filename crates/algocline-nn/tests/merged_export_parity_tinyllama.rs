@@ -40,7 +40,9 @@ fn wrap_and_train_briefly() -> (TinyLlamaModel, VarMap, TinyLlamaConfig) {
             batch_size: 1,
             ctx_len: 8,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );

@@ -943,6 +943,17 @@ impl NnModelCard {
         let mut metrics = serde_json::Map::new();
         metrics.insert("train_loss".into(), serde_json::json!(ckpt.train_loss));
         metrics.insert("step".into(), serde_json::json!(ckpt.step));
+        // Absent on a run that held nothing out, rather than `null`:
+        // the Card is read by consumers that compare models, and a key
+        // that is present with no number invites being treated as one.
+        // Whether a run measured generalisation at all is part of what
+        // the record has to say.
+        if let Some(val_loss) = ckpt.val_loss {
+            metrics.insert("val_loss".into(), serde_json::json!(val_loss));
+        }
+        if let Some(min_val) = ckpt.metrics.get("min_val_loss") {
+            metrics.insert("min_val_loss".into(), serde_json::json!(min_val));
+        }
 
         let candle = NnCandleBranch {
             bundle_ref: id.bundle_ref(),

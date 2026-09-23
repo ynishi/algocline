@@ -37,8 +37,8 @@ use algocline_nn::arch::{LoraConfig, TinyLlamaModel};
 use std::collections::BTreeMap;
 
 use algocline_nn::train::{
-    Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, FullFtConfig, KeepMark,
-    OptimizerKind, ScheduleKind, TrainError,
+    Candidate, CkptControl, CkptFlow, CkptHook, CkptInfo, DistillLossKind, EarlyStop, FullFtConfig,
+    KeepMark, OptimizerKind, ScheduleKind, TrainError,
 };
 use mlua::prelude::*;
 
@@ -186,6 +186,13 @@ fn ckpt_info_to_lua(lua: &Lua, info: &CkptInfo) -> LuaResult<LuaTable> {
     t.set("grad_norm", info.grad_norm)?;
     t.set("elapsed_ms", info.elapsed_ms)?;
     t.set("min_train_loss", info.min_train_loss)?;
+    // Absent rather than a placeholder number on a run with no
+    // held-out set: `info.val_loss == nil` is the Lua reading of "this
+    // run measured no generalisation", and any stand-in value would be
+    // compared against as if it had.
+    if let Some(v) = info.val_loss {
+        t.set("val_loss", v)?;
+    }
     Ok(t)
 }
 
@@ -579,6 +586,58 @@ fn apply_optional_overrides(
     }
     if let Some(v) = opts.get::<Option<usize>>("ckpt_keep")? {
         cfg.ckpt_keep = v;
+    }
+    // Whether each checkpoint gets an optimizer-state sidecar, which
+    // is what makes a later `init_from` a resume rather than a warm
+    // start. Off by default — the state is about three times the
+    // parameters again.
+    if let Some(v) = opts.get::<Option<bool>>("save_optimizer_state")? {
+        cfg.save_optimizer_state = v;
+    }
+    // Recompute activations instead of keeping them. Refused by the
+    // loop where it cannot be honoured, rather than ignored.
+    if let Some(v) = opts.get::<Option<bool>>("grad_checkpoint")? {
+        cfg.grad_checkpoint = v;
+    }
+    // Per-step curve. Writes `<card_id>-metrics.jsonl` beside the
+    // checkpoints; `0` (default) writes none.
+    if let Some(v) = opts.get::<Option<usize>>("metrics_every")? {
+        cfg.metrics_every = v;
+    }
+    // `early_stop = { patience = N, min_delta = x }`. Both keys are
+    // required when the table is present: a rule with one of them
+    // defaulted is a rule the caller did not write — `patience = 0`
+    // stops at the first evaluation that fails to improve, and
+    // `min_delta = 0` counts floating-point noise as progress, so
+    // neither is a safe thing to supply on the caller's behalf.
+    if let Some(t) = opts.get::<Option<LuaTable>>("early_stop")? {
+        let patience: usize = t.get::<Option<usize>>("patience")?.ok_or_else(|| {
+            LuaError::external(format!(
+                "{prefix}: opts.early_stop.patience is required — how many evaluations \
+                 without improvement the run tolerates"
+            ))
+        })?;
+        let min_delta: f32 = t.get::<Option<f32>>("min_delta")?.ok_or_else(|| {
+            LuaError::external(format!(
+                "{prefix}: opts.early_stop.min_delta is required — how much lower the \
+                 held-out loss has to be to count as an improvement"
+            ))
+        })?;
+        cfg.early_stop = Some(EarlyStop {
+            patience,
+            min_delta,
+        });
+    }
+    // Global-norm gradient cap. Absent means uncapped; the loop
+    // refuses a value that cannot cap anything.
+    if let Some(v) = opts.get::<Option<f64>>("clip_grad_norm")? {
+        cfg.clip_grad_norm = Some(v);
+    }
+    // Scoring period for the held-out set. The set itself comes in as
+    // `opts.val_dataset` (read by the trainer surface, not here); the
+    // loop refuses either half without the other.
+    if let Some(v) = opts.get::<Option<usize>>("eval_every")? {
+        cfg.eval_every = v;
     }
     // `init_from` names a checkpoint the model's variables are restored
     // from before the first step. An empty string is refused rather

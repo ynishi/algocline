@@ -1626,6 +1626,194 @@ fn eval_with_handle<T: mlua::FromLuaMulti>(lua: &Lua, body: &str, what: &str) ->
         .unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
+/// `handle:beam_search` returns ranked beams, and the refusals it owns.
+#[test]
+fn alc_nn_handle_beam_search_returns_ranked_beams() {
+    let lua = nn_vm();
+    let (count, first_len, ordered): (usize, usize, bool) = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local beams = h:beam_search({ 1, 2, 3 }, { beams = 3, max_new = 4 })
+        assert(#beams == 3, "three beams were asked for")
+        local ordered = true
+        for i = 2, #beams do
+            if beams[i].score > beams[i - 1].score then ordered = false end
+        end
+        for _, b in ipairs(beams) do
+            assert(#b.tokens == 7, "3 prompt + 4 generated")
+            assert(b.tokens[1] == 1 and b.tokens[2] == 2 and b.tokens[3] == 3,
+                   "every beam keeps the prompt")
+            assert(type(b.finished) == "boolean")
+        end
+        return #beams, #beams[1].tokens, ordered
+    "#,
+        )
+        .eval()
+        .expect("beam_search");
+    assert_eq!(count, 3);
+    assert_eq!(first_len, 7);
+    assert!(ordered, "beams come back best first");
+
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        return {
+            err(function() return h:beam_search({}) end),
+            err(function() return h:beam_search({ 1 }, { beams = 0 }) end),
+            err(function() return h:beam_search({ 1 }, { eos = 999999 }) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("beam_search refusals");
+    assert!(errors[0].contains("empty"), "{}", errors[0]);
+    // Refused at the bridge boundary now, with the range stated, rather
+    // than by the search after the options are already in hand.
+    assert!(
+        errors[1].contains("opts.beams must be between"),
+        "{}",
+        errors[1]
+    );
+    assert!(errors[2].contains("vocab"), "{}", errors[2]);
+}
+
+/// `handle:export_gguf` writes a file that reports what went into it,
+/// and refuses the handles that have nothing to write.
+#[test]
+fn alc_nn_handle_export_gguf_writes_and_reports() {
+    let lua = nn_vm();
+    let dir = tempfile::TempDir::new().expect("tempdir");
+    let path = dir.path().join("tiny.gguf");
+    let path_str = path.to_string_lossy().into_owned();
+    lua.globals().set("out_path", path_str.clone()).unwrap();
+
+    let (tensors, arch, has_tok): (usize, String, bool) = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local r = h:export_gguf(out_path)
+        assert(r.path == out_path, "the report names the file it wrote")
+        return r.tensors, r.architecture, r.tokenizer
+    "#,
+        )
+        .eval()
+        .expect("export_gguf");
+    assert!(tensors > 0, "a model has tensors");
+    assert_eq!(arch, "gpt2");
+    assert!(!has_tok, "no tokenizer was supplied");
+    assert!(path.exists(), "the file is on disk");
+
+    // The refusals this surface owns.
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local adapter = alc.nn.preset.llama("tiny", { device = "cpu", dtype = "f32" })
+        return {
+            err(function() return h:export_gguf(out_path, { precision = "int4" }) end),
+            err(function() return h:export_gguf(out_path, { tokenizer = "/nope/none.json" }) end),
+            err(function() return adapter:export_gguf(out_path) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("export_gguf refusals");
+    assert!(errors[0].contains("unknown precision"), "{}", errors[0]);
+    assert!(errors[1].contains("names no file"), "{}", errors[1]);
+    assert!(errors[2].contains("nothing here to write"), "{}", errors[2]);
+}
+
+/// `handle:embed` answers with one vector per call, its length the
+/// model's hidden size, and the three poolings are three different
+/// answers rather than three names for one.
+#[test]
+fn alc_nn_handle_embed_pools_the_hidden_state() {
+    let lua = nn_vm();
+    let out: Vec<f32> = lua
+        .load(
+            r#"
+        -- A trainable handle: the llama adapter exposes logits only and
+        -- refuses this call by name.
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local mean = h:embed({ 1, 2, 3 })
+        local last = h:embed({ 1, 2, 3 }, { pooling = "last" })
+        local max  = h:embed({ 1, 2, 3 }, { pooling = "max" })
+        assert(#mean == #last and #last == #max, "one length for every pooling")
+        assert(#mean > 0, "an embedding must have a width")
+
+        -- The same input twice is the same vector: the model is not
+        -- being re-initialised between calls.
+        local again = h:embed({ 1, 2, 3 })
+        for i = 1, #mean do
+            assert(mean[i] == again[i], "embedding " .. i .. " is not stable")
+        end
+
+        -- A different input is a different vector, or the embedding
+        -- carries nothing about what it read.
+        local other = h:embed({ 9, 8, 7 })
+        local moved = false
+        for i = 1, #mean do
+            if math.abs(mean[i] - other[i]) > 1e-6 then moved = true end
+        end
+        assert(moved, "two inputs embedded identically")
+
+        -- The poolings disagree.
+        local differs = false
+        for i = 1, #mean do
+            if math.abs(mean[i] - last[i]) > 1e-6 then differs = true end
+        end
+        assert(differs, "mean and last pooling returned the same vector")
+
+        return { #mean, #last, #max }
+    "#,
+        )
+        .eval()
+        .expect("handle:embed pools the hidden state");
+    assert_eq!(out.len(), 3);
+    assert_eq!(out[0], out[1]);
+    assert_eq!(out[1], out[2]);
+}
+
+/// The refusals the embedding surface owns: nothing to embed, a token
+/// the model has no row for, an unknown pooling name.
+#[test]
+fn alc_nn_handle_embed_refuses_what_it_cannot_answer() {
+    let lua = nn_vm();
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        return {
+            err(function() return h:embed({}) end),
+            err(function() return h:embed({ 999999 }) end),
+            err(function() return h:embed({ 1 }, { pooling = "cls" }) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("handle:embed refusals");
+    assert!(errors[0].contains("empty"), "{}", errors[0]);
+    assert!(errors[1].contains("vocab"), "{}", errors[1]);
+    assert!(errors[2].contains("pooling"), "{}", errors[2]);
+}
+
 /// Every factory produces a sampler a decode loop can drive: each draws
 /// an in-vocabulary token, and an unconstrained sampler never reports
 /// itself done (termination is the constraint layer's business).

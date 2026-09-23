@@ -70,7 +70,9 @@ fn dataset_opts_for_seq_batched(ctx_len: usize, batch_size: usize) -> DatasetOpt
         batch_size,
         ctx_len,
         shuffle: false,
+        seed: None,
         pad_id: 0,
+        mask_pad: true,
         text_field: "text".into(),
     }
 }
@@ -143,6 +145,7 @@ fn synthetic_run_reduces_loss_and_saves_final_bundle() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -211,6 +214,11 @@ impl algocline_nn::train::DeviceView for UnigramModel {
     }
 }
 
+/// This fixture has no blocks to recompute, so it takes the trait's
+/// refusing defaults: `grad_checkpoint` against it is an error, which
+/// is the honest answer for a model with one parameter and no depth.
+impl algocline_nn::arch::Checkpointable for UnigramModel {}
+
 /// Mixed-precision loop fence (design §7.1): BF16 parameters train
 /// through `run_full_ft` → `MixedAdamW` on CPU. Loss must drop toward
 /// the corpus marginal entropy, the parameter must stay BF16, and the
@@ -258,6 +266,7 @@ fn bf16_synthetic_run_reduces_loss_through_mixed_adamw() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -314,6 +323,7 @@ fn f16_params_refused_before_training_starts() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -352,6 +362,7 @@ fn dataset_exhaustion_surfaces_error() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -397,6 +408,7 @@ fn concurrency_lease_prevents_double_training() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -466,6 +478,7 @@ fn grad_accum_matches_equivalent_batch() {
             &model,
             &vm,
             &mut dataset,
+            None,
             &ft_cfg,
             &loss,
             tmp.path(),
@@ -509,6 +522,7 @@ fn grad_accum_matches_equivalent_batch() {
             &model,
             &vm,
             &mut dataset,
+            None,
             &ft_cfg,
             &loss,
             tmp.path(),
@@ -565,6 +579,7 @@ fn grad_accum_gt_one_reduces_loss() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),
@@ -632,6 +647,7 @@ fn bf16_grad_accum_synthetic_run_reduces_loss_through_mixed_adamw() {
         &model,
         &vm,
         &mut dataset,
+        None,
         &ft_cfg,
         &loss,
         tmp.path(),

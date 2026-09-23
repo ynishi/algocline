@@ -158,6 +158,7 @@ dependencies = [
  "parquet",
  "rand 0.10.2",
  "regex-automata",
+ "safetensors 0.8.0",
  "serde",
  "serde_json",
  "tempfile",

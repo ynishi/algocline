@@ -37,9 +37,13 @@
 //! F32 parameters are updated in place — the master would be a copy of
 //! the thing it mirrors.
 
+use std::collections::HashMap;
+
 use candle_core::backprop::GradStore;
-use candle_core::{DType, Result as CandleResult, Tensor, Var};
+use candle_core::{DType, Result as CandleResult, Tensor, TensorId, Var};
 use candle_nn::optim::Optimizer;
+
+use super::optstate::{param_name, slot_tensor};
 
 /// Lion's hyperparameters.
 ///
@@ -175,6 +179,62 @@ impl Lion {
     /// Current hyperparameters.
     pub fn params(&self) -> &ParamsLion {
         &self.params
+    }
+
+    /// Write every slot's momentum — and its master where one exists —
+    /// into `out`, keyed `<parameter name>.{momentum,master}`.
+    ///
+    /// Lion carries no bias correction and so no step count of its own;
+    /// the number stored alongside is the training loop's, which is
+    /// what the schedule resumes from.
+    ///
+    /// # Errors
+    ///
+    /// As [`MixedAdamW::write_state`](super::mixed::MixedAdamW::write_state):
+    /// a parameter absent from `names` has no name to be stored under.
+    pub fn write_state(
+        &self,
+        names: &HashMap<TensorId, String>,
+        out: &mut HashMap<String, Tensor>,
+    ) -> Result<(), String> {
+        for slot in &self.slots {
+            let name = param_name(names, slot.var.as_tensor().id())?;
+            out.insert(format!("{name}.momentum"), slot.momentum.clone());
+            // Present only for parameters that are not already F32 —
+            // see `SlotLion::master`. The restore below reads the same
+            // dtype-driven shape, so the two always agree.
+            if let Some(master) = slot.master.as_ref() {
+                out.insert(format!("{name}.master"), master.clone());
+            }
+        }
+        Ok(())
+    }
+
+    /// Read the slots back out of a loaded state.
+    ///
+    /// All or nothing, as on the AdamW side: everything is looked up
+    /// before anything is written, so a refusal leaves the live
+    /// optimizer untouched.
+    pub fn read_state(
+        &mut self,
+        names: &HashMap<TensorId, String>,
+        src: &HashMap<String, Tensor>,
+    ) -> Result<(), String> {
+        let mut staged = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let name = param_name(names, slot.var.as_tensor().id())?;
+            let momentum = slot_tensor(src, name, "momentum", &slot.momentum)?;
+            let master = match slot.master.as_ref() {
+                Some(m) => Some(slot_tensor(src, name, "master", m)?),
+                None => None,
+            };
+            staged.push((momentum, master));
+        }
+        for (slot, (momentum, master)) in self.slots.iter_mut().zip(staged) {
+            slot.momentum = momentum;
+            slot.master = master;
+        }
+        Ok(())
     }
 }
 

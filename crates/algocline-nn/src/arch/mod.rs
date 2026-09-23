@@ -15,10 +15,13 @@
 //! with the same variable names used at construction time.
 
 pub mod adapter;
+pub mod blockwise;
 pub mod custom;
 pub mod gpt2;
+pub mod kv;
 pub mod lora;
 pub mod moe;
+pub mod seeded;
 pub mod tinyllama;
 
 /// Softmax over the last dimension through the backward-safe basic-op
@@ -44,11 +47,14 @@ pub(crate) fn softmax_last_dim_slow(
     candle_nn::ops::softmax(xs, candle_core::D::Minus1)
 }
 
+pub use blockwise::Checkpointable;
 pub use custom::{
     Activation, Gpt2Custom, NormKind, NormPlacement, PosKind, ResidualKind, ALLOWED_TABLE_PREFIX,
     ALLOWED_TABLE_TENSOR, COND_TABLE_PREFIX, COND_TABLE_TENSOR,
 };
 pub use gpt2::{AllowedSets, CondIndex, CondIndexError, Gpt2Config, Gpt2Model};
+pub use kv::{KvCache, KvError};
 pub use lora::{max_abs_diff_f32, LoraConfig, LoraLinear, LoraWrappable};
 pub use moe::MoeConfig;
+pub use seeded::seeded_var_builder;
 pub use tinyllama::{TinyLlamaConfig, TinyLlamaModel};

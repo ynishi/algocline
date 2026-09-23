@@ -165,7 +165,9 @@ fn run_lora_ft_leaves_base_weights_bit_identical() {
             batch_size: 1,
             ctx_len: 8,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -304,7 +306,9 @@ fn run_lora_ft_reduces_loss_on_overfit_corpus() {
             batch_size: 1,
             ctx_len: 8,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -415,7 +419,9 @@ fn run_lora_ft_updates_lora_weights() {
             batch_size: 1,
             ctx_len: 8,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         },
     );
@@ -444,6 +450,7 @@ fn run_lora_ft_updates_lora_weights() {
         &model,
         &lora_vm,
         &mut ds,
+        None,
         &train_cfg,
         &loss_fn,
         tmp.path(),

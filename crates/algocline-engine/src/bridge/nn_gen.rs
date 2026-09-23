@@ -13,6 +13,7 @@
 //! logits:vocab()                         -> n
 //! logits:top(n)                          -> { { id = i, value = v }, ... }
 //! logits:argmax()                        -> id
+//! handle:embed(tokens, opts?)            -> { number, ... }
 //! alc.nn.logits.mix(a, b, beta, opts?)   -> LogitsHandle
 //! alc.nn.tokenize(preset, text)          -> { id, ... }
 //! alc.nn.detokenize(preset, ids)         -> string
@@ -37,17 +38,20 @@
 //!
 //! # Sessions over trainable arches (GPT-2 / TinyLlama)
 //!
-//! The trainable arch models expose no KV cache — their `forward` is
-//! the training-loop full-sequence pass. Their sessions therefore run
-//! on a **stateless backend**: every `next_logits` re-forwards the full
-//! token history and slices the final position's row. That is O(n²)
-//! over the generation length, which is acceptable for the model sizes
-//! the train side targets (tiny/small presets, smoke-scale ctx) and
-//! buys the same Lua surface as the Llama session — a decode loop
-//! written against one handle kind runs unchanged against the others.
-//! The history is capped at the model's context window; exceeding it is
-//! a loud session-level error rather than a positional-embedding
-//! failure surfacing from candle.
+//! These carry a KV cache of their own
+//! ([`algocline_nn::arch::KvCache`], one per session, obtained from the
+//! model's `new_cache`), so a session forwards only the tokens appended
+//! since its last step and attends over the rest. Generating `n` tokens
+//! runs the model over `n` positions rather than `1 + 2 + … + n`.
+//!
+//! Until this landed they re-forwarded the whole history every step —
+//! quadratic in the generation length, and every step recomputing keys
+//! and values from weights that had not changed. The Lua surface is
+//! unchanged either way; what changed is what it costs.
+//!
+//! The history is still capped at the model's context window, counted
+//! against what the cache holds, and exceeding it is a loud error
+//! rather than a positional-embedding failure surfacing from candle.
 //!
 //! # Optional input channels
 //!
@@ -93,22 +97,29 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use algocline_nn::arch::adapter::{InferenceAdapter, LlamaAdapter, LlamaCache};
+use algocline_nn::arch::KvCache;
 use algocline_nn::arch::{AllowedSets, CondIndex, Gpt2Model, TinyLlamaModel};
+use std::path::Path;
+
+use algocline_nn::gguf::{export_gguf, parse_precision, GgufArch, GgufSpec, PRECISION_NAMES};
+use algocline_nn::pooling::{pool, Pooling};
+use algocline_nn::sampling::{beam_search, Beam, BeamModel, BeamOptions};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
+use candle_core::quantized::GgmlDType;
 use candle_core::{DType, Device, Tensor};
+use candle_nn::VarMap;
 use mlua::prelude::*;
 
 use super::nn_card::{Gpt2Handle, LlamaHandle, NnHandle, TinyLlamaHandle};
 
 /// The forward path a [`GenSession`] drives.
 ///
-/// `Llama` forwards incrementally through a per-session KV cache. The
-/// trainable arches (`Gpt2` / `TinyLlama`) have no KV cache — their
-/// `forward` is the training-loop full-sequence pass — so their arm
-/// re-forwards the whole token history each step instead (see the
-/// module-level "Sessions over trainable arches" section for the cost
-/// trade-off).
+/// Every arm forwards incrementally through a per-session KV cache:
+/// the adapter through its own, the trainable arches through
+/// [`KvCache`] (see the module-level "Sessions over trainable arches"
+/// section). What differs between them is only where the cache comes
+/// from.
 enum SessionBackend {
     Llama {
         /// Shared, read-only weights. Cloning the `Arc` is what lets
@@ -122,13 +133,19 @@ enum SessionBackend {
         /// is no real contention on it.
         cache: Mutex<LlamaCache>,
     },
-    /// Stateless full-history re-forward over the shared trainable
-    /// model. Session isolation is trivial here — there is no
-    /// per-session state beyond the token history the session already
-    /// owns.
-    Gpt2(Arc<Mutex<Gpt2Model>>),
-    /// Same stateless discipline as `Gpt2`.
-    TinyLlama(Arc<Mutex<TinyLlamaModel>>),
+    /// Incremental forward over the shared trainable model, through
+    /// this session's own KV cache. Two sessions over one handle share
+    /// the weights and nothing else, the same isolation the Llama arm
+    /// has.
+    Gpt2 {
+        model: Arc<Mutex<Gpt2Model>>,
+        cache: Mutex<KvCache>,
+    },
+    /// Same discipline as `Gpt2`.
+    TinyLlama {
+        model: Arc<Mutex<TinyLlamaModel>>,
+        cache: Mutex<KvCache>,
+    },
 }
 
 /// The optional input channel a session feeds the model on every
@@ -222,9 +239,10 @@ pub(super) struct GenSession {
     /// Vocabulary bound every caller-supplied token id is checked
     /// against.
     vocab: usize,
-    /// Model context window. Enforced on the stateless arms, whose
-    /// full-history re-forward would otherwise surface a positional
-    /// embedding error from deep inside candle.
+    /// Model context window. Enforced on the trainable arms by
+    /// [`GenSession::cached_step`], so the refusal names the session
+    /// and its history rather than surfacing a tensor dimension from
+    /// deep inside candle. The Llama adapter caps itself.
     ctx: usize,
     /// Prompt tokens followed by every token the caller appended.
     tokens: Vec<u32>,
@@ -297,15 +315,22 @@ impl GenSession {
         opts: Option<&LuaTable>,
     ) -> LuaResult<Self> {
         let tokens = Self::validate_prompt(prompt, vocab)?;
-        let (device, declared) = {
+        let (device, declared, cache) = {
             let guard = model.lock().map_err(|e| {
                 LuaError::external(format!("alc.nn generate_session: model lock: {e}"))
             })?;
-            (guard.device().clone(), DeclaredChannels::of_gpt2(&guard))
+            (
+                guard.device().clone(),
+                DeclaredChannels::of_gpt2(&guard),
+                guard.new_cache(),
+            )
         };
         let channel = extract_channel(opts, declared, vocab)?;
         Ok(Self {
-            backend: SessionBackend::Gpt2(model),
+            backend: SessionBackend::Gpt2 {
+                model,
+                cache: Mutex::new(cache),
+            },
             channel,
             device,
             vocab,
@@ -333,8 +358,17 @@ impl GenSession {
         // TinyLlama has no channel-table axis, so a channel key here is
         // refused rather than dropped.
         let channel = extract_channel(opts, DeclaredChannels::default(), vocab)?;
+        let cache = {
+            let guard = model.lock().map_err(|e| {
+                LuaError::external(format!("{GEN_SESSION_ERR_PREFIX}: model lock: {e}"))
+            })?;
+            guard.new_cache()
+        };
         Ok(Self {
-            backend: SessionBackend::TinyLlama(model),
+            backend: SessionBackend::TinyLlama {
+                model,
+                cache: Mutex::new(cache),
+            },
             channel,
             device,
             vocab,
@@ -344,33 +378,48 @@ impl GenSession {
         })
     }
 
-    /// Build the `[1, len]` input tensor for the full token history and
-    /// run one stateless forward, returning the final position's
-    /// `[1, vocab]` row.
+    /// Forward this step's pending tokens through the caller's cached
+    /// entry point and return the final position's `[1, vocab]` row.
     ///
     /// Shared by the `Gpt2` / `TinyLlama` arms of `next_logits`; the
-    /// per-arm closure only supplies the model's inherent `forward`.
-    fn full_history_row(
+    /// per-arm closure supplies the model's `*_with_cache` call. The
+    /// context window is checked here rather than left to the model, so
+    /// the message names the session and its history instead of a
+    /// tensor dimension.
+    ///
+    /// `on_failure` is called when the forward fails, before the error
+    /// is returned: a model that failed part way down its layer stack
+    /// has pushed entries for the layers it reached and not for the
+    /// rest, so the cache no longer describes any sequence. Dropping it
+    /// is what makes the session's "a failed step leaves the session
+    /// where it was" true — otherwise a retry forwards the same tokens
+    /// into already-extended layers.
+    fn cached_step(
         &self,
         forward: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>,
+        on_failure: impl FnOnce(),
     ) -> LuaResult<Tensor> {
-        let n = self.tokens.len();
-        if n > self.ctx {
+        let pending = &self.tokens[self.forwarded..];
+        let total = self.tokens.len();
+        if total > self.ctx {
             return Err(LuaError::external(format!(
-                "alc.nn session:next_logits: session history ({n} tokens) exceeds \
-                 the model context window ({ctx}); trainable-arch sessions \
-                 re-forward the full history and cannot generate past ctx",
+                "alc.nn session:next_logits: session history ({total} tokens) exceeds \
+                 the model context window ({ctx}); a session cannot generate past ctx",
                 ctx = self.ctx
             )));
         }
-        let input = Tensor::from_slice(&self.tokens, (1, n), &self.device)
+        let input = Tensor::from_slice(pending, (1, pending.len()), &self.device)
             .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
-        // `[1, n, vocab]` full-sequence logits → keep only the final
-        // position's `[1, vocab]` row, matching the Llama adapter's
-        // LastToken output shape so the common tail below is shared.
-        let full = forward(&input)
-            .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?;
-        full.narrow(1, n - 1, 1)
+        // `[1, pending, vocab]` — this step's positions only, so the
+        // last row is the next-token distribution. Same shape as the
+        // Llama adapter's LastToken output, which is what lets the tail
+        // of `next_logits` be shared.
+        let step = forward(&input).map_err(|e| {
+            on_failure();
+            LuaError::external(format!("alc.nn session:next_logits: {e}"))
+        })?;
+        let last = step.dims()[1] - 1;
+        step.narrow(1, last, 1)
             .and_then(|t| t.squeeze(1))
             .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))
     }
@@ -405,45 +454,73 @@ impl GenSession {
                     .forward_with_cache(&input, self.forwarded, &mut cache)
                     .map_err(|e| LuaError::external(format!("alc.nn session:next_logits: {e}")))?
             }
-            SessionBackend::Gpt2(model) => {
+            SessionBackend::Gpt2 { model, cache } => {
                 let guard = model.lock().map_err(|e| {
                     LuaError::external(format!(
                         "alc.nn session:next_logits: model lock poisoned: {e}"
                     ))
                 })?;
-                match &self.channel {
-                    SessionChannel::None => self.full_history_row(|input| guard.forward(input))?,
-                    SessionChannel::Cond(index) => {
-                        // One row, so one condition. The session is
-                        // batch-1 by construction.
-                        let conds = [*index];
-                        self.full_history_row(|input| guard.forward_conditioned(input, &conds))?
-                    }
-                    SessionChannel::CondWeights(weights) => {
-                        // One combination for the whole forward; the
-                        // session is batch-1 either way.
-                        self.full_history_row(|input| guard.forward_cond_weighted(input, weights))?
-                    }
-                    SessionChannel::Allowed(ids) => self.full_history_row(|input| {
-                        // The same set at every position of the one
-                        // row, rebuilt each step because the history
-                        // the sets have to cover grows with it. Built
-                        // inside the closure so the context-window
-                        // check runs first.
-                        let positions = input.dims()[1];
-                        let sets = vec![vec![ids.clone(); positions]];
-                        let allowed = AllowedSets::new(&sets, input.device())?;
-                        guard.forward_allowed(input, &allowed)
-                    })?,
+                let mut cache = cache.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: kv cache lock poisoned: {e}"
+                    ))
+                })?;
+                // The cache is behind one `&mut` borrow, so the reset
+                // is expressed as a flag the arm below acts on rather
+                // than as a closure that would need a second one.
+                let mut failed = false;
+                let row = self.cached_step(
+                    |input| match &self.channel {
+                        SessionChannel::None => guard.forward_with_cache(input, &mut cache),
+                        SessionChannel::Cond(index) => {
+                            // One row, so one condition. The session is
+                            // batch-1 by construction.
+                            let conds = [*index];
+                            guard.forward_conditioned_with_cache(input, &conds, &mut cache)
+                        }
+                        SessionChannel::CondWeights(weights) => {
+                            // One combination for the whole forward; the
+                            // session is batch-1 either way.
+                            guard.forward_cond_weighted_with_cache(input, weights, &mut cache)
+                        }
+                        SessionChannel::Allowed(ids) => {
+                            // The same set at every position of this step's
+                            // tokens. Only this step's: the positions
+                            // already in the cache read their sets when
+                            // they were forwarded.
+                            let positions = input.dims()[1];
+                            let sets = vec![vec![ids.clone(); positions]];
+                            let allowed = AllowedSets::new(&sets, input.device())?;
+                            guard.forward_allowed_with_cache(input, &allowed, &mut cache)
+                        }
+                    },
+                    || failed = true,
+                );
+                if failed {
+                    cache.reset();
                 }
+                row?
             }
-            SessionBackend::TinyLlama(model) => {
+            SessionBackend::TinyLlama { model, cache } => {
                 let guard = model.lock().map_err(|e| {
                     LuaError::external(format!(
                         "alc.nn session:next_logits: model lock poisoned: {e}"
                     ))
                 })?;
-                self.full_history_row(|input| guard.forward(input))?
+                let mut cache = cache.lock().map_err(|e| {
+                    LuaError::external(format!(
+                        "alc.nn session:next_logits: kv cache lock poisoned: {e}"
+                    ))
+                })?;
+                let mut failed = false;
+                let row = self.cached_step(
+                    |input| guard.forward_with_cache(input, &mut cache),
+                    || failed = true,
+                );
+                if failed {
+                    cache.reset();
+                }
+                row?
             }
         };
         // Advance only after a successful forward: a failed step leaves
@@ -1119,8 +1196,7 @@ where
 }
 
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the
-/// trainable GPT-2 handle's method table (stateless full-history
-/// backend).
+/// trainable GPT-2 handle's method table.
 pub(super) fn add_gpt2_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<Gpt2Handle>,
@@ -1139,9 +1215,565 @@ where
     );
 }
 
+/// Register `handle:embed(tokens, opts?)` on the trainable GPT-2
+/// handle's method table.
+pub(super) fn add_gpt2_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            embed_gpt2(this, &tokens, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:embed(tokens, opts?)` on the trainable TinyLlama
+/// handle's method table.
+pub(super) fn add_tinyllama_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            embed_tinyllama(this, &tokens, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:embed(tokens, opts?)` on the union handle — what a
+/// Card reloaded through `alc.nn.card.load_handle` carries.
+pub(super) fn add_nn_handle_embed_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<NnHandle>,
+{
+    methods.add_method(
+        "embed",
+        |_, this, (tokens, opts): (Vec<i64>, Option<LuaTable>)| {
+            let opts = opts.as_ref();
+            match this {
+                NnHandle::Gpt2(h) => embed_gpt2(h, &tokens, opts),
+                NnHandle::TinyLlama(h) => embed_tinyllama(h, &tokens, opts),
+                // The adapter architectures expose logits and nothing
+                // else: their forward returns the head's output and
+                // there is no hidden state to reach behind it. Refused
+                // by name rather than answered with the logits row,
+                // which is a different quantity of a different width.
+                NnHandle::Llama(_) => Err(LuaError::external(format!(
+                    "{EMBED_ERR_PREFIX}: the llama adapter exposes logits only, so it has no \
+                     hidden state to pool; embed with a gpt2 / tinyllama handle"
+                ))),
+            }
+        },
+    );
+}
+
+/// The embedding of `tokens` under a GPT-2 handle.
+fn embed_gpt2(this: &Gpt2Handle, tokens: &[i64], opts: Option<&LuaTable>) -> LuaResult<Vec<f32>> {
+    let ids = validate_embed_input(tokens, this.vocab(), this.ctx())?;
+    let pooling = extract_pooling(opts)?;
+    let model = this.model();
+    let guard = model
+        .lock()
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: model lock: {e}")))?;
+    let input = Tensor::from_slice(&ids, (1, ids.len()), guard.device())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    let hidden = guard
+        .hidden(&input)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled_row(&hidden, pooling)
+}
+
+/// The embedding of `tokens` under a TinyLlama handle.
+fn embed_tinyllama(
+    this: &TinyLlamaHandle,
+    tokens: &[i64],
+    opts: Option<&LuaTable>,
+) -> LuaResult<Vec<f32>> {
+    let ids = validate_embed_input(tokens, this.vocab(), this.ctx())?;
+    let pooling = extract_pooling(opts)?;
+    let model = this.model();
+    let guard = model
+        .lock()
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: model lock: {e}")))?;
+    let input = Tensor::from_slice(&ids, (1, ids.len()), guard.device())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    let hidden = guard
+        .hidden(&input)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled_row(&hidden, pooling)
+}
+
+/// Error prefix for the embedding surface.
+const EMBED_ERR_PREFIX: &str = "alc.nn handle:embed";
+
+/// Error prefix for the beam-search surface.
+const BEAM_ERR_PREFIX: &str = "alc.nn handle:beam_search";
+
+/// A [`BeamModel`] over a closure, so each architecture contributes
+/// five lines rather than an impl.
+struct ClosureBeam<F>(F);
+
+impl<F> BeamModel for ClosureBeam<F>
+where
+    F: FnMut(&[u32]) -> candle_core::Result<Vec<f32>>,
+{
+    fn next_log_probs(&mut self, tokens: &[u32]) -> candle_core::Result<Vec<f32>> {
+        (self.0)(tokens)
+    }
+}
+
+/// Read `{ beams, max_new, length_penalty, eos }` off a Lua table.
+fn beam_options(opts: Option<&LuaTable>, vocab: usize) -> LuaResult<BeamOptions> {
+    let mut out = BeamOptions::default();
+    let Some(t) = opts else {
+        return Ok(out);
+    };
+    if let Some(v) = t.get::<Option<usize>>("beams")? {
+        // Bounded, because the cost is `beams²` sequence clones per
+        // step and the number comes from Lua: an unbounded one is a
+        // hang rather than an error. The ceiling is far above any
+        // useful width — published work stops well before 50.
+        if v == 0 || v > MAX_BEAMS {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.beams must be between 1 and {MAX_BEAMS} (got {v})"
+            )));
+        }
+        out.beams = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("max_new")? {
+        if v == 0 {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.max_new must be at least 1; a search that generates \
+                 nothing returns the prompt"
+            )));
+        }
+        out.max_new = v;
+    }
+    if let Some(v) = t.get::<Option<f32>>("length_penalty")? {
+        // A negative exponent inverts the ranking and a non-finite one
+        // makes every comparison fall through to `Ordering::Equal`,
+        // which leaves the "best" beam to sort stability.
+        if !v.is_finite() || v < 0.0 {
+            return Err(LuaError::external(format!(
+                "{BEAM_ERR_PREFIX}: opts.length_penalty must be finite and >= 0 (got {v}); \
+                 0 leaves raw score sums and 1 is the mean per token"
+            )));
+        }
+        out.length_penalty = v;
+    }
+    if let Some(v) = t.get::<Option<i64>>("eos")? {
+        out.eos = Some(check_token(v, vocab, "opts.eos")?);
+    }
+    Ok(out)
+}
+
+/// Widest beam this surface accepts.
+///
+/// Not a property of the search — a bound on a number that arrives from
+/// Lua and multiplies the work quadratically.
+const MAX_BEAMS: usize = 64;
+
+/// Project the search's beams into the Lua array a caller gets back.
+fn beams_to_lua(lua: &Lua, beams: Vec<Beam>) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    for (i, beam) in beams.into_iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("tokens", beam.tokens)?;
+        row.set("score", beam.score)?;
+        row.set("finished", beam.finished)?;
+        out.set(i + 1, row)?;
+    }
+    Ok(out)
+}
+
+/// The last position's log-probabilities from a full-sequence forward.
+///
+/// Log-probabilities rather than logits because the search sums them
+/// across steps, and summing unnormalised scores compares sequences
+/// under different normalisers.
+fn last_log_probs(logits: &Tensor) -> candle_core::Result<Vec<f32>> {
+    use candle_core::IndexOp;
+    let t = logits.dims()[1];
+    let row = logits.i((0, t - 1))?.to_dtype(DType::F32)?;
+    candle_nn::ops::log_softmax(&row, 0)?.to_vec1()
+}
+
+/// Register `handle:beam_search(prompt, opts?)` on the GPT-2 handle.
+pub(super) fn add_gpt2_beam_search_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "beam_search",
+        |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            let vocab = this.vocab();
+            // Options first: the window check reads `max_new`.
+            let options = beam_options(opts.as_ref(), vocab)?;
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx(), options.max_new)?;
+            let model = this.model();
+            let guard = model
+                .lock()
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: model lock: {e}")))?;
+            let device = guard.device().clone();
+            let mut beam_model = ClosureBeam(|tokens: &[u32]| {
+                let input = Tensor::from_slice(tokens, (1, tokens.len()), &device)?;
+                last_log_probs(&guard.forward(&input)?)
+            });
+            let beams = beam_search(&mut beam_model, &ids, &options)
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: {e}")))?;
+            beams_to_lua(lua, beams)
+        },
+    );
+}
+
+/// Register `handle:beam_search(prompt, opts?)` on the TinyLlama
+/// handle.
+pub(super) fn add_tinyllama_beam_search_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "beam_search",
+        |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            let vocab = this.vocab();
+            // Options first: the window check reads `max_new`.
+            let options = beam_options(opts.as_ref(), vocab)?;
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx(), options.max_new)?;
+            let model = this.model();
+            let guard = model
+                .lock()
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: model lock: {e}")))?;
+            let device = guard.device().clone();
+            let mut beam_model = ClosureBeam(|tokens: &[u32]| {
+                let input = Tensor::from_slice(tokens, (1, tokens.len()), &device)?;
+                last_log_probs(&guard.forward(&input)?)
+            });
+            let beams = beam_search(&mut beam_model, &ids, &options)
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: {e}")))?;
+            beams_to_lua(lua, beams)
+        },
+    );
+}
+
+/// Check a beam-search prompt, leaving room for what it will generate.
+///
+/// The window is checked against prompt plus budget rather than against
+/// the prompt alone: a search that would run past `ctx` half way
+/// through is better refused before it starts than after it has spent
+/// the forwards — which is why `max_new` is a parameter here and the
+/// options are read before this is called.
+fn validate_beam_prompt(
+    prompt: &[i64],
+    vocab: usize,
+    ctx: usize,
+    max_new: usize,
+) -> LuaResult<Vec<u32>> {
+    if prompt.is_empty() {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: prompt_tokens is empty; there is no sequence to continue"
+        )));
+    }
+    if prompt.len() >= ctx {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: a prompt of {} fills the model context window ({ctx}), \
+             leaving nothing to generate",
+            prompt.len()
+        )));
+    }
+    if prompt.len() + max_new > ctx {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: a prompt of {} plus max_new = {max_new} would reach {} \
+             positions, past the model context window ({ctx})",
+            prompt.len(),
+            prompt.len() + max_new
+        )));
+    }
+    prompt
+        .iter()
+        .enumerate()
+        .map(|(i, id)| check_token(*id, vocab, &format!("prompt_tokens[{}]", i + 1)))
+        .collect()
+}
+
+/// Error prefix for the GGUF export surface.
+const GGUF_ERR_PREFIX: &str = "alc.nn handle:export_gguf";
+
+/// The shape and weights a GGUF export reads off a handle.
+///
+/// Built by each handle type, so this module needs none of their
+/// private fields and they need none of the export's vocabulary beyond
+/// this one struct.
+pub(super) struct GgufSource {
+    /// Architecture family, as the handle names it.
+    pub family: &'static str,
+    /// Full `family-variant`, recorded as the model's name.
+    pub variant: String,
+    pub layers: usize,
+    pub heads: usize,
+    pub kv_heads: usize,
+    pub dim: usize,
+    pub ffn_dim: usize,
+    pub ctx: usize,
+    pub vocab: usize,
+    /// RoPE base, for architectures that rotate.
+    pub rope_theta: Option<f32>,
+    /// The weights, or `None` for a handle whose tensors live behind an
+    /// mmap this bridge never named.
+    pub varmap: Option<Arc<VarMap>>,
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the GPT-2 handle.
+pub(super) fn add_gpt2_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            export_gguf_impl(lua, this.gguf_source(), &path, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the TinyLlama handle.
+pub(super) fn add_tinyllama_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            export_gguf_impl(lua, this.gguf_source()?, &path, opts.as_ref())
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the inference-only
+/// adapter handle, where it refuses.
+///
+/// Registered rather than left absent so the caller gets the reason
+/// instead of `attempt to call a nil value`.
+pub(super) fn add_llama_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<LlamaHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |_, _this, (_path, _opts): (String, Option<LuaTable>)| -> LuaResult<LuaTable> {
+            Err(LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: the llama adapter holds its weights behind an mmap this \
+                 bridge never named, so there is nothing here to write; export from a \
+                 trainable handle"
+            )))
+        },
+    );
+}
+
+/// Register `handle:export_gguf(path, opts?)` on the union handle —
+/// what a Card reloaded through `alc.nn.card.load_handle` carries.
+pub(super) fn add_nn_handle_export_gguf_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<NnHandle>,
+{
+    methods.add_method(
+        "export_gguf",
+        |lua, this, (path, opts): (String, Option<LuaTable>)| {
+            let source = match this {
+                NnHandle::Gpt2(h) => h.gguf_source(),
+                NnHandle::TinyLlama(h) => h.gguf_source()?,
+                NnHandle::Llama(_) => {
+                    return Err(LuaError::external(format!(
+                        "{GGUF_ERR_PREFIX}: the llama adapter holds its weights behind an \
+                         mmap this bridge never named, so there is nothing here to write; \
+                         export from a trainable handle"
+                    )))
+                }
+            };
+            export_gguf_impl(lua, source, &path, opts.as_ref())
+        },
+    );
+}
+
+/// Write this handle's weights out as GGUF, and report what was
+/// written.
+fn export_gguf_impl(
+    lua: &Lua,
+    source: GgufSource,
+    path: &str,
+    opts: Option<&LuaTable>,
+) -> LuaResult<LuaTable> {
+    let precision = match opts
+        .map(|t| t.get::<Option<String>>("precision"))
+        .transpose()?
+    {
+        Some(Some(name)) => parse_precision(&name).ok_or_else(|| {
+            LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: unknown precision '{name}' (expected one of: {})",
+                PRECISION_NAMES.join(" / ")
+            ))
+        })?,
+        _ => GgmlDType::F32,
+    };
+    // A path to an HF `tokenizer.json`, not a preset name: a
+    // `UserData` method has no view of the app directory the preset
+    // cache lives under. The cache is at
+    // `<app>/nn/tokenizers/<preset>.json`, which is what a caller
+    // wanting the preset's own vocabulary points at.
+    //
+    // Refused if it does not exist, rather than writing a file with no
+    // vocabulary in it — llama.cpp will not load one, and the failure
+    // would surface there instead of here.
+    let tokenizer = match opts
+        .map(|t| t.get::<Option<String>>("tokenizer"))
+        .transpose()?
+    {
+        Some(Some(file)) => {
+            let file = PathBuf::from(file);
+            if !file.is_file() {
+                return Err(LuaError::external(format!(
+                    "{GGUF_ERR_PREFIX}: opts.tokenizer names no file at {}; pass the path to \
+                     an HF tokenizer.json (the preset cache is <app>/nn/tokenizers/<preset>.json)",
+                    file.display()
+                )));
+            }
+            Some(file)
+        }
+        _ => None,
+    };
+
+    let (spec, varmap) = gguf_spec(source)?;
+    let report = export_gguf(
+        &varmap,
+        &spec,
+        precision,
+        tokenizer.as_deref(),
+        Path::new(path),
+    )
+    .map_err(|e| LuaError::external(format!("{GGUF_ERR_PREFIX}: {e}")))?;
+
+    let out = lua.create_table()?;
+    out.set("path", path)?;
+    out.set("tensors", report.tensors)?;
+    out.set("metadata", report.metadata)?;
+    out.set("tokenizer", report.tokenizer)?;
+    out.set("architecture", spec.arch.name())?;
+    Ok(out)
+}
+
+/// A handle's source to the export spec and the weights.
+///
+/// Refused where the handle cannot answer: a handle built
+/// `pretrained = true` holds its tensors behind an mmap this bridge
+/// never named, so there is nothing here to write under the names GGUF
+/// wants. Exporting those means loading the weights into a
+/// from-scratch handle first, and the message says so rather than
+/// writing an empty file.
+fn gguf_spec(source: GgufSource) -> LuaResult<(GgufSpec, Arc<VarMap>)> {
+    let arch = match source.family {
+        "gpt2" => GgufArch::Gpt2,
+        "tinyllama" => GgufArch::Llama,
+        other => {
+            return Err(LuaError::external(format!(
+                "{GGUF_ERR_PREFIX}: no GGUF key set for architecture family `{other}`"
+            )))
+        }
+    };
+    if source.variant.contains("custom") {
+        return Err(LuaError::external(format!(
+            "{GGUF_ERR_PREFIX}: a custom architecture's shape is not one GGUF has a key set \
+             for — its feed-forward ratio, norm kind and position scheme are this crate's \
+             own, and a reader would assemble the reference graph instead"
+        )));
+    }
+    let varmap = source.varmap.clone().ok_or_else(|| {
+        LuaError::external(format!(
+            "{GGUF_ERR_PREFIX}: this handle was built with pretrained = true and carries no \
+             VarMap, so its tensors have no names here; load the weights into a \
+             from-scratch handle to export them"
+        ))
+    })?;
+    Ok((
+        GgufSpec {
+            arch,
+            layers: source.layers,
+            heads: source.heads,
+            kv_heads: source.kv_heads,
+            dim: source.dim,
+            ffn_dim: source.ffn_dim,
+            ctx: source.ctx,
+            vocab: source.vocab,
+            eps: 1e-5,
+            rope_theta: source.rope_theta,
+            name: source.variant,
+        },
+        varmap,
+    ))
+}
+
+/// Check an embedding input: non-empty, in vocabulary, inside the
+/// context window.
+///
+/// The window is checked here rather than left to the forward pass for
+/// the same reason the session checks it: the message then names the
+/// input the caller wrote instead of a tensor dimension.
+fn validate_embed_input(tokens: &[i64], vocab: usize, ctx: usize) -> LuaResult<Vec<u32>> {
+    if tokens.is_empty() {
+        return Err(LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: tokens is empty; an embedding of nothing is not a vector \
+             of zeros, it is a question with no subject"
+        )));
+    }
+    if tokens.len() > ctx {
+        return Err(LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: {} tokens exceed the model context window ({ctx}); \
+             split the input or embed a window of it",
+            tokens.len()
+        )));
+    }
+    tokens
+        .iter()
+        .enumerate()
+        .map(|(i, id)| check_token(*id, vocab, &format!("tokens[{}]", i + 1)))
+        .collect()
+}
+
+/// Read `opts.pooling`, defaulting to the mean.
+fn extract_pooling(opts: Option<&LuaTable>) -> LuaResult<Pooling> {
+    let Some(t) = opts else {
+        return Ok(Pooling::default());
+    };
+    let Some(name) = t.get::<Option<String>>("pooling")? else {
+        return Ok(Pooling::default());
+    };
+    Pooling::parse(&name).ok_or_else(|| {
+        LuaError::external(format!(
+            "{EMBED_ERR_PREFIX}: unknown pooling '{name}' (expected one of: {})",
+            Pooling::NAMES.join(" / ")
+        ))
+    })
+}
+
+/// Pool a `[1, seq, dim]` hidden state into the flat Lua array a caller
+/// gets back.
+///
+/// A plain array of numbers rather than an opaque handle: an embedding
+/// is consumed by whatever the caller already has — a distance, a store,
+/// a file — and none of those would take a handle this crate defines.
+fn pooled_row(hidden: &Tensor, pooling: Pooling) -> LuaResult<Vec<f32>> {
+    let pooled = pool(hidden, pooling, None)
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))?;
+    pooled
+        .squeeze(0)
+        .and_then(|row| row.to_dtype(DType::F32))
+        .and_then(|row| row.to_vec1::<f32>())
+        .map_err(|e| LuaError::external(format!("{EMBED_ERR_PREFIX}: {e}")))
+}
+
 /// Register `handle:generate_session(prompt_tokens, opts?)` on the
-/// trainable TinyLlama handle's method table (stateless full-history
-/// backend).
+/// trainable TinyLlama handle's method table.
 pub(super) fn add_tinyllama_generate_session_method<M>(methods: &mut M)
 where
     M: mlua::UserDataMethods<TinyLlamaHandle>,
@@ -1368,6 +2000,7 @@ mod tests {
 
     use super::*;
     use algocline_nn::arch::adapter::LlamaAdapterConfig;
+    use candle_core::IndexOp;
     use candle_nn::{VarBuilder, VarMap};
 
     /// Tiny random-weight adapter (2 layers / vocab 64 / ctx 16). The
@@ -1412,6 +2045,128 @@ mod tests {
             }
         }
         worst
+    }
+
+    /// Vocabulary and context window of [`tiny_gpt2`], restated where
+    /// a session is built because `new_gpt2` takes both from the
+    /// caller (the handle carries them in the bridge proper).
+    const TINY_GPT2_VOCAB: usize = 32;
+    const TINY_GPT2_CTX: usize = 16;
+
+    /// A tiny GPT-2 with fixed weights, so two sessions over it can be
+    /// compared for equality.
+    fn tiny_gpt2() -> Arc<Mutex<Gpt2Model>> {
+        use algocline_nn::arch::Gpt2Config;
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: TINY_GPT2_CTX,
+            vocab: TINY_GPT2_VOCAB,
+            dtype: candle_core::DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: None,
+        };
+        let vm = VarMap::new();
+        let vs = algocline_nn::arch::seeded_var_builder(&vm, 31337, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).expect("build gpt2 tiny");
+        Arc::new(Mutex::new(model))
+    }
+
+    fn run_gpt2(
+        model: Arc<Mutex<Gpt2Model>>,
+        prompt: &[i64],
+        steps: usize,
+    ) -> Vec<(u32, Vec<f32>)> {
+        let mut s = GenSession::new_gpt2(model, TINY_GPT2_VOCAB, TINY_GPT2_CTX, prompt, None)
+            .expect("session");
+        (0..steps).map(|_| step(&mut s)).collect()
+    }
+
+    /// The cached session returns, at every step, the row a full
+    /// re-forward of the history returns. This is the bridge-level
+    /// statement of the claim the cache rests on — the arch-level one
+    /// is `gpt2::tests::a_cached_decode_matches_the_full_re_forward`,
+    /// and this one additionally covers the session's own bookkeeping
+    /// (what it forwards, and which row of the step it reads).
+    #[test]
+    fn a_gpt2_session_returns_what_a_full_re_forward_would() {
+        let model = tiny_gpt2();
+        let prompt: [i64; 3] = [1, 2, 3];
+        let produced = run_gpt2(Arc::clone(&model), &prompt, 4);
+
+        let mut history: Vec<u32> = prompt.iter().map(|id| *id as u32).collect();
+        for (step_index, (sampled, row)) in produced.iter().enumerate() {
+            let n = history.len();
+            let input = Tensor::from_slice(&history, (1, n), &Device::Cpu).expect("input");
+            let full = {
+                let guard = model.lock().unwrap();
+                guard.forward(&input).expect("full forward")
+            };
+            let reference: Vec<f32> = full
+                .i((0, n - 1))
+                .unwrap()
+                .to_vec1()
+                .expect("reference row");
+            let gap = row
+                .iter()
+                .zip(&reference)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                gap < 2e-4,
+                "step {step_index}: session row diverged by {gap}"
+            );
+            history.push(*sampled);
+        }
+    }
+
+    /// Two GPT-2 sessions over one handle hold separate caches: run in
+    /// lockstep they produce exactly what each produces alone. Before
+    /// the cache the arm was stateless and this was trivially true;
+    /// with per-session state it is the property that has to be kept.
+    #[test]
+    fn two_gpt2_sessions_over_one_handle_do_not_mix() {
+        let model = tiny_gpt2();
+        let prompt_a: [i64; 3] = [1, 2, 3];
+        let prompt_b: [i64; 3] = [10, 11, 12];
+
+        let solo_a = run_gpt2(Arc::clone(&model), &prompt_a, 4);
+        let solo_b = run_gpt2(Arc::clone(&model), &prompt_b, 4);
+
+        let mut a = GenSession::new_gpt2(
+            Arc::clone(&model),
+            TINY_GPT2_VOCAB,
+            TINY_GPT2_CTX,
+            &prompt_a,
+            None,
+        )
+        .unwrap();
+        let mut b = GenSession::new_gpt2(
+            Arc::clone(&model),
+            TINY_GPT2_VOCAB,
+            TINY_GPT2_CTX,
+            &prompt_b,
+            None,
+        )
+        .unwrap();
+        let mut mixed_a = Vec::new();
+        let mut mixed_b = Vec::new();
+        for _ in 0..4 {
+            mixed_a.push(step(&mut a));
+            mixed_b.push(step(&mut b));
+        }
+
+        assert!(
+            max_gap(&solo_a, &mixed_a) < 1e-6,
+            "session a saw session b's history"
+        );
+        assert!(
+            max_gap(&solo_b, &mixed_b) < 1e-6,
+            "session b saw session a's history"
+        );
     }
 
     /// Two sessions over one handle advanced in lockstep must produce

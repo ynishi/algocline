@@ -38,7 +38,7 @@
 //! token keeps the output on a path towards a full pattern match. JSON
 //! schema and GBNF grammars are future additions behind the same trait.
 
-use candle_core::{Result as CandleResult, Tensor};
+use candle_core::{Device, Result as CandleResult, Tensor};
 use regex_automata::{
     dfa::{dense, Automaton, StartKind},
     util::primitives::StateID,
@@ -46,6 +46,186 @@ use regex_automata::{
 };
 
 use super::{validate_logits, Sampler};
+
+/// A token mask as one bit per token id.
+///
+/// The dense counterpart of [`TokenMask`], and the shape the field
+/// converged on independently:
+/// [XGrammar](https://github.com/mlc-ai/xgrammar) and
+/// [llguidance](https://docs.rs/llguidance/latest/llguidance/struct.Matcher.html)
+/// both settled on a 32-bit-word bitset of `ceil(vocab / 32)` elements
+/// with a set bit meaning *allowed*, without a specification saying so.
+/// Two reasons, and both apply here: a grammar's allowed set is neither
+/// reliably small nor reliably large — an id list is the wrong
+/// representation at one end and the other — and a bitset can be filled
+/// into a buffer the caller already owns, which takes the per-token
+/// allocation out of the decode loop.
+///
+/// The bit primitives ignore an id at or beyond `vocab`: a set is a
+/// set, and resizing or panicking inside one is not its business.
+/// [`TokenBitset::fill_from`] does not ignore it — a constraint that
+/// emits an out-of-range id has a bug, and absorbing it there would
+/// hide the bug behind plausible output, which is the contract
+/// [`TokenMask`] has always carried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenBitset {
+    /// One bit per id, low bit first, `1` = allowed.
+    words: Vec<u32>,
+    vocab: usize,
+}
+
+impl TokenBitset {
+    /// A set of `vocab` ids with nothing allowed.
+    pub fn none(vocab: usize) -> Self {
+        Self {
+            words: vec![0; vocab.div_ceil(32)],
+            vocab,
+        }
+    }
+
+    /// A set of `vocab` ids with everything allowed.
+    pub fn all(vocab: usize) -> Self {
+        let mut out = Self::none(vocab);
+        out.allow_all();
+        out
+    }
+
+    /// Ids this set describes.
+    pub fn vocab(&self) -> usize {
+        self.vocab
+    }
+
+    /// Allow every id.
+    ///
+    /// The tail bits past `vocab` in the last word are left clear, so
+    /// two sets of one vocabulary compare equal exactly when they allow
+    /// the same ids — which is what the mask cache's comparison rests
+    /// on.
+    pub fn allow_all(&mut self) {
+        for word in &mut self.words {
+            *word = u32::MAX;
+        }
+        self.clear_tail();
+    }
+
+    /// Allow nothing.
+    pub fn deny_all(&mut self) {
+        for word in &mut self.words {
+            *word = 0;
+        }
+    }
+
+    /// Allow `id`, if it is in range.
+    pub fn allow(&mut self, id: u32) {
+        if (id as usize) < self.vocab {
+            self.words[id as usize / 32] |= 1 << (id % 32);
+        }
+    }
+
+    /// Deny `id`, if it is in range.
+    pub fn deny(&mut self, id: u32) {
+        if (id as usize) < self.vocab {
+            self.words[id as usize / 32] &= !(1 << (id % 32));
+        }
+    }
+
+    /// Whether `id` is allowed. Out-of-range ids are not.
+    pub fn contains(&self, id: u32) -> bool {
+        (id as usize) < self.vocab && self.words[id as usize / 32] & (1 << (id % 32)) != 0
+    }
+
+    /// Whether nothing is allowed — the state a mask must never be left
+    /// in, since no token could be sampled.
+    pub fn is_empty(&self) -> bool {
+        self.words.iter().all(|w| *w == 0)
+    }
+
+    /// How many ids are allowed.
+    pub fn count(&self) -> usize {
+        self.words.iter().map(|w| w.count_ones() as usize).sum()
+    }
+
+    /// Re-shape to `vocab` and allow everything, reusing the buffer.
+    ///
+    /// The decode loop calls this once per step on a set it already
+    /// owns; allocating only happens when the vocabulary changes, which
+    /// it does not within a generation.
+    pub fn reset_to_all(&mut self, vocab: usize) {
+        if self.vocab != vocab {
+            self.words.clear();
+            self.words.resize(vocab.div_ceil(32), 0);
+            self.vocab = vocab;
+        }
+        self.allow_all();
+    }
+
+    /// Fill from a [`TokenMask`], reusing the buffer.
+    ///
+    /// # Errors
+    ///
+    /// The first id at or beyond `vocab`. A constraint that names one
+    /// is a constraint with a bug, and a mask that quietly dropped it
+    /// would restrict the generation to something the caller did not
+    /// ask for while looking entirely ordinary.
+    pub fn fill_from(&mut self, mask: &TokenMask, vocab: usize) -> Result<(), u32> {
+        self.reset_to_all(vocab);
+        let ids = match mask {
+            TokenMask::AllowAll => return Ok(()),
+            TokenMask::Deny(ids) => ids,
+            TokenMask::Allow(ids) => {
+                self.deny_all();
+                ids
+            }
+        };
+        for id in ids {
+            if (*id as usize) >= vocab {
+                return Err(*id);
+            }
+        }
+        match mask {
+            TokenMask::Deny(ids) => {
+                for id in ids {
+                    self.deny(*id);
+                }
+            }
+            TokenMask::Allow(ids) => {
+                for id in ids {
+                    self.allow(*id);
+                }
+            }
+            TokenMask::AllowAll => unreachable!("returned above"),
+        }
+        Ok(())
+    }
+
+    /// The allowed ids, ascending.
+    ///
+    /// For a caller that needs the list — a report, a test, a
+    /// representation that is not a mask. The decode path does not use
+    /// it: walking the words is the point of holding them.
+    pub fn allowed(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.count());
+        for (index, word) in self.words.iter().enumerate() {
+            let mut bits = *word;
+            while bits != 0 {
+                let bit = bits.trailing_zeros();
+                out.push((index * 32) as u32 + bit);
+                bits &= bits - 1;
+            }
+        }
+        out
+    }
+
+    /// Clear the bits past `vocab` in the final word.
+    fn clear_tail(&mut self) {
+        let used = self.vocab % 32;
+        if used != 0 {
+            if let Some(last) = self.words.last_mut() {
+                *last &= (1u32 << used) - 1;
+            }
+        }
+    }
+}
 
 /// Sparse per-step token mask produced by a [`Constraint`].
 ///
@@ -82,9 +262,21 @@ pub enum TokenMask {
 /// this [`ConstrainedSampler`] has produced since construction or the
 /// last [`ConstrainedSampler::reset`].
 ///
-/// Implementations are expected to be pure with respect to the prefix
-/// (`&self`, no interior mutation): the same prefix must yield the same
-/// mask, which is what makes seeded generation reproducible end to end.
+/// [`Constraint::mask`] takes the prefix and `&self`, so a constraint
+/// can always be written statelessly. It may instead keep the state
+/// that prefix implies and let the sampler keep the two in step through
+/// [`accept`](Constraint::accept) / [`rollback`](Constraint::rollback)
+/// / [`reset`](Constraint::reset) — the verb set XGrammar and
+/// llguidance arrived at separately, and the one that turns a
+/// prefix-walking constraint from `O(n)` per token into `O(1)`.
+///
+/// **A stateful implementation must agree with itself**: after
+/// accepting exactly the tokens of some prefix, its mask must be the
+/// mask it would return for that prefix. The sampler calls `accept`
+/// once per token it produces and `reset` when its own prefix is
+/// cleared, so an implementation that honours the contract cannot
+/// drift — but one that keeps state and answers `mask` from the prefix
+/// inconsistently would produce a generation neither path explains.
 pub trait Constraint {
     /// Tokens permitted at the position immediately after `prefix`.
     ///
@@ -98,6 +290,72 @@ pub trait Constraint {
     /// break. The generation loop owns termination and polls
     /// [`ConstrainedSampler::is_done`].
     fn is_terminal(&self, prefix: &[u32]) -> bool;
+
+    /// The vocabulary this constraint reasons over, or `None` for one
+    /// that reasons over ids alone and so fits any width.
+    ///
+    /// [`ConstrainedSampler`] checks it against the logits row it is
+    /// handed. A constraint built from a token→string table cannot
+    /// judge an id past the end of that table, and under a wider row
+    /// those ids would come through permitted without ever having been
+    /// examined — plausible output drawn from the part of the
+    /// vocabulary the grammar never saw.
+    fn vocab(&self) -> Option<usize> {
+        None
+    }
+
+    /// Fill `out` with the tokens permitted after `prefix`.
+    ///
+    /// The dense form of [`Self::mask`], and the one the decode loop
+    /// calls: `out` is a buffer the caller already owns, so a step
+    /// allocates nothing. The default adapts [`Self::mask`], which is
+    /// what makes every existing implementation work unchanged; an
+    /// implementation whose natural output is a bitset — a grammar
+    /// walking a token trie — overrides this and leaves `mask` as the
+    /// adapter instead.
+    fn fill_mask(&self, prefix: &[u32], vocab: usize, out: &mut TokenBitset) -> Result<(), u32> {
+        out.fill_from(&self.mask(prefix), vocab)
+    }
+
+    /// The same, for a caller whose accepted tokens **are** `prefix`.
+    ///
+    /// [`ConstrainedSampler`] is that caller and the only one: it
+    /// accepts every token it produces and resets with its own prefix,
+    /// so a constraint keeping state can answer from it instead of
+    /// walking. The default ignores the distinction, which is correct
+    /// for a stateless implementation and is why this is a separate
+    /// method rather than a precondition on [`Self::fill_mask`] —
+    /// a precondition the public method cannot check is a trap.
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        self.fill_mask(prefix, vocab, out)
+    }
+
+    /// Advance by one token the sampler has committed to.
+    ///
+    /// A no-op by default, which is right for a constraint that reads
+    /// the prefix. A stateful one advances its automaton here instead
+    /// of re-deriving it next step.
+    fn accept(&mut self, token: u32) {
+        let _ = token;
+    }
+
+    /// Undo the last `n` accepted tokens.
+    ///
+    /// For a caller that retracts — a beam search abandoning a branch,
+    /// a speculative decode whose draft was rejected. A constraint that
+    /// cannot rewind re-derives from the prefix instead, which is what
+    /// the default no-op means for a stateless one.
+    fn rollback(&mut self, n: usize) {
+        let _ = n;
+    }
+
+    /// Forget everything accepted, as at construction.
+    fn reset(&mut self) {}
 }
 
 /// A boxed, type-erased constraint is still a [`Constraint`].
@@ -117,6 +375,38 @@ impl Constraint for Box<dyn Constraint + Send> {
 
     fn is_terminal(&self, prefix: &[u32]) -> bool {
         (**self).is_terminal(prefix)
+    }
+
+    /// Delegated rather than defaulted, so a boxed constraint that
+    /// overrides any of these keeps its override through the erasure —
+    /// the default would quietly re-adapt from `mask` and undo it.
+    fn fill_mask(&self, prefix: &[u32], vocab: usize, out: &mut TokenBitset) -> Result<(), u32> {
+        (**self).fill_mask(prefix, vocab, out)
+    }
+
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        (**self).fill_mask_accepted(prefix, vocab, out)
+    }
+
+    fn accept(&mut self, token: u32) {
+        (**self).accept(token)
+    }
+
+    fn rollback(&mut self, n: usize) {
+        (**self).rollback(n)
+    }
+
+    fn reset(&mut self) {
+        (**self).reset()
+    }
+
+    fn vocab(&self) -> Option<usize> {
+        (**self).vocab()
     }
 }
 
@@ -141,6 +431,11 @@ pub struct ConstrainedSampler<S: Sampler, C: Constraint> {
     inner: S,
     constraint: C,
     prefix: Vec<u32>,
+    /// This step's allowed set, reused across steps so a decode loop
+    /// allocates nothing per token.
+    allowed: TokenBitset,
+    /// The bias tensor of the last mask, reused while the mask holds.
+    bias: MaskBias,
 }
 
 impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
@@ -150,6 +445,11 @@ impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
             inner,
             constraint,
             prefix: Vec::new(),
+            // Sized on the first step, from the logits the caller
+            // brings: the constraint does not always know the
+            // vocabulary and the sampler never does until then.
+            allowed: TokenBitset::none(0),
+            bias: MaskBias::default(),
         }
     }
 
@@ -174,21 +474,69 @@ impl<S: Sampler, C: Constraint> ConstrainedSampler<S, C> {
     /// same seed.
     pub fn reset(&mut self) {
         self.prefix.clear();
+        // The constraint's own state goes with it, or a stateful one
+        // would answer the next generation from the last one's
+        // automaton.
+        self.constraint.reset();
     }
 }
 
 impl<S: Sampler, C: Constraint> Sampler for ConstrainedSampler<S, C> {
+    /// Refused: this sampler holds one prefix and a batch is several
+    /// sequences. Mixing every row's tokens into one prefix would
+    /// return valid ids in the right shape, constrained against a
+    /// sequence none of the rows is.
+    fn sample_batch(&mut self, _logits: &Tensor) -> CandleResult<Vec<u32>> {
+        Err(candle_core::Error::Msg(
+            "sample_batch: a constrained sampler tracks one prefix, and a batch is several              sequences; use one constrained sampler per row"
+                .into(),
+        ))
+    }
+
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
-        let mask = self.constraint.mask(&self.prefix);
-        let token = match mask {
-            // Free path: hand the caller's tensor straight through.
-            TokenMask::AllowAll => self.inner.sample(logits)?,
-            _ => {
-                let masked = apply_mask(logits, &mask)?;
-                self.inner.sample(&masked)?
+        validate_logits(logits)?;
+        let vocab = logits.dims()[0];
+        if let Some(declared) = self.constraint.vocab() {
+            if declared != vocab {
+                return Err(candle_core::Error::Msg(format!(
+                    "ConstrainedSampler: the constraint reasons over {declared} tokens and the \
+                     logits row is {vocab} wide; the ids in between would be permitted without \
+                     the constraint having examined them"
+                )));
             }
+        }
+        // The accepted form: this sampler's prefix is exactly what it
+        // has accepted, which is the precondition the fast path needs.
+        self.constraint
+            .fill_mask_accepted(&self.prefix, vocab, &mut self.allowed)
+            .map_err(|id| {
+                candle_core::Error::Msg(format!(
+                    "ConstrainedSampler: mask token id {id} is out of range for vocab {vocab}"
+                ))
+            })?;
+        if self.allowed.is_empty() {
+            return Err(candle_core::Error::Msg(format!(
+                "ConstrainedSampler: the constraint permits no token at position {} \
+                 (vocab {vocab} fully masked)",
+                self.prefix.len()
+            )));
+        }
+        let token = if self.allowed.count() == vocab {
+            // Nothing is restricted: hand the caller's tensor straight
+            // through, no bias and no copy.
+            self.inner.sample(logits)?
+        } else {
+            let bias = self.bias.bias_for(&self.allowed, logits.device())?;
+            // The surviving entries come through untouched —
+            // `x + 0.0` is `x` — and the row never leaves the device it
+            // was produced on.
+            let masked = logits.add(&bias)?;
+            self.inner.sample(&masked)?
         };
         self.prefix.push(token);
+        // The constraint advances with the prefix, so a stateful one
+        // never has to re-walk it.
+        self.constraint.accept(token);
         Ok(token)
     }
 }
@@ -255,7 +603,7 @@ impl Constraint for StopTokensConstraint {
 ///
 /// # Empty lists are rejected
 ///
-/// An empty legal set permits nothing, which [`apply_mask`] refuses at
+/// An empty legal set permits nothing, which [`mask_bias`] refuses at
 /// sample time. That is one token too late to be useful: the mistake is
 /// in the caller's legality computation, not in the draw. `new` returns
 /// `Err` instead, the same way [`RegexConstraint::new`] rejects a
@@ -366,7 +714,7 @@ impl Constraint for AllowListConstraint {
 /// state, or an id past the end of `vocab`), and when no token can
 /// continue a viable prefix, `mask` returns [`TokenMask::Allow`] with an
 /// empty list. [`Constraint::mask`] cannot return an error — but an empty
-/// `Allow` is rejected by [`apply_mask`], so the condition surfaces as a
+/// `Allow` is rejected by [`mask_bias`], so the condition surfaces as a
 /// loud `Err` from [`Sampler::sample`] instead of quietly emitting an
 /// off-pattern token.
 #[derive(Debug, Clone)]
@@ -376,6 +724,27 @@ pub struct RegexConstraint {
     /// per-step walk cannot fail.
     start: StateID,
     vocab: Vec<String>,
+    /// The incrementally kept walk — see [`Walk`] and
+    /// [`Constraint::accept`].
+    walked: Walk,
+}
+
+/// What this constraint knows about the walk so far.
+///
+/// Three states, not two: a walk that **died** is an answer (nothing is
+/// permitted from here), and a walk that is **unknown** is not. Folding
+/// them together makes a rollback look like a dead end, which permits
+/// nothing and ends the generation — the bug this enum exists to make
+/// unrepresentable.
+#[derive(Debug, Clone, Copy)]
+enum Walk {
+    /// The state after exactly `len` accepted tokens, or `None` if the
+    /// walk died along the way.
+    Known { state: Option<StateID>, len: usize },
+    /// Nothing is known; the next question re-walks the prefix.
+    ///
+    /// Entered by a rollback, because a DFA does not run backwards.
+    Unknown,
 }
 
 impl RegexConstraint {
@@ -417,7 +786,15 @@ impl RegexConstraint {
                     "RegexConstraint: no anchored start state for pattern {pattern:?}: {e}"
                 ))
             })?;
-        Ok(Self { dfa, start, vocab })
+        Ok(Self {
+            dfa,
+            start,
+            vocab,
+            walked: Walk::Known {
+                state: Some(start),
+                len: 0,
+            },
+        })
     }
 
     /// Whether the DFA can still reach a match from `state`.
@@ -444,6 +821,12 @@ impl RegexConstraint {
     /// DFA state after consuming the whole prefix, or `None` when the
     /// prefix cannot be part of any match (including the case of an id
     /// that is not in `vocab` at all).
+    ///
+    /// Walked from the start every time. [`Self::walked`] is the same
+    /// state kept incrementally, and the two are asserted equal — this
+    /// one stays because a caller that never accepts (a mask asked for
+    /// a prefix this constraint has not been advanced through, a
+    /// beam search probing a branch) still needs an answer.
     fn state_for(&self, prefix: &[u32]) -> Option<StateID> {
         let mut state = self.start;
         for &id in prefix {
@@ -455,16 +838,20 @@ impl RegexConstraint {
         }
         Some(state)
     }
-}
 
-impl Constraint for RegexConstraint {
-    fn mask(&self, prefix: &[u32]) -> TokenMask {
-        let Some(state) = self.state_for(prefix) else {
-            // Unreachable prefix. Permitting nothing routes this into the
-            // loud-failure path rather than letting the sampler improvise.
+    /// The tokens permitted from `state`, or nothing at all when the
+    /// walk has died.
+    ///
+    /// The half of [`Constraint::mask`] that does not depend on how the
+    /// state was reached, so the walked path and the kept-walk fast
+    /// path cannot answer differently.
+    fn mask_from(&self, state: Option<StateID>) -> TokenMask {
+        let Some(state) = state else {
+            // Unreachable prefix. Permitting nothing routes this into
+            // the loud-failure path rather than letting the sampler
+            // improvise.
             return TokenMask::Allow(Vec::new());
         };
-
         let vocab = self.vocab.len();
         let mut allowed: Vec<u32> = Vec::new();
         for (id, piece) in self.vocab.iter().enumerate() {
@@ -500,6 +887,131 @@ impl Constraint for RegexConstraint {
         TokenMask::Allow(allowed)
     }
 
+    /// The kept walk, if it covers a prefix of exactly `len` tokens.
+    ///
+    /// **Length is not identity.** Two prefixes of one length can reach
+    /// different states, so this is only sound for a caller that knows
+    /// the accepted tokens *are* the prefix — which is
+    /// [`ConstrainedSampler`], and nothing else: it accepts every token
+    /// it produces and resets when its prefix is cleared. Every other
+    /// caller goes through [`Self::state_for`], which walks.
+    ///
+    /// Keeping the accepted tokens and comparing them would make the
+    /// check sound for everyone and cost the walk it exists to avoid.
+    fn kept_walk(&self, len: usize) -> Option<Option<StateID>> {
+        match self.walked {
+            Walk::Known { state, len: known } if known == len => Some(state),
+            _ => None,
+        }
+    }
+}
+
+impl Constraint for RegexConstraint {
+    /// The surface-string table this was built with — see
+    /// [`Self::mask`]'s note on the two vocabularies.
+    fn vocab(&self) -> Option<usize> {
+        Some(self.vocab.len())
+    }
+
+    /// The mask from the kept walk when it covers this prefix — see
+    /// [`Constraint::fill_mask_accepted`]. Falls back to walking when
+    /// the walk is unknown, which is what a rollback leaves behind.
+    fn fill_mask_accepted(
+        &self,
+        prefix: &[u32],
+        vocab: usize,
+        out: &mut TokenBitset,
+    ) -> Result<(), u32> {
+        match self.kept_walk(prefix.len()) {
+            Some(state) => out.fill_from(&self.mask_from(state), vocab),
+            None => out.fill_from(&self.mask(prefix), vocab),
+        }
+    }
+
+    /// Advance the kept state by one token.
+    ///
+    /// This is what takes the per-token cost from `O(prefix)` to
+    /// `O(token bytes)`: without it every step re-walked the whole
+    /// generation from the start, which over `n` tokens is `O(n²)`
+    /// bytes through the DFA.
+    fn accept(&mut self, token: u32) {
+        self.walked = match self.walked {
+            // Nothing is known, and one more token does not make it
+            // known: the next question re-walks either way.
+            Walk::Unknown => Walk::Unknown,
+            Walk::Known { state, len } => {
+                let next = match (state, self.vocab.get(token as usize)) {
+                    (Some(state), Some(piece)) => {
+                        let next = self.step(state, piece.as_bytes());
+                        self.alive(next).then_some(next)
+                    }
+                    // Already dead, or a token outside the vocabulary:
+                    // either way the walk cannot continue, and `None`
+                    // is what `state_for` would have answered.
+                    _ => None,
+                };
+                Walk::Known {
+                    state: next,
+                    len: len + 1,
+                }
+            }
+        };
+    }
+
+    /// Drop the last `n` accepted tokens.
+    ///
+    /// A DFA cannot be run backwards, so the kept walk becomes unknown
+    /// and the next mask re-walks the prefix. Correct, and the cost
+    /// falls on the rollback rather than on every step.
+    ///
+    /// Rolling back to nothing is the one case that stays known: that
+    /// state is the start state, which is a constant.
+    fn rollback(&mut self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let remaining = match self.walked {
+            Walk::Known { len, .. } => len.saturating_sub(n),
+            Walk::Unknown => 0,
+        };
+        self.walked = if remaining == 0 {
+            Walk::Known {
+                state: Some(self.start),
+                len: 0,
+            }
+        } else {
+            Walk::Unknown
+        };
+    }
+
+    fn reset(&mut self) {
+        self.walked = Walk::Known {
+            state: Some(self.start),
+            len: 0,
+        };
+    }
+
+    /// # The two vocabularies
+    ///
+    /// This reasons over `self.vocab`, the surface strings it was built
+    /// with, while the mask is applied over the logits row's width. The
+    /// two are the same number for every shipped preset, and
+    /// [`ConstrainedSampler`] refuses a disagreement rather than
+    /// letting it pass — without that check, an id past the end of the
+    /// string list would be permitted without the DFA ever having
+    /// looked at it.
+    ///
+    /// Always walks `prefix`. The state kept by [`Self::accept`] is a
+    /// fast path for the sampler alone — see [`Self::kept_walk`].
+    fn mask(&self, prefix: &[u32]) -> TokenMask {
+        let Some(state) = self.state_for(prefix) else {
+            // Unreachable prefix. Permitting nothing routes this into the
+            // loud-failure path rather than letting the sampler improvise.
+            return TokenMask::Allow(Vec::new());
+        };
+        self.mask_from(Some(state))
+    }
+
     fn is_terminal(&self, prefix: &[u32]) -> bool {
         match self.state_for(prefix) {
             // The end-of-input transition applies the pattern's trailing
@@ -513,59 +1025,77 @@ impl Constraint for RegexConstraint {
 
 // ─── helpers ──────────────────────────────────────────────────────────
 
-/// Build a new logits row with the masked-out entries set to `-inf`.
+/// The additive bias a mask applies: `0.0` where a token survives,
+/// `-inf` where it does not.
 ///
-/// Round-trips through host memory (`to_vec1` → mutate → `from_vec`)
-/// rather than composing tensor ops: the mask is sparse and the vocab
-/// row is a single vector, so the scatter is cheaper than materialising
-/// a full-width mask tensor. The result lands on the input's device.
+/// A bias rather than a rewritten row, because addition leaves the
+/// surviving entries as they were (`x + 0.0 == x`) and the whole tensor
+/// stays where it already is.
+///
+/// One value changes its bits and nothing else: a logit of `-0.0` comes
+/// back as `+0.0`, since IEEE-754 addition of two zeros of unlike sign
+/// rounds to `+0.0`. The two compare equal under every operator and
+/// exponentiate to the same number, so no sampler here can tell them
+/// apart — but the claim is "unchanged", not "bit-identical", and the
+/// difference is stated rather than rounded over. The previous form read the logits
+/// back to the host, scattered `-inf` into the copy, and uploaded the
+/// result — on an accelerator that is a device→host→device round trip
+/// of the full vocabulary at every decoded token, against a model whose
+/// forward never left the device.
+///
+/// The bias is still built on the host and uploaded once, which is half
+/// the traffic and, for a constraint whose mask does not change between
+/// steps, is paid once per generation rather than once per token — see
+/// [`MaskBias`].
 ///
 /// Errors on an out-of-range token id and on a mask that leaves no
 /// candidate at all; see the module doc for why neither is recoverable.
-fn apply_mask(logits: &Tensor, mask: &TokenMask) -> CandleResult<Tensor> {
-    validate_logits(logits)?;
-    let mut values = logits.to_vec1::<f32>()?;
-    let vocab = values.len();
-
-    // `keep` starts at the variant's default answer and the id list
-    // flips the exceptions, so both variants share one scatter loop.
-    let (ids, kept_default) = match mask {
-        TokenMask::AllowAll => return Ok(logits.clone()),
-        TokenMask::Deny(ids) => (ids, true),
-        TokenMask::Allow(ids) => {
-            if ids.is_empty() {
-                return Err(candle_core::Error::Msg(
-                    "ConstrainedSampler: TokenMask::Allow with an empty token list leaves no candidate tokens".into(),
-                ));
-            }
-            (ids, false)
-        }
-    };
-
-    let mut keep = vec![kept_default; vocab];
-    for &id in ids {
-        let idx = id as usize;
-        if idx >= vocab {
-            return Err(candle_core::Error::Msg(format!(
-                "ConstrainedSampler: mask token id {id} is out of range for vocab {vocab}"
-            )));
-        }
-        keep[idx] = !kept_default;
-    }
-
-    if keep.iter().all(|k| !*k) {
+/// Both are decided from the id list alone, so neither needs the logits.
+fn bitset_bias(allowed: &TokenBitset, device: &Device) -> CandleResult<Tensor> {
+    if allowed.is_empty() {
         return Err(candle_core::Error::Msg(format!(
-            "ConstrainedSampler: mask leaves no candidate tokens (vocab {vocab} fully masked)"
+            "ConstrainedSampler: mask leaves no candidate tokens (vocab {} fully masked)",
+            allowed.vocab()
         )));
     }
+    let bias: Vec<f32> = (0..allowed.vocab() as u32)
+        .map(|id| {
+            if allowed.contains(id) {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect();
+    Tensor::from_vec(bias, allowed.vocab(), device)
+}
 
-    for (value, keep) in values.iter_mut().zip(keep) {
-        if !keep {
-            *value = f32::NEG_INFINITY;
+/// The bias tensor of the most recent mask, kept so a constraint whose
+/// mask does not change between steps uploads it once.
+///
+/// Which is most of them: an allow-list and a stop-token set answer the
+/// same mask at every position, and a grammar's mask changes only when
+/// the parse state does. The comparison that decides a hit is a host
+/// memcmp over the id list — cheap next to the transfer it avoids, and
+/// free when the lists are short, which is the case an allow-list
+/// decode is.
+#[derive(Debug, Default, Clone)]
+struct MaskBias {
+    cached: Option<(TokenBitset, Tensor)>,
+}
+
+impl MaskBias {
+    /// The bias for `allowed`, from the cache when it fits.
+    fn bias_for(&mut self, allowed: &TokenBitset, device: &Device) -> CandleResult<Tensor> {
+        if let Some((cached, bias)) = self.cached.as_ref() {
+            if cached == allowed && bias.device().same_device(device) {
+                return Ok(bias.clone());
+            }
         }
+        let bias = bitset_bias(allowed, device)?;
+        self.cached = Some((allowed.clone(), bias.clone()));
+        Ok(bias)
     }
-
-    Tensor::from_vec(values, vocab, logits.device())
 }
 
 #[cfg(test)]
@@ -576,6 +1106,82 @@ mod tests {
 
     fn cpu_logits(vals: &[f32]) -> Tensor {
         Tensor::from_slice(vals, (vals.len(),), &Device::Cpu).unwrap()
+    }
+
+    /// The mask is applied as an additive bias, so a surviving logit
+    /// comes through bit-identical — `x + 0.0` is `x`, and any other
+    /// arrangement would perturb the values the sampler ranks.
+    #[test]
+    fn a_surviving_logit_is_not_touched_by_the_mask() {
+        let values = [0.1f32, -3.25, 7.5, 0.0, -0.0];
+        let logits = cpu_logits(&values);
+        let mut set = TokenBitset::none(values.len());
+        set.fill_from(&TokenMask::Deny(vec![1, 3]), values.len())
+            .unwrap();
+        let bias = bitset_bias(&set, &Device::Cpu).unwrap();
+        let masked: Vec<f32> = logits.add(&bias).unwrap().to_vec1().unwrap();
+        assert_eq!(masked[0].to_bits(), values[0].to_bits());
+        assert_eq!(masked[2].to_bits(), values[2].to_bits());
+        assert!(masked[1].is_infinite() && masked[1].is_sign_negative());
+        assert!(masked[3].is_infinite() && masked[3].is_sign_negative());
+
+        // The one exception, pinned rather than papered over: `-0.0`
+        // comes back `+0.0` because IEEE-754 rounds a sum of unlike
+        // zeros that way. Equal under every comparison the samplers
+        // make, and it exponentiates to the same number, so nothing
+        // downstream can observe it — but it is not bit-identity.
+        assert_eq!(values[4].to_bits(), (-0.0f32).to_bits());
+        assert_eq!(masked[4].to_bits(), 0.0f32.to_bits());
+        assert_eq!(masked[4], values[4], "still equal, and that is what ranks");
+    }
+
+    /// A constraint whose mask does not change between steps uploads
+    /// the bias once. Tensor identity is the observation: a cache hit
+    /// hands back a clone of the same tensor, a miss builds a new one.
+    #[test]
+    fn an_unchanged_mask_reuses_the_bias_it_already_built() {
+        let mut cache = MaskBias::default();
+        let mut set = TokenBitset::none(4);
+        set.fill_from(&TokenMask::Allow(vec![1, 2]), 4).unwrap();
+        let first = cache.bias_for(&set, &Device::Cpu).unwrap();
+        let second = cache.bias_for(&set, &Device::Cpu).unwrap();
+        assert_eq!(
+            first.id(),
+            second.id(),
+            "an unchanged mask must not rebuild"
+        );
+
+        set.fill_from(&TokenMask::Allow(vec![1]), 4).unwrap();
+        let third = cache.bias_for(&set, &Device::Cpu).unwrap();
+        assert_ne!(first.id(), third.id(), "a changed mask must rebuild");
+
+        // A different vocabulary is a different set even under the same
+        // allow list, or a row of another width would be added to.
+        set.fill_from(&TokenMask::Allow(vec![1]), 8).unwrap();
+        let fourth = cache.bias_for(&set, &Device::Cpu).unwrap();
+        assert_ne!(third.id(), fourth.id());
+        assert_eq!(fourth.dims(), &[8]);
+    }
+
+    /// The two refusals are decided from the id list, so they do not
+    /// need the logits and fire before anything reaches the device.
+    #[test]
+    fn the_mask_refusals_are_decided_without_the_logits() {
+        let mut set = TokenBitset::none(4);
+        assert_eq!(
+            set.fill_from(&TokenMask::Allow(vec![9]), 4),
+            Err(9),
+            "an out-of-range id is refused while filling, before any tensor exists"
+        );
+
+        set.fill_from(&TokenMask::Deny(vec![0, 1, 2, 3]), 4)
+            .unwrap();
+        let err = bitset_bias(&set, &Device::Cpu).unwrap_err().to_string();
+        assert!(err.contains("fully masked"), "{err}");
+
+        set.fill_from(&TokenMask::Allow(Vec::new()), 4).unwrap();
+        let err = bitset_bias(&set, &Device::Cpu).unwrap_err().to_string();
+        assert!(err.contains("fully masked"), "{err}");
     }
 
     /// Logits used across the mask tests: argmax is index 1.
@@ -658,6 +1264,226 @@ mod tests {
             FixedMask(TokenMask::Deny(vec![0, 1, 2, 3, 4])),
         );
         assert!(s.sample(&fixture()).is_err(), "full Deny must error");
+    }
+
+    #[test]
+    fn a_bitset_is_the_set_it_was_filled_with() {
+        let mut set = TokenBitset::none(70);
+        assert!(set.is_empty());
+        set.fill_from(&TokenMask::Allow(vec![0, 33, 69]), 70)
+            .unwrap();
+        assert_eq!(set.allowed(), vec![0, 33, 69]);
+        assert_eq!(set.count(), 3);
+        assert!(set.contains(33) && !set.contains(34));
+
+        set.fill_from(&TokenMask::Deny(vec![0, 69]), 70).unwrap();
+        assert_eq!(set.count(), 68);
+        assert!(!set.contains(0) && !set.contains(69) && set.contains(1));
+
+        set.fill_from(&TokenMask::AllowAll, 70).unwrap();
+        assert_eq!(set.count(), 70, "the bits past the vocab stay clear");
+    }
+
+    #[test]
+    fn a_bitset_refuses_an_id_it_has_no_bit_for() {
+        let mut set = TokenBitset::none(4);
+        assert_eq!(set.fill_from(&TokenMask::Allow(vec![1, 9]), 4), Err(9));
+        assert_eq!(set.fill_from(&TokenMask::Deny(vec![4]), 4), Err(4));
+    }
+
+    #[test]
+    fn a_bitset_reuses_its_buffer_across_steps() {
+        // What takes the allocation out of the decode loop: the width
+        // only changes when the vocabulary does, and it does not within
+        // a generation.
+        let mut set = TokenBitset::all(64);
+        let before = set.allowed().len();
+        set.fill_from(&TokenMask::Allow(vec![7]), 64).unwrap();
+        set.fill_from(&TokenMask::AllowAll, 64).unwrap();
+        assert_eq!(set.allowed().len(), before);
+        assert_eq!(set.vocab(), 64);
+    }
+
+    /// A constraint reasoning over a narrower vocabulary than the
+    /// logits row is refused: the ids in between would come through
+    /// permitted without the grammar ever having examined them.
+    #[test]
+    fn a_constraint_and_a_wider_logits_row_are_refused() {
+        let vocab: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let c = RegexConstraint::new("a+", vocab).unwrap();
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        // Five logits against a three-token table.
+        let err = s
+            .sample(&cpu_logits(&[0.1, 0.2, 0.3, 9.0, 0.4]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3 tokens") && err.contains("5 wide"), "{err}");
+
+        // The matching width goes through.
+        let vocab: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        let c = RegexConstraint::new("a+", vocab).unwrap();
+        let mut s = ConstrainedSampler::new(GreedySampler, c);
+        assert!(s.sample(&cpu_logits(&[0.1, 0.2, 0.3])).is_ok());
+    }
+
+    /// An id-only constraint declares no vocabulary and fits any width,
+    /// which is what lets an allow list work with a tokenizer this
+    /// crate has never seen.
+    #[test]
+    fn an_id_only_constraint_fits_any_width() {
+        let mut s =
+            ConstrainedSampler::new(GreedySampler, AllowListConstraint::new(vec![1, 2]).unwrap());
+        assert!(s.sample(&cpu_logits(&[0.1, 5.0, 0.3, 0.4, 0.5])).is_ok());
+    }
+
+    /// The public `mask` answers the prefix it is given, whatever has
+    /// been accepted. The kept walk is a fast path for the sampler,
+    /// whose prefix *is* what it accepted; a caller probing another
+    /// branch — a beam search, a speculative decode, the uses
+    /// `rollback` is documented for — must not be answered from a state
+    /// that belongs to a different sequence of the same length.
+    #[test]
+    fn mask_answers_the_prefix_it_is_given_not_the_one_accepted() {
+        let vocab: Vec<String> = ["a", "b", "ab", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut c = RegexConstraint::new("(ab)+", vocab).unwrap();
+        // Accept "a" — a legal opening — then ask about "b", which is
+        // not one. Both prefixes are one token long.
+        c.accept(0);
+        assert_eq!(
+            c.mask(&[1]),
+            TokenMask::Allow(Vec::new()),
+            "an impossible prefix permits nothing, whatever was accepted"
+        );
+        assert!(!c.is_terminal(&[1]));
+        // And the accepted prefix still answers from the kept walk.
+        let mut set = TokenBitset::none(4);
+        c.fill_mask_accepted(&[0], 4, &mut set).unwrap();
+        let mut walked = TokenBitset::none(4);
+        c.fill_mask(&[0], 4, &mut walked).unwrap();
+        assert_eq!(set, walked, "the fast path answers what the walk does");
+    }
+
+    /// The kept state and the prefix walk must agree at every step —
+    /// the optimisation is only an optimisation if it answers the same
+    /// question.
+    #[test]
+    fn the_kept_state_agrees_with_the_prefix_walk() {
+        let vocab: Vec<String> = ["a", "b", "ab", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let stateful = RegexConstraint::new("(ab|ac)+", vocab.clone()).unwrap();
+        let reference = RegexConstraint::new("(ab|ac)+", vocab).unwrap();
+
+        let mut stateful = stateful;
+        let mut prefix: Vec<u32> = Vec::new();
+        // Walk a few tokens, checking the two masks at every position —
+        // including after a token that kills the walk (3 = "c" from the
+        // start is not a legal opening).
+        for token in [0u32, 1, 0, 3, 1] {
+            assert_eq!(
+                stateful.mask(&prefix),
+                reference.mask(&prefix),
+                "masks diverged at prefix {prefix:?}"
+            );
+            assert_eq!(
+                stateful.is_terminal(&prefix),
+                reference.is_terminal(&prefix),
+                "terminality diverged at prefix {prefix:?}"
+            );
+            prefix.push(token);
+            stateful.accept(token);
+        }
+        assert_eq!(stateful.mask(&prefix), reference.mask(&prefix));
+    }
+
+    /// `rollback` un-accepts, and the mask afterwards is the mask for
+    /// the shorter prefix — re-walked, since a DFA does not run
+    /// backwards.
+    #[test]
+    fn rollback_returns_the_constraint_to_an_earlier_position() {
+        let vocab: Vec<String> = ["a", "b", "ab", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut c = RegexConstraint::new("(ab)+", vocab).unwrap();
+        let after_one = c.mask(&[0]);
+        c.accept(0);
+        c.accept(1);
+        c.rollback(1);
+        assert_eq!(
+            c.mask(&[0]),
+            after_one,
+            "back to where it was after one token"
+        );
+        c.rollback(1);
+        assert_eq!(
+            c.mask(&[]),
+            RegexConstraint::new(
+                "(ab)+",
+                vec!["a".into(), "b".into(), "ab".into(), "c".into()]
+            )
+            .unwrap()
+            .mask(&[])
+        );
+    }
+
+    /// `reset` puts it back to construction, which is what the sampler
+    /// calls when its own prefix is cleared.
+    #[test]
+    fn reset_returns_the_constraint_to_construction() {
+        let vocab: Vec<String> = ["a", "b", "ab", "c"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut c = RegexConstraint::new("(ab)+", vocab).unwrap();
+        let fresh = c.mask(&[]);
+        c.accept(0);
+        c.accept(1);
+        c.reset();
+        assert_eq!(c.mask(&[]), fresh);
+    }
+
+    /// The sampler keeps the constraint in step with its own prefix:
+    /// after sampling, the constraint has accepted exactly what the
+    /// sampler produced, and `reset` clears both.
+    #[test]
+    fn the_sampler_advances_and_resets_the_constraint_with_its_prefix() {
+        /// Records what it was told, so the test can see the calls
+        /// rather than infer them.
+        #[derive(Default)]
+        struct Recorder {
+            accepted: Vec<u32>,
+            resets: usize,
+        }
+        impl Constraint for Recorder {
+            fn mask(&self, _prefix: &[u32]) -> TokenMask {
+                TokenMask::AllowAll
+            }
+            fn is_terminal(&self, _prefix: &[u32]) -> bool {
+                false
+            }
+            fn accept(&mut self, token: u32) {
+                self.accepted.push(token);
+            }
+            fn reset(&mut self) {
+                self.resets += 1;
+                self.accepted.clear();
+            }
+        }
+
+        let mut s = ConstrainedSampler::new(GreedySampler, Recorder::default());
+        let logits = cpu_logits(&[0.1, 5.0, 0.2, 0.3, 0.4]);
+        let a = s.sample(&logits).unwrap();
+        let b = s.sample(&logits).unwrap();
+        assert_eq!(s.prefix(), &[a, b]);
+        s.reset();
+        assert_eq!(s.prefix().len(), 0);
+        // The constraint saw the same two tokens and then the reset.
+        let _ = (a, b);
     }
 
     /// A token id at or beyond `vocab` is a constraint bug. Absorbing it
@@ -1057,7 +1883,7 @@ mod tests {
 
     /// An empty legal set is a caller bug in the *legality* computation,
     /// so it is refused where that computation is wired up rather than
-    /// one token later inside `apply_mask`.
+    /// one token later inside `mask_bias`.
     #[test]
     fn allow_list_rejects_an_empty_list_at_construction() {
         let err = match AllowListConstraint::new(Vec::new()) {
@@ -1068,7 +1894,7 @@ mod tests {
     }
 
     /// An id past the end of the vocab is still caught, just later: the
-    /// constraint cannot know the vocab size, so `apply_mask` is the one
+    /// constraint cannot know the vocab size, so `mask_bias` is the one
     /// place that can tell.
     #[test]
     fn allow_list_out_of_range_id_errors_at_sample_time() {

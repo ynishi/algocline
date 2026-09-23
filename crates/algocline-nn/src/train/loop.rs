@@ -23,35 +23,49 @@ use std::time::Instant;
 use serde::Serialize;
 
 use candle_core::backprop::GradStore;
+use candle_core::TensorId;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
+use candle_nn::{Module, Optimizer, ParamsAdamW, VarMap};
 
-use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
+use crate::arch::{AllowedSets, Checkpointable, CondIndex, LoraConfig, LoraWrappable};
+use crate::train::checkpointing::checkpointed_step;
 use crate::train::ckpt::{
-    checkpoint_from_path, restore_into, Candidate, CheckpointStore, RestoreError,
+    checkpoint_from_path, restore_into, BundleIdentity, Candidate, CheckpointStore, MetricPoint,
+    RestoreError,
 };
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::lion::{Lion, ParamsLion};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
+use crate::train::optstate::{names_by_tensor_id, sidecar_path, OptimizerState};
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::AllowedForward;
 use crate::train::Checkpoint;
 use crate::train::ConditionedForward;
 use crate::train::DeviceView;
 
-/// Optimizer flavour selected by the parameter dtype (design §7.1).
+/// Optimizer flavour, over the parameter dtypes each one accepts
+/// (design §7.1).
 ///
-/// - All-F32 vars → the stock [`candle_nn::AdamW`], keeping the
-///   established baseline bit-identical.
-/// - All-BF16 vars → [`MixedAdamW`] (FP32 master weights + FP32
-///   moments; gradients upcast per step).
+/// - AdamW → [`MixedAdamW`] on both F32 and BF16 (FP32 master weights +
+///   FP32 moments; gradients upcast per step).
+/// - Lion → [`Lion`], which keeps its own FP32 master where the dtype
+///   needs one.
 /// - Anything else (F16, F64, a mixed set) is a loud
-///   [`TrainError::Candle`]: stock AdamW on BF16 keeps its moments in
-///   BF16 and stalls silently, and F16 needs a loss scaler that does
-///   not ship here.
+///   [`TrainError::Candle`]: an optimizer holding BF16 moments stalls
+///   silently, and F16 needs a loss scaler that does not ship here.
+///
+/// # Why F32 AdamW no longer routes through `candle_nn::AdamW`
+///
+/// It used to, as the bit-identical baseline. But that type keeps its
+/// moments in private fields with no accessor, so a run using it could
+/// not write its optimizer state and `init_from` could never be more
+/// than a warm start — for the default optimizer at the default dtype,
+/// which is nearly every run. [`MixedAdamW`] implements the same update
+/// term for term and its FP32-on-FP32 case is pinned against the stock
+/// one to within `1e-6` by `mixed::tests::f32_parity_with_stock_adamw`.
+/// Resumable state for every run is worth that much.
 enum FtOptimizer {
-    Stock(AdamW),
     Mixed(MixedAdamW),
     Lion(Lion),
 }
@@ -90,6 +104,29 @@ impl OptimizerKind {
 
     /// Every wire name this version accepts.
     pub const NAMES: [&'static str; 4] = ["adamw", "adam_w", "adam", "lion"];
+
+    /// Stable number for this flavour, written into an optimizer-state
+    /// file so a resume can refuse to read one optimizer's tensors into
+    /// another's slots.
+    ///
+    /// Spelt out rather than taken from the enum's layout: a variant
+    /// added above another must not renumber a file already on disk.
+    pub fn discriminant(self) -> u32 {
+        match self {
+            Self::AdamW => 0,
+            Self::Lion => 1,
+        }
+    }
+
+    /// Inverse of [`Self::discriminant`]. `None` for a number this
+    /// build has no optimizer for.
+    pub fn from_discriminant(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::AdamW),
+            1 => Some(Self::Lion),
+            _ => None,
+        }
+    }
 }
 
 impl FtOptimizer {
@@ -126,8 +163,7 @@ impl FtOptimizer {
             };
         }
         match dtypes.as_slice() {
-            [DType::F32] => Ok(Self::Stock(AdamW::new(vars, params)?)),
-            [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
+            [DType::F32] | [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
             [DType::F16] => Err(TrainError::Candle(
                 "run_ft_core: f16 parameters need loss scaling, which is not \
                  implemented — build the model with dtype bf16 (CUDA) or f32"
@@ -142,9 +178,61 @@ impl FtOptimizer {
 
     fn set_learning_rate(&mut self, lr: f64) {
         match self {
-            Self::Stock(o) => o.set_learning_rate(lr),
             Self::Mixed(o) => o.set_learning_rate(lr),
             Self::Lion(o) => o.set_learning_rate(lr),
+        }
+    }
+
+    /// Which flavour this is, for the state file's own record of what
+    /// wrote it.
+    fn kind(&self) -> OptimizerKind {
+        match self {
+            Self::Mixed(_) => OptimizerKind::AdamW,
+            Self::Lion(_) => OptimizerKind::Lion,
+        }
+    }
+
+    /// Everything this optimizer would need to carry on, as tensors
+    /// named after the parameters they belong to.
+    fn state(&self, names: &HashMap<TensorId, String>) -> Result<OptimizerState, String> {
+        let mut tensors = HashMap::new();
+        let step = match self {
+            Self::Mixed(o) => {
+                o.write_state(names, &mut tensors)?;
+                o.step_count()
+            }
+            Self::Lion(o) => {
+                o.write_state(names, &mut tensors)?;
+                // Lion has no bias correction and keeps no counter; the
+                // loop's own step is written so a resume can pick the
+                // schedule back up.
+                0
+            }
+        };
+        Ok(OptimizerState {
+            kind: self.kind(),
+            step,
+            tensors,
+        })
+    }
+
+    /// Read a state back in, refusing one written by a different
+    /// optimizer.
+    fn load_state(
+        &mut self,
+        names: &HashMap<TensorId, String>,
+        state: &OptimizerState,
+    ) -> Result<(), String> {
+        if state.kind != self.kind() {
+            return Err(format!(
+                "optimizer state: the file was written by {:?} and this run uses {:?};                  their tensors are not the same quantity",
+                state.kind,
+                self.kind()
+            ));
+        }
+        match self {
+            Self::Mixed(o) => o.read_state(names, &state.tensors, state.step),
+            Self::Lion(o) => o.read_state(names, &state.tensors),
         }
     }
 
@@ -158,7 +246,6 @@ impl FtOptimizer {
     /// for `grad_accum == 1`) so a single code path serves both cases.
     fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
         match self {
-            Self::Stock(o) => o.step(grads),
             Self::Mixed(o) => o.step(grads),
             Self::Lion(o) => o.step(grads),
         }
@@ -183,10 +270,17 @@ pub struct FullFtConfig {
     /// micro-batches before applying a single optimizer update, so the
     /// effective batch size is `batch_size * grad_accum`. Each
     /// micro-batch's loss is pre-scaled by `1 / grad_accum` before
-    /// `backward()` so the summed gradient equals the mean over the
-    /// full effective batch (canonical PyTorch form). `grad_accum = 0`
-    /// is refused as a config error; `grad_accum = 1` behaves exactly
+    /// `backward()` (canonical PyTorch form). `grad_accum = 0` is
+    /// refused as a config error; `grad_accum = 1` behaves exactly
     /// like the single-micro path.
+    ///
+    /// What that sum equals is the mean **of the per-micro means**, not
+    /// the mean over the effective batch's tokens: the loss divides by
+    /// each micro-batch's own scored-token count. The two coincide only
+    /// when every micro-batch scores the same number of positions,
+    /// which stopped being automatic when [`DatasetOpts::mask_pad`]
+    /// began excluding padding — a short final batch now carries more
+    /// weight per token than a full one.
     pub grad_accum: usize,
     /// Total optimizer steps to run.
     pub steps: usize,
@@ -231,6 +325,132 @@ pub struct FullFtConfig {
     /// Number of rotating checkpoints kept (clamped to at least 1
     /// inside [`CheckpointStore`]).
     pub ckpt_keep: usize,
+    /// Write the optimizer's own state beside every checkpoint, so
+    /// [`Self::init_from`] can resume rather than warm-start.
+    ///
+    /// `false` (default) leaves checkpoints the size they have always
+    /// been. AdamW's state is an FP32 master plus two FP32 moments per
+    /// parameter — roughly three times the parameters again — and it is
+    /// of no use to anything but a resume of this exact run, so it goes
+    /// in a `<checkpoint>.opt.safetensors` sidecar rather than into the
+    /// bundle every inference path loads.
+    ///
+    /// What turning it on buys: `init_from` currently restores weights
+    /// into a zeroed optimizer, and AdamW's bias-corrected
+    /// `m̂ / (√v̂ + ε)` makes the first steps after that behave like the
+    /// first steps of a run. The loss bends at the restart and nothing
+    /// in the record says why. With the state in place the moments and
+    /// the step count carry over and the schedule picks up where it
+    /// stopped.
+    ///
+    /// What it does not buy: the data order. A [`Dataset`] is a
+    /// one-pass stream with no position to restore, so a resumed run
+    /// starts the corpus again from the top.
+    pub save_optimizer_state: bool,
+    /// Cap the joint L2 norm of the gradient at this value before each
+    /// optimizer step, or `None` (default) for no cap.
+    ///
+    /// Scales every trainable parameter's gradient by
+    /// `max_norm / norm` when the norm exceeds `max_norm`, leaving the
+    /// direction alone and only its length changed — the standard
+    /// global-norm form rather than a per-tensor or per-element clamp,
+    /// which would tilt the update away from the gradient.
+    ///
+    /// What it is for: one bad batch produces a gradient orders of
+    /// magnitude larger than the rest, the step it drives lands far
+    /// outside the region the loss was measured in, and the run either
+    /// returns to a worse place or leaves with non-finite weights. The
+    /// cap bounds how far any single step can move regardless of the
+    /// batch, and `1.0` is where most transformer recipes sit.
+    ///
+    /// A non-finite norm is left unscaled — multiplying by
+    /// `max_norm / NaN` would only spread the NaN into every parameter
+    /// that still had a usable gradient, and the norm still reaches the
+    /// `on_ckpt` hook, which is where a run can notice and stop.
+    ///
+    /// The norm reported through [`CkptInfo::grad_norm`] is the one
+    /// measured before this scaling, so it says what the step actually
+    /// produced rather than what the cap allowed through.
+    pub clip_grad_norm: Option<f64>,
+    /// What the checkpoints this run writes should say about
+    /// themselves, or `None` (default) to leave them describing
+    /// nothing.
+    ///
+    /// A bare `.safetensors` file carries no architecture, no
+    /// vocabulary and no dtype; everything that identified a bundle
+    /// lived in its Card, which does not travel with the file. With
+    /// this set, every checkpoint carries a header and a `.json`
+    /// sidecar saying what model loads it — see [`BundleIdentity`].
+    ///
+    /// Provenance rather than a hyperparameter, and it sits here
+    /// because the loop has no other way to learn it: a `VarMap` does
+    /// not say what architecture registered it.
+    pub bundle_identity: Option<BundleIdentity>,
+    /// Recompute each block's activations during the backward pass
+    /// instead of keeping them from the forward.
+    ///
+    /// `false` (default) keeps every intermediate of every block alive
+    /// until the backward reads it, which is what bounds context length
+    /// and batch size on a given card. `true` keeps one
+    /// `[batch, seq, dim]` tensor per block and pays a second forward
+    /// pass for the rest — roughly a third more compute for a fraction
+    /// of the activation memory (Chen et al. 2016,
+    /// [arXiv:1604.06174](https://arxiv.org/abs/1604.06174)).
+    ///
+    /// The gradients are the same gradients: a checkpointed step is
+    /// asserted against an ordinary one parameter by parameter, not
+    /// merely shaped like it.
+    ///
+    /// Available on [`run_full_ft`] only, and only for models that can
+    /// be driven one block at a time
+    /// ([`crate::arch::Checkpointable::checkpointable`] says which).
+    /// Asking for it elsewhere is
+    /// [`TrainError::CheckpointingUnsupported`] rather than a flag that
+    /// silently does nothing.
+    pub grad_checkpoint: bool,
+    /// Append one line per N optimizer steps to a
+    /// `<prefix>-metrics.jsonl` file beside the checkpoints, or `0`
+    /// (default) to write none.
+    ///
+    /// What the run produced used to reach a record only as final
+    /// values on the Card and as `Candidate` rows at keep time — two
+    /// snapshots and no curve. Whether a run converged, stalled,
+    /// diverged, or was still descending when it ran out of steps are
+    /// all different shapes of the same final loss, and none of them is
+    /// legible from it. `tracing` already emits a `train_step` event per
+    /// step, but that is a subscriber's to collect and is gone
+    /// afterwards; this leaves a file the run itself wrote.
+    ///
+    /// One JSON object per line (`{"step":…,"loss":…,"lr":…}`, plus
+    /// `grad_norm` and `val_loss` where the run has them), which is the
+    /// shape every plotting tool reads and which an interrupted run
+    /// leaves valid up to its last complete line.
+    pub metrics_every: usize,
+    /// Stop when the held-out loss has not improved for a while, or
+    /// `None` (default) to run every step asked for.
+    ///
+    /// Requires [`Self::eval_every`] and a validation dataset:
+    /// stopping on the training loss would stop when the model stopped
+    /// fitting the data it is being fitted to, which is not the
+    /// question early stopping asks. Configured without them it is
+    /// [`TrainError::EarlyStopWithoutValidation`] rather than a rule
+    /// that quietly never fires.
+    pub early_stop: Option<EarlyStop>,
+    /// Score the held-out set every N optimizer steps, or `0`
+    /// (default) to run without one.
+    ///
+    /// Non-zero requires the caller to hand a validation dataset to the
+    /// entry point, and a validation dataset requires this to be
+    /// non-zero: either half alone is
+    /// [`TrainError::ValidationHalfConfigured`] rather than a run that
+    /// silently never evaluates, or one that pays for a held-out split
+    /// nothing reads.
+    ///
+    /// The held-out batches are drained once before the first step and
+    /// re-scored at each boundary, so every evaluation sees the same
+    /// rows and the sequence of values is a curve rather than a walk
+    /// through different data.
+    pub eval_every: usize,
     /// Checkpoint the model's variables are restored from before the
     /// first step, or `None` (default) to train from whatever the
     /// caller built.
@@ -240,6 +460,16 @@ pub struct FullFtConfig {
     /// not start: a resume that quietly kept some parameters at their
     /// initial values is the failure that costs a run, and it is
     /// indistinguishable from a real one once training is under way.
+    ///
+    /// A resume or a warm start, depending on what is beside the file.
+    /// With a `<checkpoint>.opt.safetensors` sidecar (written by
+    /// [`Self::save_optimizer_state`]) the optimizer state and the step
+    /// count come back too, the schedule continues from that step, and
+    /// [`Self::steps`] is read as the total the run is working towards
+    /// rather than a count of further steps. Without one the weights
+    /// are restored into a fresh optimizer at step 0, and the run says
+    /// so through `tracing` rather than leaving the two cases looking
+    /// alike.
     ///
     /// Not supported on [`run_lora_ft`], which never sees the base
     /// map — see [`TrainError::InitFromUnsupported`].
@@ -291,8 +521,73 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            bundle_identity: None,
+            grad_checkpoint: false,
+            metrics_every: 0,
+            early_stop: None,
+            save_optimizer_state: false,
+            clip_grad_norm: None,
+            eval_every: 0,
             init_from: None,
             mask_disallowed_logits: false,
+        }
+    }
+}
+
+/// When to stop a run that is no longer improving.
+///
+/// Read at every evaluation boundary, against the held-out loss. The
+/// rule is the standard one and both halves of it matter: `patience`
+/// alone stops on noise, and `min_delta` alone never stops a run whose
+/// loss keeps creeping down by nothing.
+#[derive(Debug, Clone, Copy)]
+pub struct EarlyStop {
+    /// Evaluations without an improvement before the run stops.
+    ///
+    /// `0` stops at the first evaluation that fails to improve, which
+    /// is almost always too eager — a loss curve is not monotone at the
+    /// scale of one evaluation period.
+    pub patience: usize,
+    /// How much lower the loss has to be to count as an improvement.
+    ///
+    /// `0.0` counts any decrease, including one indistinguishable from
+    /// floating-point noise, which makes `patience` nearly unreachable
+    /// on a long run.
+    pub min_delta: f32,
+}
+
+/// The best held-out loss seen, and how long since it was beaten.
+#[derive(Debug)]
+struct EarlyStopWatch {
+    rule: EarlyStop,
+    best: f32,
+    /// Evaluations since `best` was last improved on.
+    since: usize,
+}
+
+impl EarlyStopWatch {
+    fn new(rule: EarlyStop) -> Self {
+        Self {
+            rule,
+            best: f32::INFINITY,
+            since: 0,
+        }
+    }
+
+    /// Record one evaluation and answer whether the run should stop.
+    ///
+    /// A non-finite loss is not an improvement and not a reason to keep
+    /// going: it counts against patience like any other failure to
+    /// improve, so a run that diverges into NaN stops on the same rule
+    /// rather than running to the end producing nothing.
+    fn observe(&mut self, value: f32) -> bool {
+        if value.is_finite() && value < self.best - self.rule.min_delta {
+            self.best = value;
+            self.since = 0;
+            false
+        } else {
+            self.since += 1;
+            self.since > self.rule.patience
         }
     }
 }
@@ -390,6 +685,22 @@ pub enum TrainError {
     /// Config asked for zero training steps.
     #[error("`steps` must be at least 1")]
     ZeroSteps,
+    /// Config named a learning rate that cannot mean what it says.
+    ///
+    /// A negative rate ascends the loss and a non-finite one poisons
+    /// every parameter on the first update; both run to completion and
+    /// write a checkpoint that looks like any other. **Zero is
+    /// allowed** — it takes no step, which is a real thing to ask for
+    /// (holding the weights while the rest of the loop runs) and is
+    /// what two of this module's own tests do.
+    ///
+    /// Checked in the loop rather than at one bridge surface, so every
+    /// entry point answers the same way.
+    #[error("`lr` must be finite and not negative (got {value})")]
+    InvalidLearningRate {
+        /// The value the config carried.
+        value: f64,
+    },
     /// Config asked for `grad_accum = 0`, which would divide by zero
     /// when scaling per-micro losses. Multi-step accumulation is now
     /// honoured for `grad_accum >= 1`.
@@ -398,6 +709,88 @@ pub enum TrainError {
     /// Another training session already holds the lease.
     #[error("another training session is already active on this VM")]
     LeaseHeld,
+    /// [`FullFtConfig::clip_grad_norm`] was set to a value that cannot
+    /// cap anything.
+    ///
+    /// Zero would erase every gradient and a negative value would
+    /// reverse it, and either produces a run that trains — steps are
+    /// taken, a loss is reported, a checkpoint is written — while
+    /// moving nowhere or backwards.
+    #[error("clip_grad_norm must be a finite positive number (got {value})")]
+    InvalidClipNorm {
+        /// The value the config carried.
+        value: f64,
+    },
+    /// A resumed run had already reached or passed
+    /// [`FullFtConfig::steps`].
+    ///
+    /// With optimizer state in hand, `steps` is the total the run is
+    /// working towards, so there is nothing left to do. Refused rather
+    /// than returned as a zero-step run, which would write a fresh
+    /// terminal checkpoint whose recorded loss came from no step at
+    /// all.
+    #[error(
+        "the checkpoint resumes at step {resumed} and cfg.steps is {steps}, so this run has          already finished; raise steps to extend it"
+    )]
+    ResumeBeyondSteps {
+        /// Step the optimizer state was written at.
+        resumed: usize,
+        /// Total the config asks for.
+        steps: usize,
+    },
+    /// Optimizer state was found beside a checkpoint and could not be
+    /// read into this run's optimizer.
+    ///
+    /// Refused rather than skipped: the caller asked to resume, and a
+    /// silent fall back to a warm start is the failure the state file
+    /// exists to remove.
+    #[error("init_from: {0}")]
+    OptState(String),
+    /// One half of the validation setup arrived without the other.
+    ///
+    /// [`FullFtConfig::eval_every`] and the entry point's validation
+    /// dataset are one decision expressed in two places, so either half
+    /// alone is a mistake with a quiet outcome: a period with no set
+    /// never evaluates, and a set with no period is a slice held out of
+    /// training that nothing reads.
+    #[error(
+        "validation is half-configured: {present} was given and {missing} was not — \
+         eval_every and the validation dataset go together"
+    )]
+    ValidationHalfConfigured {
+        /// The half the caller supplied.
+        present: &'static str,
+        /// The half it needs.
+        missing: &'static str,
+    },
+    /// [`FullFtConfig::grad_checkpoint`] was set where it cannot be
+    /// honoured.
+    ///
+    /// Either the entry point does not take a blockwise view of the
+    /// model (the conditioned / allowed-id / LoRA paths), or the model
+    /// itself refuses one. A flag that silently did nothing would leave
+    /// a caller believing they had the memory headroom they asked for.
+    #[error("grad_checkpoint cannot be honoured here: {0}")]
+    CheckpointingUnsupported(String),
+    /// [`FullFtConfig::early_stop`] was set on a run with nothing to
+    /// watch.
+    ///
+    /// The rule reads the held-out loss, and a run without a held-out
+    /// set never produces one. Refused rather than left to never fire,
+    /// which is indistinguishable from a rule that was never reached.
+    #[error(
+        "early_stop needs a held-out set to watch: set eval_every and pass a validation \
+         dataset, or drop the rule"
+    )]
+    EarlyStopWithoutValidation,
+    /// A validation dataset was handed over and produced no batch.
+    ///
+    /// Refused at the start rather than reported as an absent
+    /// `val_loss` later: a held-out split that came out empty is a
+    /// split that went wrong, and the run would otherwise spend its
+    /// whole length before saying so.
+    #[error("the validation dataset yielded no batch, so there is nothing to score")]
+    EmptyValidationSet,
     /// An `on_ckpt` hook returned an error.
     ///
     /// The error propagates immediately: no terminal
@@ -472,6 +865,28 @@ pub enum TrainError {
         /// at: the model input or the loss mask.
         needed: &'static str,
     },
+    /// A batch arrived whose loss mask scores no position at all.
+    ///
+    /// Refused rather than run. The masked mean divides by
+    /// `max(mask_sum, 1)` to keep a fully-masked batch from producing
+    /// `NaN`, so such a batch yields a loss of exactly `0.0` — a step
+    /// with no gradient, reported as the best loss the run has seen.
+    /// Once that value is latched, `min_train_loss` never rises again
+    /// and every later checkpoint looks worse than a step that learnt
+    /// nothing. The two readings — "this batch is empty" and "this
+    /// batch is perfect" — are the same number, which is why it has to
+    /// stop here instead of being scored.
+    #[error(
+        "a batch of {rows} row(s) has {scored} scored position(s): its loss mask leaves nothing \
+         to learn from, which scores 0.0 and would latch as the run's best loss"
+    )]
+    NothingScored {
+        /// Rows in the batch.
+        rows: usize,
+        /// Scored positions across the whole batch — zero, by
+        /// construction of this error.
+        scored: usize,
+    },
 }
 
 /// Information handed to the [`CkptHook`] at every `ckpt_every` boundary.
@@ -506,6 +921,29 @@ pub struct CkptInfo {
     /// terminal `metrics["min_train_loss"]` value if the run completes
     /// without an early break).
     pub min_train_loss: f32,
+    /// Loss on the held-out set at the most recent evaluation, or
+    /// `None` on a run with no held-out set
+    /// ([`FullFtConfig::eval_every`] unset).
+    ///
+    /// This is the number a keep decision wants: `train_loss` falls
+    /// whether the model is learning the task or the corpus, and the
+    /// two are indistinguishable from inside the training set. The
+    /// evaluation runs on the same forward path and the same loss the
+    /// training step uses, so the two are comparable.
+    ///
+    /// Evaluations happen every `eval_every` steps and checkpoints
+    /// every `ckpt_every` steps; when the two do not divide each other
+    /// this carries the most recent evaluation rather than one taken at
+    /// this step. [`Self::step`] against
+    /// [`FullFtConfig::eval_every`] is what says how stale it can be.
+    ///
+    /// Absent rather than `null` where a run held nothing out, so the
+    /// candidate record this flattens into follows the same rule the
+    /// metrics file does: a reader that sees the key can rely on it,
+    /// and two sibling JSONL files in one directory do not disagree
+    /// about how they spell "no value".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub val_loss: Option<f32>,
 }
 
 /// Whether the trainer continues or breaks early after an
@@ -654,6 +1092,13 @@ impl From<candle_core::Error> for TrainError {
 /// dedicated `<ckpt_prefix>` keeps concurrent (or historical) runs
 /// from colliding on filenames.
 ///
+/// `val` is the held-out set. `Some` requires
+/// [`FullFtConfig::eval_every`] to be non-zero and `None` requires it
+/// to be zero — see [`TrainError::ValidationHalfConfigured`]. With one
+/// in place the returned [`Checkpoint::val_loss`] and each
+/// [`CkptInfo::val_loss`] carry the loss on those rows, scored through
+/// the same forward path and loss as training.
+///
 /// `hook` is an optional [`CkptHook`] fired at each `ckpt_every`
 /// boundary (after `save_step`). Passing `None` retains the previous
 /// behaviour bit-identically; passing `Some(_)` lets the caller inspect
@@ -665,6 +1110,7 @@ pub fn run_full_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -673,7 +1119,7 @@ pub fn run_full_ft<M>(
     hook: Option<CkptHook>,
 ) -> Result<Checkpoint, TrainError>
 where
-    M: Module + DeviceView,
+    M: Module + DeviceView + Checkpointable,
 {
     // `run_full_ft` optimises every variable registered against
     // `varmap` — the full-fine-tune baseline. It shares its inner
@@ -687,6 +1133,12 @@ where
         varmap,
         varmap,
         dataset,
+        val,
+        // The same model, as the blockwise view `grad_checkpoint`
+        // needs. Only this entry point has one: the conditioned and
+        // allowed-id passes read a channel the blockwise surface does
+        // not take.
+        Some(model),
         cfg,
         loss_fn,
         ckpt_dir,
@@ -724,6 +1176,7 @@ pub fn run_conditioned_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -745,6 +1198,11 @@ where
         varmap,
         varmap,
         dataset,
+        val,
+        // No blockwise view: this pass reads an input channel the
+        // blockwise surface does not take, so `grad_checkpoint` is
+        // refused here rather than quietly dropping the channel.
+        None,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -783,6 +1241,7 @@ pub fn run_allowed_ft<M>(
     model: &M,
     varmap: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -804,6 +1263,11 @@ where
         varmap,
         varmap,
         dataset,
+        val,
+        // No blockwise view: this pass reads an input channel the
+        // blockwise surface does not take, so `grad_checkpoint` is
+        // refused here rather than quietly dropping the channel.
+        None,
         cfg,
         loss_fn,
         ckpt_dir,
@@ -811,6 +1275,67 @@ where
         lease,
         hook,
     )
+}
+
+/// Write the optimizer's state beside a checkpoint that was just
+/// saved, when the config asked for it.
+///
+/// `step` is the loop's global step, which is what a resume needs for
+/// the schedule. For AdamW it also has to match the optimizer's own
+/// counter, and it does: both count optimizer steps from the start of
+/// the original run.
+fn save_optimizer_state(
+    opt: &FtOptimizer,
+    names: &HashMap<TensorId, String>,
+    cfg: &FullFtConfig,
+    ckpt_path: &Path,
+    step: usize,
+) -> Result<(), TrainError> {
+    if !cfg.save_optimizer_state {
+        return Ok(());
+    }
+    let mut state = opt.state(names).map_err(TrainError::OptState)?;
+    // The loop's step wins over the optimizer's own: Lion keeps no
+    // counter, and on a resumed AdamW run the two agree anyway.
+    state.step = step;
+    state
+        .save(&sidecar_path(ckpt_path))
+        .map_err(TrainError::OptState)
+}
+
+/// Read the optimizer state beside `ckpt_path` into `opt`, returning
+/// the step it was written at.
+///
+/// `0` when there is no sidecar: the caller asked to start from a
+/// checkpoint that carries no optimizer state, which is a warm start
+/// and is logged as one. The two cases used to be indistinguishable
+/// from the outside, which is the whole complaint.
+fn resume_optimizer(
+    opt: &mut FtOptimizer,
+    names: &HashMap<TensorId, String>,
+    ckpt_path: &Path,
+    device: &Device,
+) -> Result<usize, TrainError> {
+    let path = sidecar_path(ckpt_path);
+    if !path.exists() {
+        tracing::info!(
+            target: "algocline_nn::train",
+            checkpoint = %ckpt_path.display(),
+            "init_from is a warm start: no optimizer state beside the checkpoint, so the \
+             moments begin at zero and the schedule at step 0"
+        );
+        return Ok(0);
+    }
+    let state = OptimizerState::load(&path, device).map_err(TrainError::OptState)?;
+    opt.load_state(names, &state)
+        .map_err(TrainError::OptState)?;
+    tracing::info!(
+        target: "algocline_nn::train",
+        checkpoint = %ckpt_path.display(),
+        step = state.step,
+        "init_from is a resume: optimizer state restored"
+    );
+    Ok(state.step)
 }
 
 /// Restore [`FullFtConfig::init_from`] into `varmap`, if one was named.
@@ -890,6 +1415,14 @@ type AllowedForwardPass<'a> = dyn FnMut(&Tensor, &AllowedSets) -> Result<Tensor,
 ///   demand of the model without this function knowing about any of
 ///   them, and it checks each batch against the variant rather than
 ///   letting a disagreement pass as a silent ignore.
+/// - `blockwise` — the model again, as something that can be driven one
+///   block at a time, for [`FullFtConfig::grad_checkpoint`]. `None` on
+///   the entry points that have no such view, where asking for
+///   checkpointing is refused rather than ignored.
+/// - `val` — the held-out set, drained once before the first step and
+///   re-scored every [`FullFtConfig::eval_every`] steps. `None` on a
+///   run without one; supplying one of the two without the other is
+///   [`TrainError::ValidationHalfConfigured`].
 /// - `opt_vm` — VarMap whose variables get optimizer updates. In a
 ///   Full FT run this is the same map as the model was constructed
 ///   against; in a LoRA run it is the fresh LoRA-only map returned by
@@ -906,6 +1439,8 @@ fn run_ft_core(
     opt_vm: &VarMap,
     save_vm: &VarMap,
     dataset: &mut dyn Dataset,
+    val: Option<&mut dyn Dataset>,
+    blockwise: Option<&dyn Checkpointable>,
     cfg: &FullFtConfig,
     loss_fn: &dyn Loss,
     ckpt_dir: &Path,
@@ -919,6 +1454,52 @@ fn run_ft_core(
     if cfg.grad_accum == 0 {
         return Err(TrainError::ZeroGradAccum);
     }
+    if !(cfg.lr.is_finite() && cfg.lr >= 0.0) {
+        return Err(TrainError::InvalidLearningRate { value: cfg.lr });
+    }
+    if let Some(max_norm) = cfg.clip_grad_norm {
+        if !(max_norm.is_finite() && max_norm > 0.0) {
+            return Err(TrainError::InvalidClipNorm { value: max_norm });
+        }
+    }
+    // The two halves of the validation setup, checked against each
+    // other before the lease is taken: both mismatches end in a run
+    // that looks configured and measures nothing.
+    // Checked before the lease, like the other config disagreements.
+    let blockwise = match (cfg.grad_checkpoint, blockwise) {
+        (false, _) => None,
+        (true, Some(model)) => {
+            model
+                .checkpointable()
+                .map_err(TrainError::CheckpointingUnsupported)?;
+            Some(model)
+        }
+        (true, None) => {
+            return Err(TrainError::CheckpointingUnsupported(
+                "this entry point drives the model through a forward it cannot decompose; \
+                 grad_checkpoint is available on run_full_ft"
+                    .into(),
+            ))
+        }
+    };
+    if cfg.early_stop.is_some() && cfg.eval_every == 0 {
+        return Err(TrainError::EarlyStopWithoutValidation);
+    }
+    let val = match (val, cfg.eval_every) {
+        (Some(_), 0) => {
+            return Err(TrainError::ValidationHalfConfigured {
+                present: "a validation dataset",
+                missing: "cfg.eval_every",
+            })
+        }
+        (None, n) if n > 0 => {
+            return Err(TrainError::ValidationHalfConfigured {
+                present: "cfg.eval_every",
+                missing: "a validation dataset",
+            })
+        }
+        (val, _) => val,
+    };
 
     let _lease = lease.acquire().ok_or(TrainError::LeaseHeld)?;
     // Fixed reference point for [`CkptInfo::elapsed_ms`]. Taken after
@@ -934,13 +1515,11 @@ fn run_ft_core(
     }
 
     // AdamW picks up its `lr` from the config once and then follows
-    // `set_learning_rate` at each step. The optimizer flavour is
-    // driven by the parameter dtype (design §7.1): F32 keeps the
-    // stock candle-nn AdamW (bit-identical baseline), BF16 routes
-    // through the FP32-master [`MixedAdamW`]. Anything else is a
-    // loud error — stock AdamW on BF16 vars would keep its moments
-    // in BF16 and stall silently, and F16 needs a loss scaler that
-    // does not ship here.
+    // `set_learning_rate` at each step. Both F32 and BF16 route
+    // through the FP32-master `MixedAdamW` — see `FtOptimizer`, which
+    // records why the stock candle-nn AdamW was retired. Anything
+    // else is a loud error: an optimizer keeping BF16 moments stalls
+    // silently, and F16 needs a loss scaler that does not ship here.
     let adamw_params = ParamsAdamW {
         lr: cfg.lr,
         weight_decay: cfg.weight_decay,
@@ -950,6 +1529,22 @@ fn run_ft_core(
     };
     let mut opt = FtOptimizer::for_vars(cfg.optimizer, vars, adamw_params)?;
 
+    // The weights were restored before the loop was entered (see
+    // `apply_init_from`); the optimizer exists only now, so its own
+    // state is read here. `resumed_step` is 0 for a fresh run and for a
+    // warm start, and the step the state was written at otherwise.
+    let names = names_by_tensor_id(opt_vm);
+    let resumed_step = match cfg.init_from.as_ref() {
+        Some(path) => resume_optimizer(&mut opt, &names, path, device)?,
+        None => 0,
+    };
+    if resumed_step >= cfg.steps {
+        return Err(TrainError::ResumeBeyondSteps {
+            resumed: resumed_step,
+            steps: cfg.steps,
+        });
+    }
+
     let scheduler = {
         let s = Scheduler::new(cfg.schedule, cfg.lr, cfg.min_lr, cfg.warmup, cfg.steps);
         match cfg.decay_steps {
@@ -958,15 +1553,31 @@ fn run_ft_core(
         }
     };
 
+    // Drained before the first step so an empty or broken held-out
+    // split is a refusal at the start rather than a `val_loss` that
+    // never arrives.
+    let val_batches = match val {
+        Some(val) => Some(drain_validation(val)?),
+        None => None,
+    };
+
     // The store is always constructed: even without mid-run
     // checkpoints (`ckpt_every == 0`) the loop still writes the
     // terminal `<prefix>.safetensors` file through it.
     let mut ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+    if let Some(identity) = cfg.bundle_identity.clone() {
+        ckpt_store = ckpt_store.with_identity(identity);
+    }
 
     let device = device.clone();
     let mut last_train_loss = f32::NAN;
     let mut running_min_loss = f32::INFINITY;
+    // `None` until the first evaluation lands, which is also what a run
+    // without a held-out set reports for its whole length.
+    let mut last_val_loss: Option<f32> = None;
+    let mut min_val_loss = f32::INFINITY;
+    let mut watch = cfg.early_stop.map(EarlyStopWatch::new);
     // Checkpoints the hook asked to hold, in the order it asked.
     let mut candidates: Vec<Candidate> = Vec::new();
 
@@ -982,7 +1593,11 @@ fn run_ft_core(
     // updated the parameters".
     let grad_accum = cfg.grad_accum;
     let scale = 1.0f64 / grad_accum as f64;
-    for step in 0..cfg.steps {
+    // `step` is the global index: on a resumed run it starts where the
+    // state left off, so the schedule, the checkpoint filenames and the
+    // hook's `info.step` all continue the earlier run rather than
+    // restarting alongside it.
+    for step in resumed_step..cfg.steps {
         let lr = scheduler.lr_at(step);
         opt.set_learning_rate(lr);
 
@@ -994,97 +1609,43 @@ fn run_ft_core(
                 requested: cfg.steps,
             })?;
 
-            let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
-            // The allowed-id input, built only for the entry point that
-            // takes one: every other run would pay for a tensor it
-            // cannot read. The sets are shifted to line up with the
-            // model's inputs — see `allowed_input_sets`.
-            let allowed = match &forward {
-                ForwardPass::Allowed(_) => {
-                    allowed_input_sets(&batch, batch.input_ids[0].len(), &device)?
-                }
-                _ => None,
-            };
-            // The batch's own side channels against the caller's
-            // declared intent. Both disagreements are refused: a
-            // conditioned run over a conditionless batch would train
-            // unconditioned under a checkpoint labelled otherwise, and
-            // an unconditioned run over a conditioned batch would drop
-            // a condition the caller attached per row. `inputs` is the
-            // batch after the target shift, so its first dimension is
-            // still the row count.
-            let logits = match (&mut forward, batch.conds.as_deref(), allowed.as_ref()) {
-                (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
-                (ForwardPass::PerRow(per_row), Some(conds), _) => {
-                    per_row(&inputs, conds, batch.conds_per_row)?
-                }
-                (ForwardPass::Allowed(allowed_forward), None, Some(sets)) => {
-                    allowed_forward(&inputs, sets)?
-                }
-                (ForwardPass::Allowed(_), None, None) => {
-                    return Err(TrainError::MissingAllowedSets {
-                        rows: inputs.dim(0)?,
-                        needed: "the model reads them at every position",
-                    })
-                }
-                // Neither of these two takes a condition, so a batch
-                // carrying one is the same mistake at both.
-                (ForwardPass::Plain(_) | ForwardPass::Allowed(_), Some(conds), _) => {
-                    return Err(TrainError::UnexpectedConditions {
-                        rows: inputs.dim(0)?,
-                        conds: conds.len(),
-                    })
-                }
-                (ForwardPass::PerRow(_), None, _) => {
-                    return Err(TrainError::MissingConditions {
-                        rows: inputs.dim(0)?,
-                    })
-                }
-            };
-            // Mixed precision: the loss (log_softmax + NLL reduction)
-            // is always scored in F32 — BF16's 8 mantissa bits are too
-            // coarse for a mean over thousands of log-probs.
-            // `to_dtype` is differentiable, so the backward pass
-            // crosses back into the model's dtype at this boundary.
-            // F32 logits pass through untouched.
-            let logits = if logits.dtype() == DType::F32 {
-                logits
-            } else {
-                logits.to_dtype(DType::F32)?
-            };
-            // Remove the ids this target could not have taken, so the
-            // loss scores the choice among the ones it could. Applied
-            // after the F32 cast: a large negative penalty in BF16
-            // would not survive the conversion cleanly. Opt-in, and a
-            // batch that cannot honour the opt-in is refused rather
-            // than trained unmasked.
-            let logits = if cfg.mask_disallowed_logits {
-                match allowed_logit_mask(&batch, batch.input_ids[0].len(), logits.dim(2)?, &device)?
-                {
-                    Some(m) => logits.broadcast_add(&m)?,
-                    None => {
-                        return Err(TrainError::MissingAllowedSets {
-                            rows: inputs.dim(0)?,
-                            needed: "cfg.mask_disallowed_logits asks the loss to use them",
-                        })
-                    }
-                }
-            } else {
-                logits
-            };
-            let loss = loss_fn.compute(&logits, &targets, mask.as_ref())?;
-
-            let loss_val: f32 = loss.to_scalar()?;
-            micro_loss_sum += loss_val;
-
             // Pre-backward `1 / grad_accum` scaling — the canonical
             // form. Scalar multiplication is linear w.r.t. the backward
             // pass, so `sum_i grad(loss_i / N) == grad(mean_i loss_i)`
             // and the reported grad equals the mean over the effective
             // batch. For `grad_accum == 1` this reduces to `scale = 1`
-            // and the multiply is a no-op numerically.
-            let scaled = (&loss * scale)?;
-            let grads = scaled.backward()?;
+            // and the multiply is a no-op numerically. Both paths apply
+            // it before any backward runs, so they scale identically.
+            let (loss_val, grads) = match blockwise {
+                Some(model) => {
+                    let (inputs, targets, mask) = batch_to_input_target(&batch, &device)?;
+                    let (value, grads) = checkpointed_step(
+                        model,
+                        &inputs,
+                        |logits| {
+                            loss_from_logits(
+                                logits.clone(),
+                                &batch,
+                                &targets,
+                                mask.as_ref(),
+                                cfg,
+                                loss_fn,
+                                &device,
+                            )
+                            .map_err(|e| candle_core::Error::Msg(e.to_string()))
+                        },
+                        scale,
+                    )?;
+                    (value, grads)
+                }
+                None => {
+                    let loss = forward_loss(&mut forward, &batch, &device, cfg, loss_fn)?;
+                    let loss_val: f32 = loss.to_scalar()?;
+                    let scaled = (&loss * scale)?;
+                    (loss_val, scaled.backward()?)
+                }
+            };
+            micro_loss_sum += loss_val;
             match accum.as_mut() {
                 Some(store) => store.extend(grads)?,
                 None => accum = Some(grads),
@@ -1093,7 +1654,7 @@ fn run_ft_core(
         // `accum` is always `Some` here because `grad_accum >= 1` is
         // enforced above and the inner loop runs at least once — a
         // mid-micro dataset exhaustion returns early via `?` above.
-        let grads = accum.expect("grad_accum >= 1 guarantees at least one backward");
+        let mut grads = accum.expect("grad_accum >= 1 guarantees at least one backward");
 
         let mean_loss = micro_loss_sum / grad_accum as f32;
         last_train_loss = mean_loss;
@@ -1104,9 +1665,10 @@ fn run_ft_core(
         // Per-step observability. Emit through `tracing` so downstream
         // subscribers (RUST_LOG=algocline_nn=info) can collect the loss
         // trajectory without changing the return shape. `loss` is the
-        // mean per-micro loss (matches the equivalent single-micro
-        // `batch_size * grad_accum` run) and `grad_accum` is emitted as
-        // an additive field so post-hoc analysis can distinguish
+        // mean of the per-micro losses — see `grad_accum` for why that
+        // is not the same as one `batch_size * grad_accum` batch once
+        // padding is masked — and `grad_accum` is emitted as an
+        // additive field so post-hoc analysis can distinguish
         // accumulated steps from raw single-micro ones.
         tracing::info!(
             step = step,
@@ -1116,25 +1678,63 @@ fn run_ft_core(
             "train_step"
         );
 
-        // Compute grad norm before `opt.step` consumes / mutates the
-        // per-parameter state. The value is only surfaced through the
-        // `on_ckpt` hook, so the walk is guarded by `hook.is_some()`
-        // and `ckpt_every` — a no-hook run pays nothing beyond the
-        // existing per-step cost.
+        // Computed before `opt.step` consumes / mutates the
+        // per-parameter state. Two consumers want it — the `on_ckpt`
+        // hook and the clip below — and the walk is skipped when
+        // neither does, so a run with no hook and no cap pays nothing
+        // beyond the existing per-step cost.
         let will_fire_hook =
             hook.is_some() && cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0;
-        let grad_norm = if will_fire_hook {
+        let grad_norm = if will_fire_hook || cfg.clip_grad_norm.is_some() {
             grad_l2_norm(opt_vm, &grads)?
         } else {
             0.0
         };
+        // Reported as measured, then capped: `grad_norm` above is what
+        // the step produced, and this is what the optimizer receives.
+        if let Some(max_norm) = cfg.clip_grad_norm {
+            clip_grad_norm_(opt_vm, &mut grads, max_norm, grad_norm)?;
+        }
 
         opt.step(&grads)?;
+
+        // Scored after the step, so the value belongs to the weights
+        // the checkpoint written just below actually holds.
+        let mut out_of_patience = false;
+        if let Some(batches) = val_batches.as_ref() {
+            if (step + 1) % cfg.eval_every == 0 {
+                let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                last_val_loss = Some(v);
+                if v < min_val_loss {
+                    min_val_loss = v;
+                }
+                tracing::info!(step = step, val_loss = v, "eval_step");
+                if let Some(watch) = watch.as_mut() {
+                    out_of_patience = watch.observe(v);
+                }
+            }
+        }
+
+        // The curve, written as the run goes rather than collected at
+        // the end: a run that dies still leaves what it had.
+        if cfg.metrics_every > 0 && (step + 1) % cfg.metrics_every == 0 {
+            let point = MetricPoint {
+                step: step + 1,
+                loss: mean_loss,
+                lr,
+                grad_norm: (will_fire_hook || cfg.clip_grad_norm.is_some()).then_some(grad_norm),
+                val_loss: last_val_loss,
+            };
+            ckpt_store
+                .append_metrics(&point)
+                .map_err(|e| TrainError::Ckpt(format!("metrics: {e}")))?;
+        }
 
         if cfg.ckpt_every > 0 && (step + 1) % cfg.ckpt_every == 0 {
             let ckpt_path = ckpt_store
                 .save_step(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+            save_optimizer_state(&opt, &names, cfg, &ckpt_path, step + 1)?;
 
             if let Some(hook_fn) = hook.as_mut() {
                 let info = CkptInfo {
@@ -1145,6 +1745,7 @@ fn run_ft_core(
                     grad_norm,
                     elapsed_ms: train_start.elapsed().as_millis() as u64,
                     min_train_loss: running_min_loss,
+                    val_loss: last_val_loss,
                 };
                 let control = hook_fn(&info).map_err(TrainError::Hook)?;
 
@@ -1182,37 +1783,174 @@ fn run_ft_core(
                         // downstream consumers can distinguish an
                         // early stop from a full-run save without
                         // walking `step` against `cfg.steps`.
+                        // Same as the early-stop exit: the record's
+                        // `val_loss` belongs to the weights it names.
+                        if let Some(batches) = val_batches.as_ref() {
+                            if !(step + 1).is_multiple_of(cfg.eval_every) {
+                                let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                                last_val_loss = Some(v);
+                                if v < min_val_loss {
+                                    min_val_loss = v;
+                                }
+                            }
+                        }
                         let final_path = ckpt_store
-                            .save_final(save_vm)
+                            .save_final(save_vm, step + 1)
                             .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+                        save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
                         let mut metrics: HashMap<String, f32> = HashMap::new();
                         metrics.insert("min_train_loss".into(), running_min_loss);
                         metrics.insert("final_lr".into(), lr as f32);
                         metrics.insert("early_break".into(), 1.0);
-                        let mut ckpt =
-                            checkpoint_from_path(&final_path, step + 1, mean_loss, None, metrics)
-                                .map_err(TrainError::Ckpt)?;
+                        if resumed_step > 0 {
+                            metrics.insert("resumed_from_step".into(), resumed_step as f32);
+                        }
+                        if last_val_loss.is_some() {
+                            metrics.insert("min_val_loss".into(), min_val_loss);
+                        }
+                        let mut ckpt = checkpoint_from_path(
+                            &final_path,
+                            step + 1,
+                            mean_loss,
+                            last_val_loss,
+                            metrics,
+                        )
+                        .map_err(TrainError::Ckpt)?;
                         ckpt.candidates = candidates;
                         return Ok(ckpt);
                     }
                 }
             }
+        } // After the checkpoint block above, not before it: the
+          // step that runs out of patience can also be a
+          // `ckpt_every` boundary, and returning here first would
+          // deny the hook the one fire it most needs — the step the
+          // run ends on is the step a selection hook wants to keep.
+        if out_of_patience {
+            // The run stops where it stopped improving, and says so:
+            // a caller reading `step` against `cfg.steps` would
+            // otherwise have to guess whether the run was cut short or
+            // the config was.
+            tracing::info!(
+                target: "algocline_nn::train",
+                step = step + 1,
+                val_loss = last_val_loss,
+                "early stop: the held-out loss stopped improving"
+            );
+            // Score the weights this record names, the way the normal
+            // exit does: `last_val_loss` may be several steps old, and
+            // a record pairing step N's weights with step N-3's
+            // held-out loss is a comparison nobody can make sense of
+            // later.
+            if let Some(batches) = val_batches.as_ref() {
+                if !(step + 1).is_multiple_of(cfg.eval_every) {
+                    let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+                    last_val_loss = Some(v);
+                    if v < min_val_loss {
+                        min_val_loss = v;
+                    }
+                }
+            }
+            let final_path = ckpt_store
+                .save_final(save_vm, step + 1)
+                .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+            save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
+            let mut metrics: HashMap<String, f32> = HashMap::new();
+            metrics.insert("min_train_loss".into(), running_min_loss);
+            metrics.insert("final_lr".into(), lr as f32);
+            metrics.insert("early_stop".into(), 1.0);
+            metrics.insert("min_val_loss".into(), min_val_loss);
+            if resumed_step > 0 {
+                metrics.insert("resumed_from_step".into(), resumed_step as f32);
+            }
+            let mut ckpt =
+                checkpoint_from_path(&final_path, step + 1, mean_loss, last_val_loss, metrics)
+                    .map_err(TrainError::Ckpt)?;
+            ckpt.candidates = candidates;
+            return Ok(ckpt);
         }
     }
 
     // Terminal save under the stable `<prefix>.safetensors` filename.
     let final_path = ckpt_store
-        .save_final(save_vm)
+        .save_final(save_vm, cfg.steps)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+    save_optimizer_state(&opt, &names, cfg, &final_path, cfg.steps)?;
 
     let mut metrics: HashMap<String, f32> = HashMap::new();
     metrics.insert("min_train_loss".into(), running_min_loss);
     metrics.insert("final_lr".into(), scheduler.lr_at(cfg.steps - 1) as f32);
+    if resumed_step > 0 {
+        metrics.insert("resumed_from_step".into(), resumed_step as f32);
+    }
+    // A last evaluation whenever the final step was not one, so the
+    // returned record always carries the held-out loss of the weights
+    // it names rather than of some earlier step.
+    if let Some(batches) = val_batches.as_ref() {
+        if !cfg.steps.is_multiple_of(cfg.eval_every) {
+            let v = evaluate(&mut forward, batches, &device, cfg, loss_fn)?;
+            last_val_loss = Some(v);
+            if v < min_val_loss {
+                min_val_loss = v;
+            }
+        }
+        metrics.insert("min_val_loss".into(), min_val_loss);
+    }
 
-    let mut ckpt = checkpoint_from_path(&final_path, cfg.steps, last_train_loss, None, metrics)
-        .map_err(TrainError::Ckpt)?;
+    let mut ckpt = checkpoint_from_path(
+        &final_path,
+        cfg.steps,
+        last_train_loss,
+        last_val_loss,
+        metrics,
+    )
+    .map_err(TrainError::Ckpt)?;
     ckpt.candidates = candidates;
     Ok(ckpt)
+}
+
+/// Scale every trainable parameter's gradient so their joint L2 norm is
+/// at most `max_norm`, given the `norm` already measured over the same
+/// set.
+///
+/// Takes the measured norm rather than computing it, because the caller
+/// wants the pre-clip value for [`CkptInfo::grad_norm`] anyway and the
+/// walk is the expensive part.
+///
+/// Only the gradients of variables registered in `opt_vm` are scaled.
+/// A [`GradStore`] from `backward()` also holds gradients for
+/// intermediate tensors, and those are not part of the update, so
+/// including them would measure and scale against a norm no optimizer
+/// step uses.
+///
+/// Leaves everything alone when the norm is already within the cap, and
+/// when it is not finite — see [`FullFtConfig::clip_grad_norm`].
+/// Returns the scale that was applied (`1.0` when nothing was).
+fn clip_grad_norm_(
+    opt_vm: &VarMap,
+    grads: &mut GradStore,
+    max_norm: f64,
+    norm: f32,
+) -> CandleResult<f64> {
+    if !norm.is_finite() || (norm as f64) <= max_norm {
+        return Ok(1.0);
+    }
+    let scale = max_norm / norm as f64;
+    // Collected first: the walk reads the map while the writes below go
+    // to the store, and holding the map's lock across the writes is not
+    // needed for either.
+    let ids: Vec<candle_core::TensorId> = {
+        let data = opt_vm.data().lock().unwrap();
+        data.values().map(|var| var.as_tensor().id()).collect()
+    };
+    for id in ids {
+        let Some(g) = grads.get_id(id) else {
+            continue;
+        };
+        let scaled = (g * scale)?;
+        grads.insert_id(id, scaled);
+    }
+    Ok(scale)
 }
 
 /// L2 norm of every trainable parameter's gradient in `opt_vm`.
@@ -1225,8 +1963,16 @@ fn run_ft_core(
 /// runs.
 fn grad_l2_norm(opt_vm: &VarMap, grads: &GradStore) -> CandleResult<f32> {
     let data = opt_vm.data().lock().unwrap();
+    // Summed in name order, not `HashMap` order. f32 addition is not
+    // associative and `RandomState` reseeds per process, so iterating
+    // the map directly makes the norm differ in its last bits between
+    // two runs of the same configuration — and with `clip_grad_norm`
+    // set that difference scales every gradient, which is the one axis
+    // `arch::seeded` exists to close. The same reason `ckpt.rs` writes
+    // its tensors from a `BTreeMap`.
+    let ordered: BTreeMap<&String, &candle_core::Var> = data.iter().collect();
     let mut sum_sq: f32 = 0.0;
-    for var in data.values() {
+    for var in ordered.into_values() {
         if let Some(g) = grads.get(var.as_tensor()) {
             let g_f32 = if g.dtype() == DType::F32 {
                 g.clone()
@@ -1289,6 +2035,14 @@ where
     if train_cfg.init_from.is_some() {
         return Err(TrainError::InitFromUnsupported);
     }
+    // No validation parameter reaches this entry point, so a period
+    // set here could never be honoured. Refused rather than ignored.
+    if train_cfg.eval_every > 0 {
+        return Err(TrainError::ValidationHalfConfigured {
+            present: "cfg.eval_every",
+            missing: "a validation dataset (this entry point takes none)",
+        });
+    }
 
     // Wrap first so we surface `LoraConfig` validation errors (unknown
     // target module, oversized rank) before the lease is acquired.
@@ -1321,6 +2075,10 @@ where
         &lora_vm,
         &lora_vm,
         dataset,
+        None,
+        // No blockwise view: the wrapped model's blocks are not the
+        // ones this entry holds a map for.
+        None,
         train_cfg,
         loss_fn,
         &nn_dir,
@@ -1398,7 +2156,7 @@ pub fn run_distill<M>(
     lease: Arc<TrainingLease>,
 ) -> Result<Checkpoint, TrainError>
 where
-    M: Module + DeviceView,
+    M: Module + DeviceView + Checkpointable,
 {
     match spec.loss_kind {
         DistillLossKind::Ce => {
@@ -1410,6 +2168,9 @@ where
                 student,
                 varmap,
                 dataset,
+                // Distillation holds nothing out either; `eval_every`
+                // on the shared config is refused by the loop.
+                None,
                 &spec.hyperparams,
                 &loss,
                 ckpt_dir,
@@ -1419,6 +2180,182 @@ where
             )
         }
     }
+}
+
+/// One batch to its scalar loss: the target shift, the side-channel
+/// checks, the F32 cast and the optional allowed-id mask, in the order
+/// the training step needs them.
+///
+/// Held apart from the step itself because the evaluation pass has to
+/// score the held-out set exactly the way training scores a batch. A
+/// second copy of this sequence would let `val_loss` and `train_loss`
+/// drift apart under any later change to either — and two numbers that
+/// are compared have to be the same measurement.
+///
+/// Returns the loss tensor rather than its scalar value: the training
+/// step needs the node to call `backward()` on, and the evaluation pass
+/// simply never does.
+fn forward_loss(
+    forward: &mut ForwardPass<'_>,
+    batch: &Batch,
+    device: &Device,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+) -> Result<Tensor, TrainError> {
+    let (inputs, targets, mask) = batch_to_input_target(batch, device)?;
+    // Counted on the rows the batch carries rather than on the tensor:
+    // the mask is host-side data and a `sum_all` here would pull the
+    // device back for every step. The first column is dropped because
+    // the mask is sliced in lockstep with the target shift.
+    if let Some(rows) = batch.loss_mask.as_ref() {
+        let scored = rows
+            .iter()
+            .flat_map(|row| row.iter().skip(1))
+            .filter(|weight| **weight != 0.0)
+            .count();
+        if scored == 0 {
+            return Err(TrainError::NothingScored {
+                rows: rows.len(),
+                scored,
+            });
+        }
+    }
+    // The allowed-id input, built only for the entry point that takes
+    // one: every other run would pay for a tensor it cannot read. The
+    // sets are shifted to line up with the model's inputs — see
+    // `allowed_input_sets`.
+    let allowed = match &forward {
+        ForwardPass::Allowed(_) => allowed_input_sets(batch, batch.input_ids[0].len(), device)?,
+        _ => None,
+    };
+    // The batch's own side channels against the caller's declared
+    // intent. Both disagreements are refused: a conditioned run over a
+    // conditionless batch would train unconditioned under a checkpoint
+    // labelled otherwise, and an unconditioned run over a conditioned
+    // batch would drop a condition the caller attached per row.
+    // `inputs` is the batch after the target shift, so its first
+    // dimension is still the row count.
+    let logits = match (forward, batch.conds.as_deref(), allowed.as_ref()) {
+        (ForwardPass::Plain(plain), None, _) => plain(&inputs)?,
+        (ForwardPass::PerRow(per_row), Some(conds), _) => {
+            per_row(&inputs, conds, batch.conds_per_row)?
+        }
+        (ForwardPass::Allowed(allowed_forward), None, Some(sets)) => {
+            allowed_forward(&inputs, sets)?
+        }
+        (ForwardPass::Allowed(_), None, None) => {
+            return Err(TrainError::MissingAllowedSets {
+                rows: inputs.dim(0)?,
+                needed: "the model reads them at every position",
+            })
+        }
+        // Neither of these two takes a condition, so a batch carrying
+        // one is the same mistake at both.
+        (ForwardPass::Plain(_) | ForwardPass::Allowed(_), Some(conds), _) => {
+            return Err(TrainError::UnexpectedConditions {
+                rows: inputs.dim(0)?,
+                conds: conds.len(),
+            })
+        }
+        (ForwardPass::PerRow(_), None, _) => {
+            return Err(TrainError::MissingConditions {
+                rows: inputs.dim(0)?,
+            })
+        }
+    };
+    loss_from_logits(logits, batch, &targets, mask.as_ref(), cfg, loss_fn, device)
+}
+
+/// A model's logits to the scalar loss: the F32 cast, the optional
+/// allowed-id mask, and the loss itself.
+///
+/// The tail of [`forward_loss`], split off because the
+/// gradient-checkpointed path produces its logits elsewhere and has to
+/// score them the same way. Two copies of this sequence would let a
+/// checkpointed run and an ordinary one optimise slightly different
+/// objectives while reporting the same number.
+fn loss_from_logits(
+    logits: Tensor,
+    batch: &Batch,
+    targets: &Tensor,
+    mask: Option<&Tensor>,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+    device: &Device,
+) -> Result<Tensor, TrainError> {
+    // Mixed precision: the loss (log_softmax + NLL reduction) is always
+    // scored in F32 — BF16's 8 mantissa bits are too coarse for a mean
+    // over thousands of log-probs. `to_dtype` is differentiable, so the
+    // backward pass crosses back into the model's dtype at this
+    // boundary. F32 logits pass through untouched.
+    let logits = if logits.dtype() == DType::F32 {
+        logits
+    } else {
+        logits.to_dtype(DType::F32)?
+    };
+    // Remove the ids this target could not have taken, so the loss
+    // scores the choice among the ones it could. Applied after the F32
+    // cast: a large negative penalty in BF16 would not survive the
+    // conversion cleanly. Opt-in, and a batch that cannot honour the
+    // opt-in is refused rather than trained unmasked.
+    let logits = if cfg.mask_disallowed_logits {
+        match allowed_logit_mask(batch, batch.input_ids[0].len(), logits.dim(2)?, device)? {
+            Some(m) => logits.broadcast_add(&m)?,
+            None => {
+                return Err(TrainError::MissingAllowedSets {
+                    rows: logits.dim(0)?,
+                    needed: "cfg.mask_disallowed_logits asks the loss to use them",
+                })
+            }
+        }
+    } else {
+        logits
+    };
+    Ok(loss_fn.compute(&logits, targets, mask)?)
+}
+
+/// Drain a validation dataset into the batches every evaluation will
+/// re-score.
+///
+/// Held in memory rather than re-read: [`Dataset`] is a one-pass
+/// stream with no rewind, so a second evaluation would otherwise score
+/// different rows from the first and the sequence of values would stop
+/// being a curve. A held-out split is small by construction, which is
+/// what makes holding it affordable.
+fn drain_validation(val: &mut dyn Dataset) -> Result<Vec<Batch>, TrainError> {
+    let mut batches = Vec::new();
+    while let Some(batch) = val.next_batch()? {
+        batches.push(batch);
+    }
+    if batches.is_empty() {
+        return Err(TrainError::EmptyValidationSet);
+    }
+    Ok(batches)
+}
+
+/// Mean loss over the held-out batches, scored on the same forward path
+/// and the same loss the training step uses.
+///
+/// The mean is taken over batches rather than over tokens, matching how
+/// the training step reports its own loss across micro-batches. The two
+/// agree whenever the batches are equally sized, which they are except
+/// for a short final one.
+///
+/// No `backward()` is called, so nothing here touches the optimizer or
+/// the parameters.
+fn evaluate(
+    forward: &mut ForwardPass<'_>,
+    batches: &[Batch],
+    device: &Device,
+    cfg: &FullFtConfig,
+    loss_fn: &dyn Loss,
+) -> Result<f32, TrainError> {
+    let mut sum = 0.0f32;
+    for batch in batches {
+        let loss = forward_loss(forward, batch, device, cfg, loss_fn)?;
+        sum += loss.to_scalar::<f32>()?;
+    }
+    Ok(sum / batches.len() as f32)
 }
 
 /// Break a [`Batch`] into `(inputs, targets, mask)` tensors on the
@@ -1657,6 +2594,7 @@ mod tests {
     use crate::train::data::{DatasetOpts, TokenizedDataset};
     use crate::train::loss::CrossEntropyLoss;
     use candle_nn::VarBuilder;
+    use std::sync::Mutex;
     use tempfile::TempDir;
 
     fn tiny_cfg_and_model() -> (Gpt2Config, VarMap, Gpt2Model) {
@@ -1690,10 +2628,1205 @@ mod tests {
                 batch_size: 1,
                 ctx_len: 8,
                 shuffle: false,
+                seed: None,
                 pad_id: 0,
+                mask_pad: true,
                 text_field: "text".into(),
             },
         )
+    }
+
+    /// With optimizer state on disk, `init_from` resumes: the step
+    /// count carries over, `steps` is the total the run works towards,
+    /// and the record says where it picked up.
+    #[test]
+    fn init_from_with_optimizer_state_resumes_the_step_count_and_the_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 4,
+            warmup: 2,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        let a = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "resume",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.step, 4);
+        let ckpt = tmp.path().join("resume.safetensors");
+        let sidecar = crate::train::optstate::sidecar_path(&ckpt);
+        assert!(sidecar.exists(), "the sidecar must sit beside {ckpt:?}");
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 7,
+            warmup: 2,
+            save_optimizer_state: true,
+            init_from: Some(ckpt),
+            ..FullFtConfig::default()
+        };
+        let b = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "resume2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            b.step, 7,
+            "steps is the total, not a count of further steps"
+        );
+        assert_eq!(
+            b.metrics.get("resumed_from_step").copied(),
+            Some(4.0),
+            "the record has to say the run did not start at zero"
+        );
+    }
+
+    /// A checkpoint with no state beside it is still accepted, and the
+    /// run reports itself as starting from zero rather than looking
+    /// like a resume.
+    #[test]
+    fn init_from_without_optimizer_state_is_still_a_warm_start() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "warm",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        let ckpt = tmp.path().join("warm.safetensors");
+        assert!(
+            !crate::train::optstate::sidecar_path(&ckpt).exists(),
+            "save_optimizer_state was off, so nothing should sit beside it"
+        );
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            init_from: Some(ckpt),
+            ..FullFtConfig::default()
+        };
+        let b = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "warm2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.step, 2);
+        assert!(!b.metrics.contains_key("resumed_from_step"));
+    }
+
+    /// Resuming into a total the run has already reached is refused
+    /// rather than answered with a zero-step run and a fresh terminal
+    /// checkpoint.
+    #[test]
+    fn a_resume_past_the_requested_total_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "done",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            init_from: Some(tmp.path().join("done.safetensors")),
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "done2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ResumeBeyondSteps {
+                    resumed: 4,
+                    steps: 4
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// State written by one optimizer is not read into another's slots.
+    #[test]
+    fn a_state_written_by_another_optimizer_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let adamw = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &adamw,
+            &loss,
+            tmp.path(),
+            "kind",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let lion = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            optimizer: OptimizerKind::Lion,
+            lr: 1e-4,
+            init_from: Some(tmp.path().join("kind.safetensors")),
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &lion,
+            &loss,
+            tmp.path(),
+            "kind2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrainError::OptState(_)), "{err}");
+    }
+
+    /// A rotated-out checkpoint takes its state file with it.
+    #[test]
+    fn rotation_drops_the_optimizer_state_alongside_the_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let cfg = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            ckpt_every: 1,
+            ckpt_keep: 2,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "rot",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        let sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-step") && n.ends_with(".opt.safetensors"))
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            2,
+            "one per surviving step checkpoint, not one per step: {sidecars:?}"
+        );
+    }
+
+    /// The cap scales the gradient down to exactly `max_norm` and    /// The cap scales the gradient down to exactly `max_norm` and
+    /// leaves its direction alone.
+    #[test]
+    fn clipping_shortens_the_gradient_without_turning_it() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(3, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[3.0f32, 4.0, 0.0], &dev).unwrap())
+            .unwrap();
+        // `sum(w^2)/2` has gradient `w`, so the norm is the length of
+        // the value set above — 5, against a cap of 1.
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+
+        let before = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((before - 5.0).abs() < 1e-5, "norm before = {before}");
+
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, before).unwrap();
+        assert!((scale - 0.2).abs() < 1e-6, "scale = {scale}");
+        let after = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((after - 1.0).abs() < 1e-5, "norm after = {after}");
+        let g: Vec<f32> = grads
+            .get(var.as_tensor())
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        // Direction preserved: the original [3, 4, 0] scaled by 1/5.
+        assert!((g[0] - 0.6).abs() < 1e-6 && (g[1] - 0.8).abs() < 1e-6 && g[2].abs() < 1e-6);
+    }
+
+    /// A gradient already inside the cap is handed to the optimizer
+    /// untouched.
+    #[test]
+    fn a_gradient_within_the_cap_is_left_alone() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(2, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[0.3f32, 0.4], &dev).unwrap())
+            .unwrap();
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+        let before = grad_l2_norm(&vm, &grads).unwrap();
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, before).unwrap();
+        assert_eq!(scale, 1.0);
+        let after = grad_l2_norm(&vm, &grads).unwrap();
+        assert!((after - before).abs() < 1e-7);
+    }
+
+    /// A non-finite norm is left unscaled rather than multiplied into
+    /// every parameter that still had a usable gradient.
+    #[test]
+    fn a_non_finite_norm_is_not_scaled() {
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(2, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = {
+            let data = vm.data().lock().unwrap();
+            data["w"].clone()
+        };
+        var.set(&Tensor::new(&[1.0f32, 2.0], &dev).unwrap())
+            .unwrap();
+        let loss = (var.as_tensor().sqr().unwrap().sum_all().unwrap() * 0.5).unwrap();
+        let mut grads = loss.backward().unwrap();
+        let scale = clip_grad_norm_(&vm, &mut grads, 1.0, f32::NAN).unwrap();
+        assert_eq!(scale, 1.0);
+        let g: Vec<f32> = grads
+            .get(var.as_tensor())
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(g, vec![1.0, 2.0], "the gradient must not become NaN");
+    }
+
+    /// A learning rate that ascends or poisons is refused; zero, which
+    /// takes no step, is not — holding the weights while the rest of
+    /// the loop runs is a real thing to ask for.
+    #[test]
+    fn a_learning_rate_that_cannot_mean_what_it_says_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        for value in [-1e-3, f64::NAN, f64::INFINITY] {
+            let mut ds = overfit_dataset();
+            let cfg = FullFtConfig {
+                lr: value,
+                steps: 2,
+                ..FullFtConfig::default()
+            };
+            let err = run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &cfg,
+                &loss,
+                tmp.path(),
+                "lr",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TrainError::InvalidLearningRate { .. }),
+                "lr = {value}: {err}"
+            );
+        }
+
+        let mut ds = overfit_dataset();
+        let zero = FullFtConfig {
+            lr: 0.0,
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        assert!(
+            run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &zero,
+                &loss,
+                tmp.path(),
+                "lrzero",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .is_ok(),
+            "lr = 0 takes no step and is allowed"
+        );
+    }
+
+    /// A cap that cannot cap anything is refused before the run starts.
+    #[test]
+    fn a_clip_norm_that_erases_or_reverses_the_gradient_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut ds = overfit_dataset();
+            let cfg = FullFtConfig {
+                steps: 2,
+                clip_grad_norm: Some(value),
+                ..FullFtConfig::default()
+            };
+            let err = run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &cfg,
+                &loss,
+                tmp.path(),
+                "clip",
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, TrainError::InvalidClipNorm { .. }),
+                "clip_grad_norm = {value}: {err}"
+            );
+        }
+    }
+
+    /// The norm the hook is handed is the one the step produced, not
+    /// the one the cap let through.
+    #[test]
+    fn the_hook_sees_the_norm_before_the_cap_applied() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ckpt_every: 1,
+            // Small enough that a from-scratch step is over it.
+            clip_grad_norm: Some(1e-6),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let seen: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: CkptHook = Box::new(move |info: &CkptInfo| {
+            sink.lock().unwrap().push(info.grad_norm);
+            Ok(CkptControl::CONTINUE)
+        });
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "clipnorm",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(
+            seen.iter().all(|n| *n > 1e-6),
+            "reported norms must be the measured ones, not the cap: {seen:?}"
+        );
+    }
+
+    /// A run with a held-out set reports its loss on the record, in
+    /// the metrics, and at every hook fire.
+    #[test]
+    fn a_held_out_set_is_scored_and_reaches_the_record_and_the_hook() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 4,
+            warmup: 1,
+            ckpt_every: 2,
+            eval_every: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let seen: Arc<Mutex<Vec<Option<f32>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let hook: CkptHook = Box::new(move |info: &CkptInfo| {
+            sink.lock().unwrap().push(info.val_loss);
+            Ok(CkptControl::CONTINUE)
+        });
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "val",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .expect("run with a held-out set");
+
+        let val_loss = ckpt.val_loss.expect("the record carries the held-out loss");
+        assert!(
+            val_loss.is_finite() && val_loss > 0.0,
+            "val_loss = {val_loss}"
+        );
+        let min = *ckpt
+            .metrics
+            .get("min_val_loss")
+            .expect("min_val_loss is recorded alongside min_train_loss");
+        assert!(min <= val_loss, "min_val_loss {min} > final {val_loss}");
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2, "two checkpoint boundaries at ckpt_every = 2");
+        assert!(
+            seen.iter().all(|v| v.is_some()),
+            "every fire lands on an evaluation boundary here, so each carries a value: {seen:?}"
+        );
+    }
+
+    /// A checkpointed run is the same run: after the same steps on the
+    /// same data from the same initialisation, the parameters match.
+    #[test]
+    fn a_checkpointed_run_lands_where_the_ordinary_one_does() {
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        // `(before, after)` per run: a comparison of two runs that both
+        // failed to train agrees perfectly, which is what a version of
+        // this test that only compared the ends could not tell.
+        let weights_after = |grad_checkpoint: bool,
+                             prefix: &str|
+         -> (BTreeMap<String, Vec<f32>>, BTreeMap<String, Vec<f32>>) {
+            let cfg = Gpt2Config {
+                layers: 2,
+                heads: 2,
+                dim: 16,
+                ctx: 8,
+                vocab: 32,
+                dtype: DType::F32,
+                device: Device::Cpu,
+                eps: 1e-5,
+                moe: None,
+                custom: None,
+            };
+            let vm = VarMap::new();
+            // Seeded, so the two runs start from one model and a
+            // difference at the end is the checkpointing.
+            let vs = crate::arch::seeded_var_builder(&vm, 4711, cfg.dtype, &cfg.device);
+            let model = Gpt2Model::new(&cfg, vs).unwrap();
+            let snapshot = |vm: &VarMap| -> BTreeMap<String, Vec<f32>> {
+                let data = vm.data().lock().unwrap();
+                data.iter()
+                    .map(|(name, var)| {
+                        let t = var.as_tensor().flatten_all().unwrap();
+                        (name.clone(), t.to_vec1::<f32>().unwrap())
+                    })
+                    .collect()
+            };
+            let before = snapshot(&vm);
+            let mut ds = overfit_dataset();
+            let ft = FullFtConfig {
+                lr: 5e-3,
+                steps: 4,
+                warmup: 1,
+                grad_checkpoint,
+                ..FullFtConfig::default()
+            };
+            run_full_ft(
+                &model,
+                &vm,
+                &mut ds,
+                None,
+                &ft,
+                &loss,
+                tmp.path(),
+                prefix,
+                Arc::new(TrainingLease::new()),
+                None,
+            )
+            .expect("run");
+            (before, snapshot(&vm))
+        };
+
+        let (plain_before, plain) = weights_after(false, "plain");
+        let (_, checkpointed) = weights_after(true, "ckpt");
+
+        // Four steps have to have moved something, or the agreement
+        // below is between two runs that did nothing.
+        let moved = plain_before
+            .iter()
+            .map(|(name, before)| {
+                let after = &plain[name];
+                before
+                    .iter()
+                    .zip(after)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
+            })
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-6, "training moved nothing: max change {moved}");
+        assert_eq!(plain.len(), checkpointed.len());
+        assert!(!plain.is_empty());
+        for (name, values) in &plain {
+            let other = checkpointed.get(name).expect("same parameter set");
+            let gap = values
+                .iter()
+                .zip(other)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(gap < 1e-4, "`{name}` diverged by {gap} after 4 steps");
+        }
+    }
+
+    /// An entry point with no blockwise view refuses the flag rather
+    /// than ignoring it — a caller who believed they had the memory
+    /// headroom would find out from an allocator, much later.
+    #[test]
+    fn checkpointing_is_refused_where_it_cannot_be_honoured() {
+        let cfg = Gpt2Config {
+            layers: 2,
+            heads: 2,
+            dim: 16,
+            ctx: 8,
+            vocab: 32,
+            dtype: DType::F32,
+            device: Device::Cpu,
+            eps: 1e-5,
+            moe: None,
+            custom: Some(crate::arch::Gpt2Custom {
+                cond_slots: Some(2),
+                ..Default::default()
+            }),
+        };
+        let vm = VarMap::new();
+        let vs = VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let model = Gpt2Model::new(&cfg, vs).unwrap();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+        let ft = FullFtConfig {
+            steps: 2,
+            grad_checkpoint: true,
+            ..FullFtConfig::default()
+        };
+
+        // The conditioned entry point has no blockwise view at all.
+        let mut ds = overfit_dataset()
+            .with_conditions(vec![CondIndex::new(0, 2).unwrap(); 400])
+            .unwrap();
+        let err = run_conditioned_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &ft,
+            &loss,
+            tmp.path(),
+            "cond",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::CheckpointingUnsupported(_)),
+            "{err}"
+        );
+
+        // And the model itself refuses, because its forward reads a
+        // channel the blockwise surface does not take.
+        let mut ds = overfit_dataset();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &ft,
+            &loss,
+            tmp.path(),
+            "chan",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        match err {
+            TrainError::CheckpointingUnsupported(why) => {
+                assert!(why.contains("input channel"), "{why}")
+            }
+            other => panic!("expected a checkpointing refusal, got {other}"),
+        }
+    }
+
+    /// Early stopping ends the run where the held-out loss stopped
+    /// improving, and the record says the run was cut short rather than
+    /// leaving a caller to compare `step` against `steps` and guess.
+    #[test]
+    fn early_stopping_ends_a_run_that_stopped_improving() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            // No learning at all, so the held-out loss cannot improve
+            // and the rule is the only thing that can end the run.
+            lr: 0.0,
+            weight_decay: 0.0,
+            steps: 20,
+            warmup: 0,
+            eval_every: 1,
+            early_stop: Some(EarlyStop {
+                patience: 2,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "stop",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .expect("run");
+
+        assert!(
+            ckpt.step < cfg.steps,
+            "the run should have stopped early, ended at {}",
+            ckpt.step
+        );
+        assert_eq!(
+            ckpt.metrics.get("early_stop").copied(),
+            Some(1.0),
+            "the record has to distinguish a stopped run from a finished one"
+        );
+        assert!(tmp.path().join("stop.safetensors").exists());
+    }
+
+    /// The step a run stops on is a step the hook sees. A selection
+    /// hook picks the checkpoint it wants to keep from what it is
+    /// shown, and the last step of the run is the one it most wants to
+    /// be shown — so the checkpoint block runs before the stop, not
+    /// after it.
+    #[test]
+    fn the_hook_sees_the_step_the_run_stops_on() {
+        use std::sync::Mutex;
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            // Frozen weights: the held-out loss cannot improve, so the
+            // patience rule is what ends the run.
+            lr: 0.0,
+            weight_decay: 0.0,
+            steps: 20,
+            warmup: 0,
+            eval_every: 1,
+            // Every step is a boundary, so the stopping step is one.
+            ckpt_every: 1,
+            ckpt_keep: 20,
+            early_stop: Some(EarlyStop {
+                patience: 2,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+
+        let fires: Arc<Mutex<Vec<usize>>> = Arc::new(Mutex::new(Vec::new()));
+        let fires_hook = Arc::clone(&fires);
+        let hook: CkptHook = Box::new(move |info| {
+            fires_hook.lock().unwrap().push(info.step);
+            Ok(CkptControl {
+                flow: CkptFlow::Continue,
+                keep: Some(KeepMark {
+                    reason: Some("last one wins".into()),
+                    values: Default::default(),
+                }),
+            })
+        });
+
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "stop_hook",
+            Arc::new(TrainingLease::new()),
+            Some(hook),
+        )
+        .expect("run");
+
+        assert_eq!(
+            ckpt.metrics.get("early_stop").copied(),
+            Some(1.0),
+            "the run has to have stopped on the rule for this to test anything"
+        );
+        let seen = fires.lock().unwrap();
+        assert_eq!(
+            seen.last().copied(),
+            Some(ckpt.step),
+            "the stopping step must be among the fires, got {seen:?} for a run ending at {}",
+            ckpt.step
+        );
+        let last = ckpt
+            .candidates
+            .last()
+            .expect("the hook kept every fire it saw");
+        assert_eq!(last.info.step, ckpt.step);
+        assert!(
+            last.info.ckpt_path.exists(),
+            "a candidate kept on the stopping step has to survive the exit"
+        );
+    }
+
+    /// A rule with nothing to watch is refused rather than left never
+    /// to fire.
+    #[test]
+    fn early_stopping_without_a_held_out_set_is_refused() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 4,
+            early_stop: Some(EarlyStop {
+                patience: 1,
+                min_delta: 0.0,
+            }),
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "nostop",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::EarlyStopWithoutValidation),
+            "{err}"
+        );
+    }
+
+    /// The patience rule itself, away from a training run: an
+    /// improvement resets the count, a non-improvement spends it, and a
+    /// non-finite loss counts as a failure to improve rather than as a
+    /// reason to keep going.
+    #[test]
+    fn the_patience_rule_counts_what_it_says_it_counts() {
+        let mut watch = EarlyStopWatch::new(EarlyStop {
+            patience: 2,
+            min_delta: 0.1,
+        });
+        assert!(!watch.observe(1.0), "the first value is the best so far");
+        assert!(
+            !watch.observe(0.95),
+            "0.05 is inside min_delta: no improvement (1 of 2)"
+        );
+        assert!(!watch.observe(0.80), "a real improvement resets the count");
+        assert!(!watch.observe(0.80), "no improvement (1 of 2)");
+        assert!(!watch.observe(0.80), "no improvement (2 of 2)");
+        assert!(watch.observe(0.80), "patience spent");
+
+        let mut watch = EarlyStopWatch::new(EarlyStop {
+            patience: 0,
+            min_delta: 0.0,
+        });
+        assert!(!watch.observe(1.0));
+        assert!(
+            watch.observe(f32::NAN),
+            "a diverged run must not outlive the rule"
+        );
+    }
+
+    /// The metrics file is a curve: one line per step, valid JSON on
+    /// each, and the numbers are the ones the run reported.
+    #[test]
+    fn the_metrics_file_records_one_line_per_step() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 6,
+            warmup: 0,
+            metrics_every: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "curve",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let path = tmp.path().join("curve-metrics.jsonl");
+        let text = std::fs::read_to_string(&path).expect("the metrics file exists");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "6 steps at every 2");
+        let points: Vec<serde_json::Value> = lines
+            .iter()
+            .map(|l| serde_json::from_str(l).expect("each line is a JSON object"))
+            .collect();
+        assert_eq!(points[0]["step"], 2);
+        assert_eq!(points[2]["step"], 6);
+        assert!(points[0]["loss"].is_number());
+        assert!(
+            points[0].get("val_loss").is_none(),
+            "a run with no held-out set writes no val_loss key"
+        );
+        assert!(
+            points[0].get("grad_norm").is_none(),
+            "a run computing no gradient norm writes no grad_norm key"
+        );
+        assert_eq!(ckpt.step, 6);
+    }
+
+    /// A run that was not asked for a curve writes no file.
+    #[test]
+    fn no_metrics_file_is_written_unless_one_was_asked_for() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "quiet",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert!(!tmp.path().join("quiet-metrics.jsonl").exists());
+    }
+
+    /// Without a held-out set the record says so rather than reporting
+    /// a number that came from the training rows.
+    #[test]
+    fn a_run_without_a_held_out_set_reports_no_val_loss() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            warmup: 1,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let ckpt = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "noval",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(ckpt.val_loss, None);
+        assert!(!ckpt.metrics.contains_key("min_val_loss"));
+    }
+
+    /// Either half of the validation setup without the other is a
+    /// refusal, not a run that quietly measures nothing.
+    #[test]
+    fn half_a_validation_setup_is_refused_from_both_sides() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let loss = CrossEntropyLoss::new();
+        let tmp = TempDir::new().unwrap();
+
+        let mut ds = overfit_dataset();
+        let period_only = FullFtConfig {
+            steps: 2,
+            eval_every: 1,
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &period_only,
+            &loss,
+            tmp.path(),
+            "half",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ValidationHalfConfigured {
+                    present: "cfg.eval_every",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+
+        let mut ds = overfit_dataset();
+        let mut val = overfit_dataset();
+        let set_only = FullFtConfig {
+            steps: 2,
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &set_only,
+            &loss,
+            tmp.path(),
+            "half",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ValidationHalfConfigured {
+                    present: "a validation dataset",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// An empty held-out set is caught before the first step, not after
+    /// a whole run has gone by without a number.
+    #[test]
+    fn an_empty_held_out_set_is_refused_before_the_first_step() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let mut val = TokenizedDataset::new(
+            Vec::new(),
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                shuffle: false,
+                seed: None,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            eval_every: 1,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            Some(&mut val),
+            &cfg,
+            &loss,
+            tmp.path(),
+            "empty",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrainError::EmptyValidationSet), "{err}");
+    }
+
+    /// A row short enough that padding covers everything the loss
+    /// would score. The masked mean answers `0.0` for such a batch, so
+    /// without a refusal the run would report a perfect step it never
+    /// took.
+    #[test]
+    fn a_batch_that_scores_nothing_is_refused_rather_than_scored_zero() {
+        let (_, vm, model) = tiny_cfg_and_model();
+        // One real token, seven pads: the mask is 1 at position 0 and 0
+        // everywhere after, and position 0 is the one the target shift
+        // drops.
+        let rows: Vec<Vec<u32>> = std::iter::repeat_with(|| vec![1u32]).take(4).collect();
+        let mut ds = TokenizedDataset::new(
+            rows,
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 8,
+                shuffle: false,
+                seed: None,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let loss = CrossEntropyLoss::new();
+        let cfg = FullFtConfig {
+            steps: 2,
+            ..FullFtConfig::default()
+        };
+        let tmp = TempDir::new().unwrap();
+        let err = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "empty-mask",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, TrainError::NothingScored { scored: 0, .. }),
+            "{err}"
+        );
     }
 
     #[test]
@@ -1722,6 +3855,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1754,6 +3888,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1818,6 +3953,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1875,6 +4011,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -1937,6 +4074,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2044,6 +4182,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2122,6 +4261,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2178,6 +4318,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2230,6 +4371,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2287,6 +4429,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2359,6 +4502,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2424,6 +4568,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2493,6 +4638,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2554,6 +4700,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2599,6 +4746,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &loss,
             tmp.path(),
@@ -2651,6 +4799,7 @@ mod tests {
             &model_a,
             &vm_a,
             &mut ds_a,
+            None,
             &base_cfg(),
             &loss,
             tmp_a.path(),
@@ -2671,6 +4820,7 @@ mod tests {
             &model_b,
             &vm_b,
             &mut ds_b,
+            None,
             &base_cfg(),
             &loss,
             tmp_b.path(),
@@ -2860,7 +5010,9 @@ mod tests {
             batch_size: 1,
             ctx_len: 8,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         }
     }
@@ -2884,6 +5036,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(4),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2910,6 +5063,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2938,6 +5092,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2973,6 +5128,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(4),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -2998,6 +5154,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &short_run(1),
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3031,6 +5188,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3067,6 +5225,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3166,6 +5325,42 @@ mod tests {
             .is_none());
     }
 
+    /// The pad mask a dataset attaches survives the target shift with
+    /// the meaning it was built with: entry `k` gates the prediction of
+    /// `input_ids[k + 1]`, so the position that first holds filler is
+    /// the first one excluded.
+    #[test]
+    fn the_pad_mask_lines_up_with_the_targets_after_the_shift() {
+        let mut ds = TokenizedDataset::new(
+            vec![vec![1u32, 2, 3]],
+            DatasetOpts {
+                batch_size: 1,
+                ctx_len: 5,
+                shuffle: false,
+                seed: None,
+                pad_id: 0,
+                mask_pad: true,
+                text_field: "text".into(),
+            },
+        );
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.input_ids[0], vec![1, 2, 3, 0, 0]);
+        let (_, targets, mask) = batch_to_input_target(&batch, &Device::Cpu).unwrap();
+        let targets: Vec<u32> = targets.i(0).unwrap().to_vec1().unwrap();
+        let mask: Vec<f32> = mask
+            .expect("a padded batch reaches the loss with a mask")
+            .i(0)
+            .unwrap()
+            .to_vec1()
+            .unwrap();
+        assert_eq!(targets, vec![2, 3, 0, 0]);
+        assert_eq!(
+            mask,
+            vec![1.0, 1.0, 0.0, 0.0],
+            "predicting token 3 is scored; predicting the filler behind it is not"
+        );
+    }
+
     /// `init_from` puts the checkpoint's weights in place before the
     /// first step. Run at `lr = 0` with no weight decay so what the
     /// map holds afterwards is the checkpoint and nothing else.
@@ -3200,6 +5395,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3233,6 +5429,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),
@@ -3273,6 +5470,7 @@ mod tests {
             &model,
             &vm,
             &mut ds,
+            None,
             &cfg,
             &CrossEntropyLoss::new(),
             tmp.path(),

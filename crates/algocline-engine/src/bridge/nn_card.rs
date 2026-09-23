@@ -38,8 +38,8 @@ use algocline_nn::arch::adapter::{
     InferenceAdapter, LlamaAdapter, LlamaAdapterConfig, LogitsShape,
 };
 use algocline_nn::arch::{
-    Activation, CondIndex, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig, MoeConfig, NormKind,
-    NormPlacement, PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
+    seeded_var_builder, Activation, CondIndex, Gpt2Config, Gpt2Custom, Gpt2Model, LoraConfig,
+    MoeConfig, NormKind, NormPlacement, PosKind, ResidualKind, TinyLlamaConfig, TinyLlamaModel,
 };
 use algocline_nn::card::{
     bundle_ref_for, sanitize_stem, unique_stem, validate_training_path, CardId, NnCandleBranch,
@@ -1662,6 +1662,11 @@ impl mlua::UserData for Gpt2Handle {
         // backend (no KV cache on the trainable arch); see nn_gen's
         // module doc §"Sessions over trainable arches".
         super::nn_gen::add_gpt2_generate_session_method(methods);
+        // `handle:embed(tokens, opts?)` — the pooled hidden state, so a
+        // model trained here can be used as an encoder.
+        super::nn_gen::add_gpt2_embed_method(methods);
+        super::nn_gen::add_gpt2_export_gguf_method(methods);
+        super::nn_gen::add_gpt2_beam_search_method(methods);
     }
 }
 
@@ -1720,6 +1725,30 @@ impl Gpt2Handle {
     /// stateless session history.
     pub(super) fn ctx(&self) -> usize {
         self.ctx
+    }
+
+    /// The shape and weights a GGUF export reads.
+    ///
+    /// One accessor rather than six: the exporter needs all of them
+    /// together and nothing else needs any of them, so widening the
+    /// handle's surface item by item would be the larger change.
+    pub(super) fn gguf_source(&self) -> super::nn_gen::GgufSource {
+        super::nn_gen::GgufSource {
+            family: "gpt2",
+            variant: self.variant.clone(),
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            // The reference GPT-2 MLP is 4x the hidden size. A custom
+            // spec may say otherwise, which is one reason the exporter
+            // refuses a custom variant.
+            ffn_dim: self.dim * 4,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            rope_theta: None,
+            varmap: self.varmap(),
+        }
     }
 
     /// Test-only: strip the `VarMap` off a from-scratch handle so it
@@ -2386,6 +2415,7 @@ impl mlua::UserData for LlamaHandle {
         // why a session (with its own KV cache) is the only decode
         // entry point exposed to Lua.
         super::nn_gen::add_generate_session_method(methods);
+        super::nn_gen::add_llama_export_gguf_method(methods);
     }
 }
 
@@ -2466,6 +2496,9 @@ impl mlua::UserData for TinyLlamaHandle {
         add_meta_methods(methods, TinyLlamaHandle::meta);
         // Stateless-session mirror of the Gpt2Handle registration.
         super::nn_gen::add_tinyllama_generate_session_method(methods);
+        super::nn_gen::add_tinyllama_embed_method(methods);
+        super::nn_gen::add_tinyllama_export_gguf_method(methods);
+        super::nn_gen::add_tinyllama_beam_search_method(methods);
     }
 }
 
@@ -2507,6 +2540,39 @@ impl TinyLlamaHandle {
     /// Vocabulary size; mirrors [`Gpt2Handle::vocab`].
     pub(super) fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// The shape and weights a GGUF export reads. See
+    /// [`Gpt2Handle::gguf_source`].
+    pub(super) fn gguf_source(&self) -> LuaResult<super::nn_gen::GgufSource> {
+        Ok(super::nn_gen::GgufSource {
+            family: "tinyllama",
+            variant: self.variant.clone(),
+            layers: self.layers,
+            heads: self.heads,
+            kv_heads: self.kv_heads,
+            dim: self.dim,
+            ffn_dim: self.hidden_dim()?,
+            ctx: self.ctx,
+            vocab: self.vocab,
+            // TinyLlama's reference `rope_theta`, which every preset
+            // here is built with.
+            rope_theta: Some(10_000.0),
+            varmap: self.varmap(),
+        })
+    }
+
+    /// SwiGLU intermediate size, read off the live model.
+    ///
+    /// Not a handle field: it is the one shape number the handle does
+    /// not carry, and the only caller (the GGUF export, which has to
+    /// write `llama.feed_forward_length`) can afford the lock.
+    pub(super) fn hidden_dim(&self) -> LuaResult<usize> {
+        let guard = self
+            .inner
+            .lock()
+            .map_err(|e| LuaError::external(format!("alc.nn tinyllama handle: model lock: {e}")))?;
+        Ok(guard.config().hidden_dim)
     }
 
     /// Context window; mirrors [`Gpt2Handle::ctx`].
@@ -2651,6 +2717,28 @@ fn parse_llama_dtype(s: &str) -> LuaResult<DType> {
 // (`setup_gpt2_base_scaffold` builds a base handle in-place). Kept
 // module-private otherwise; no production caller outside this module
 // consumes it.
+/// Refuse `seed` on a pretrained load.
+///
+/// A pretrained handle draws nothing: every parameter comes out of the
+/// downloaded bundle. Honouring the key silently would let a caller
+/// believe two pretrained runs differ by their seed, and then read the
+/// difference between them as the seed's doing when it is the data
+/// order's.
+fn guard_seed_against_pretrained(
+    prefix: &str,
+    seed: Option<u64>,
+    pretrained: bool,
+) -> LuaResult<()> {
+    if seed.is_some() && pretrained {
+        return Err(LuaError::external(format!(
+            "{prefix}: opts.seed has nothing to seed on a pretrained handle — every parameter \
+             comes from the downloaded bundle; pass pretrained = false to initialise from the \
+             seed, or drop the key"
+        )));
+    }
+    Ok(())
+}
+
 pub(super) fn build_gpt2_handle(
     variant: &str,
     opts: Option<&LuaTable>,
@@ -2679,6 +2767,11 @@ pub(super) fn build_gpt2_handle(
     let pretrained = opts
         .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
         .unwrap_or(true);
+    // Read for the random-init path only; a pretrained load has no
+    // draw to seed. Refused rather than ignored when the two are
+    // combined — see `guard_seed_against_pretrained`.
+    let seed = opts.and_then(|t| t.get::<Option<u64>>("seed").ok().flatten());
+    guard_seed_against_pretrained("alc.nn.preset.gpt2", seed, pretrained)?;
 
     cfg.device = parse_device(&device_str)?;
     cfg.dtype = parse_dtype(&dtype_str)?;
@@ -2708,7 +2801,10 @@ pub(super) fn build_gpt2_handle(
         (m, None)
     } else {
         let vm = VarMap::new();
-        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let vs = match seed {
+            Some(seed) => seeded_var_builder(&vm, seed, cfg.dtype, &cfg.device),
+            None => candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device),
+        };
         let m = Gpt2Model::new(&cfg, vs)
             .map_err(|e| LuaError::external(format!("alc.nn.preset.gpt2: {e}")))?;
         (m, Some(Arc::new(vm)))
@@ -2998,6 +3094,8 @@ pub(super) fn build_tinyllama_handle(
     let pretrained = opts
         .and_then(|t| t.get::<Option<bool>>("pretrained").ok().flatten())
         .unwrap_or(true);
+    let seed = opts.and_then(|t| t.get::<Option<u64>>("seed").ok().flatten());
+    guard_seed_against_pretrained("alc.nn.preset.tinyllama", seed, pretrained)?;
 
     cfg.device = parse_device_for("alc.nn.preset.tinyllama", &device_str)?;
     cfg.dtype = parse_dtype_for("alc.nn.preset.tinyllama", &dtype_str)?;
@@ -3011,7 +3109,10 @@ pub(super) fn build_tinyllama_handle(
         (m, None)
     } else {
         let vm = VarMap::new();
-        let vs = candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device);
+        let vs = match seed {
+            Some(seed) => seeded_var_builder(&vm, seed, cfg.dtype, &cfg.device),
+            None => candle_nn::VarBuilder::from_varmap(&vm, cfg.dtype, &cfg.device),
+        };
         let m = TinyLlamaModel::new(&cfg, vs)
             .map_err(|e| LuaError::external(format!("alc.nn.preset.tinyllama: {e}")))?;
         (m, Some(Arc::new(vm)))
@@ -4204,8 +4305,20 @@ fn extract_dataset_opts(opts: Option<&LuaTable>) -> LuaResult<DatasetOpts> {
         if let Some(v) = t.get::<Option<bool>>("shuffle")? {
             d.shuffle = v;
         }
+        // Read whether or not `shuffle` is on: the dataset ignores it
+        // for an unshuffled source, and refusing the pair here would
+        // only make a caller that sets both once strip the key again.
+        if let Some(v) = t.get::<Option<u64>>("seed")? {
+            d.seed = Some(v);
+        }
         if let Some(v) = t.get::<Option<u32>>("pad_id")? {
             d.pad_id = v;
+        }
+        // Opt-out only: the mask is on by default, and the reason to
+        // name it here is to reproduce a run recorded before it
+        // existed. See `DatasetOpts::mask_pad`.
+        if let Some(v) = t.get::<Option<bool>>("mask_pad")? {
+            d.mask_pad = v;
         }
         if let Some(v) = t.get::<Option<String>>("text_field")? {
             d.text_field = v;
@@ -5314,6 +5427,7 @@ fn full_ft_impl(
         &*model,
         &vm_arc,
         ds_lock.as_mut(),
+        None,
         &cfg,
         &loss_fn,
         &ckpt_dir,
@@ -5746,6 +5860,16 @@ impl NnHandle {
     /// Thin delegate to [`HandleMeta::arch_family_variant`], which
     /// documents the two storage conventions this normalises between.
     #[allow(dead_code)]
+    /// Vocabulary size the handle was built at.
+    pub(super) fn vocab(&self) -> usize {
+        self.meta().vocab
+    }
+
+    /// Context window the handle was built at.
+    pub(super) fn ctx(&self) -> usize {
+        self.meta().ctx
+    }
+
     pub(super) fn arch_family_variant(&self) -> String {
         self.meta().arch_family_variant()
     }
@@ -5779,6 +5903,12 @@ impl mlua::UserData for NnHandle {
         // `handle:generate_session(prompt)` on the union — this is what
         // lets a Card reloaded via `alc.nn.card.load_handle` generate.
         super::nn_gen::add_nn_handle_generate_session_method(methods);
+        // `handle:embed(tokens, opts?)` on the union, for the same reason.
+        super::nn_gen::add_nn_handle_embed_method(methods);
+        // `handle:export_gguf(path, opts?)` — the weights in the format
+        // llama.cpp / Ollama read, which is the only way anything
+        // trained here leaves this repository runnable.
+        super::nn_gen::add_nn_handle_export_gguf_method(methods);
     }
 }
 
@@ -6898,6 +7028,61 @@ mod load_dispatch_tests {
 
     // ── arch-neutral preset dispatch ─────────────────────────
 
+    /// `opts.seed` on a from-scratch preset makes two builds identical.
+    #[test]
+    fn a_seeded_preset_builds_the_same_parameters_twice() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let build = || {
+            let opts_val = lua
+                .to_value(&json!({ "pretrained": false, "seed": 123 }))
+                .unwrap();
+            let opts_tbl = match opts_val {
+                LuaValue::Table(t) => t,
+                _ => unreachable!(),
+            };
+            let h = build_gpt2_handle("tiny", Some(&opts_tbl), tmp.path()).expect("gpt2 tiny");
+            let vm = h
+                .varmap()
+                .expect("a from-scratch handle carries its VarMap");
+            let data = vm.data().lock().unwrap();
+            let mut out: Vec<(String, Vec<f32>)> = data
+                .iter()
+                .map(|(name, var)| {
+                    let t = var.as_tensor().flatten_all().unwrap();
+                    (name.clone(), t.to_vec1::<f32>().unwrap())
+                })
+                .collect();
+            out.sort_by(|a, b| a.0.cmp(&b.0));
+            out
+        };
+        assert_eq!(build(), build(), "the same seed must build the same model");
+    }
+
+    /// A seed on a pretrained handle is refused rather than accepted
+    /// and ignored: nothing is drawn on that path, so a caller who
+    /// believed otherwise would misread where a difference came from.
+    #[test]
+    fn a_seed_on_a_pretrained_handle_is_refused() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let lua = Lua::new();
+        let opts_val = lua
+            .to_value(&json!({ "pretrained": true, "seed": 1 }))
+            .unwrap();
+        let opts_tbl = match opts_val {
+            LuaValue::Table(t) => t,
+            _ => unreachable!(),
+        };
+        let err = match build_gpt2_handle("tiny", Some(&opts_tbl), tmp.path()) {
+            Ok(_) => panic!("seed + pretrained must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("nothing to seed"),
+            "message: {err}"
+        );
+    }
+
     #[test]
     fn neutral_preset_gpt2_returns_gpt2_nn_handle() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -7612,7 +7797,9 @@ mod load_ckpt_tests {
                 batch_size: 1,
                 ctx_len: 16,
                 shuffle: false,
+                seed: None,
                 pad_id: 0,
+                mask_pad: true,
                 text_field: "text".into(),
             },
         );
@@ -8748,9 +8935,17 @@ mod loss_mask_from_card_tests {
         let mut ds = handle.inner_lock().expect("lock");
         let batch = ds.next_batch().expect("next_batch").expect("batch");
 
-        // Invariant: identical token ids, mask-free legacy path.
+        // Invariant: identical token ids, and no *response* mask — the
+        // undeclared card scores the whole row rather than its answer
+        // region. The mask that is here covers the padding behind the
+        // row (`DatasetOpts::mask_pad`), which every dataset path
+        // attaches and which says nothing about prompt versus response.
         assert_eq!(batch.input_ids, masked_ids);
-        assert!(batch.loss_mask.is_none());
+        assert_eq!(
+            batch.loss_mask,
+            Some(vec![vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]]),
+            "the four tokens the row held are scored and the filler behind them is not"
+        );
     }
 
     #[test]

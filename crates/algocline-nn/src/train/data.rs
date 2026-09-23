@@ -129,8 +129,10 @@ pub enum DatasetError {
     /// [`crate::train::allowed_logit_mask`] scores the target among the
     /// ids its set names, so a target its own set excludes is scored as
     /// a disallowed id and contributes the penalty — roughly `1e9`,
-    /// which nothing gates here (a [`TokenizedDataset`] batch carries
-    /// no `loss_mask`). Refused where the caller can still fix it, for
+    /// which nothing gates at a position the row really occupies (the
+    /// only `loss_mask` a [`TokenizedDataset`] batch carries is
+    /// [`DatasetOpts::mask_pad`]'s, and that one covers the padding
+    /// behind the row, not the row). Refused where the caller can still fix it, for
     /// the same reason [`Self::AllowedRaggedRows`] is.
     #[error(
         "allowed-id row {row} position {position} excludes token {token}, which is the token \
@@ -163,6 +165,34 @@ pub enum DatasetError {
         /// Which channel the caller was attaching.
         channel: String,
     },
+    /// A holdout split would have left one of its two sides with no
+    /// rows.
+    ///
+    /// Both empty outcomes are refused here rather than at the first
+    /// step that needs the missing side: a training set of zero rows
+    /// exhausts immediately, and a held-out set of zero rows reports no
+    /// validation loss — neither says what went wrong, and both are
+    /// hours away from the call that caused them.
+    #[error(
+        "a holdout of {fraction} over {rows} row(s) leaves {train} for training and {holdout}          held out; both sides need at least one row"
+    )]
+    HoldoutEmptySide {
+        /// Fraction the caller asked to hold out.
+        fraction: f64,
+        /// Rows the dataset held.
+        rows: usize,
+        /// Rows the split would have left for training.
+        train: usize,
+        /// Rows the split would have held out.
+        holdout: usize,
+    },
+    /// A holdout split was asked of a dataset that cannot be cut in two
+    /// without losing something the caller attached.
+    #[error("this dataset cannot be split for a holdout: {reason}")]
+    HoldoutRefused {
+        /// What stands in the way, phrased so the caller can act on it.
+        reason: &'static str,
+    },
 }
 
 /// Iterator config shared across dataset kinds.
@@ -178,11 +208,53 @@ pub struct DatasetOpts {
     pub ctx_len: usize,
     /// Randomly shuffle rows before iteration (in-memory shuffle;
     /// large corpora should stream separately — v2 carry).
+    ///
+    /// The order is decided by [`Self::seed`], so the same seed gives
+    /// the same order and no seed gives a different one each run.
     pub shuffle: bool,
+    /// Seed for the [`Self::shuffle`] draw, or `None` to take one from
+    /// the system.
+    ///
+    /// Row order is one of the two things that make two runs of the
+    /// same config differ; the other is the parameter initialisation
+    /// (see [`crate::arch::seeded_var_builder`]). Setting both is what
+    /// makes a run repeatable, and setting one is what makes it
+    /// possible to vary the other on purpose.
+    ///
+    /// Read only when `shuffle` is on: an unshuffled dataset already
+    /// has one order.
+    pub seed: Option<u64>,
     /// Pad token id used to fill short rows to `ctx_len`.
     /// Defaults to `0` which is the GPT-2 `<|endoftext|>` id and
     /// matches the nanoGPT convention.
     pub pad_id: u32,
+    /// Keep the padding a short row was filled with out of the loss.
+    ///
+    /// `true` (default) makes every batch carry a [`Batch::loss_mask`]
+    /// whenever at least one of its rows is shorter than `ctx_len`:
+    /// `1.0` over the tokens the row actually held, `0.0` over the
+    /// [`Self::pad_id`] filler behind them. Without it the filler is a
+    /// target like any other and the run spends part of its gradient
+    /// learning to predict padding — the loss then reads lower than the
+    /// model's real next-token loss by whatever share of the batch was
+    /// padding, which is a property of the row lengths rather than of
+    /// the model.
+    ///
+    /// Position-wise rather than token-wise: the mask is derived from
+    /// how long the row was before padding, so a `pad_id` occurring
+    /// *inside* a row is scored normally. That is the distinction a
+    /// token-equality test would lose, and it matters at the default
+    /// `pad_id = 0`, which is GPT-2's `<|endoftext|>`.
+    ///
+    /// A row that should teach where it ends has to carry its own end
+    /// token: the first padded position is masked out with the rest, so
+    /// nothing here trains the model to stop. That is the same contract
+    /// as a `-100` label fill.
+    ///
+    /// Batches whose rows all reach `ctx_len` carry no mask either way
+    /// — a packed corpus is unaffected by this switch. Set to `false`
+    /// to reproduce a run recorded before the mask existed.
+    pub mask_pad: bool,
     /// JSONL / Parquet source field to tokenize. Defaults to `"text"`.
     pub text_field: String,
 }
@@ -193,7 +265,9 @@ impl Default for DatasetOpts {
             batch_size: 8,
             ctx_len: 128,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         }
     }
@@ -310,7 +384,7 @@ impl TokenizedDataset {
             cursor: 0,
         };
         if this.opts.shuffle {
-            this.rows.reverse(); // deterministic re-order for now; a later stage wires an RNG
+            shuffle_rows(&mut this.rows, this.opts.seed);
         }
         this
     }
@@ -451,6 +525,77 @@ impl TokenizedDataset {
         self.rows.len()
     }
 
+    /// Take the last `fraction` of the rows out of this dataset and
+    /// hand them back as a second one, for use as the held-out set.
+    ///
+    /// The tail rather than a fresh sample: with
+    /// [`DatasetOpts::shuffle`] on, the rows were already re-ordered at
+    /// construction and the tail is that random draw; with it off, the
+    /// caller asked for the corpus order and the tail is the part of it
+    /// the training set never reaches. Drawing again here would make
+    /// the split depend on a second source of randomness that nothing
+    /// records.
+    ///
+    /// Both halves keep this dataset's [`DatasetOpts`], so the held-out
+    /// rows are batched, padded and masked exactly like the training
+    /// ones — a validation loss is only comparable to a training loss
+    /// if the two were measured the same way.
+    ///
+    /// # Errors
+    ///
+    /// - [`DatasetError::HoldoutEmptySide`] when the fraction is not in
+    ///   `(0, 1)` or rounds to an empty side.
+    /// - [`DatasetError::HoldoutRefused`] when a per-row side channel
+    ///   is attached (the pairing is positional and would not survive
+    ///   the cut) or when iteration has already begun (the rows already
+    ///   handed out would end up in neither half).
+    pub fn split_off_holdout(&mut self, fraction: f64) -> Result<Self, DatasetError> {
+        if self.conds.is_some() || self.allowed_ids.is_some() {
+            return Err(DatasetError::HoldoutRefused {
+                reason: "a per-row side channel is attached, and its pairing is positional — \
+                         split the rows before attaching it",
+            });
+        }
+        if self.cursor > 0 {
+            return Err(DatasetError::HoldoutRefused {
+                reason: "iteration has already begun, so the rows already handed out would                          fall in neither half — split before the first batch",
+            });
+        }
+        let rows = self.rows.len();
+        // `floor`, so a fraction that rounds down to nothing is caught
+        // by the empty-side check below rather than silently rounded up
+        // into one row the caller never asked for.
+        let holdout = if fraction.is_finite() && fraction > 0.0 && fraction < 1.0 {
+            (rows as f64 * fraction).floor() as usize
+        } else {
+            0
+        };
+        let train = rows - holdout.min(rows);
+        if holdout == 0 || train == 0 {
+            return Err(DatasetError::HoldoutEmptySide {
+                fraction,
+                rows,
+                train,
+                holdout,
+            });
+        }
+        let tail = self.rows.split_off(train);
+        Ok(Self {
+            rows: tail,
+            conds: None,
+            conds_per_row: self.conds_per_row,
+            allowed_ids: None,
+            // The rows are already in the order this dataset settled
+            // on; re-ordering the tail again would only lose the
+            // correspondence to the split the caller was told about.
+            opts: DatasetOpts {
+                shuffle: false,
+                ..self.opts.clone()
+            },
+            cursor: 0,
+        })
+    }
+
     /// Refuse a positional side channel on a dataset whose rows were
     /// re-ordered at construction. See
     /// [`DatasetError::SideChannelAfterReorder`].
@@ -476,6 +621,7 @@ impl TokenizedDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&self.rows[start..end], ctx, self.opts.mask_pad);
         // The side channels follow their rows. `conds` is row-major at
         // `conds_per_row` per row, so the row range scales; the counts
         // were checked against the row count when they were attached.
@@ -490,7 +636,7 @@ impl TokenizedDataset {
             .map(|all| all[start..end].to_vec());
         Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: end == self.rows.len(),
             allowed_ids,
             conds,
@@ -567,9 +713,7 @@ impl JsonlDataset {
             let ids = self.tokenize_line(&line, idx)?;
             rows.push(ids);
         }
-        // Reverse ordering as a deterministic "shuffle" placeholder;
-        // A later stage wires a real RNG seed once the trainer opts land.
-        rows.reverse();
+        shuffle_rows(&mut rows, self.opts.seed);
         self.total_rows = Some(rows.len());
         self.buffer = rows;
         self.buffer_cursor = 0;
@@ -642,9 +786,10 @@ impl Dataset for JsonlDataset {
                 .iter()
                 .map(|row| pad_or_truncate(row, ctx, pad))
                 .collect();
+            let loss_mask = pad_loss_mask(&self.buffer[start..end], ctx, self.opts.mask_pad);
             return Ok(Some(Batch {
                 input_ids,
-                loss_mask: None,
+                loss_mask,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
@@ -664,9 +809,10 @@ impl Dataset for JsonlDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&rows, ctx, self.opts.mask_pad);
         Ok(Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
@@ -778,10 +924,7 @@ impl ParquetDataset {
             let text = row_text(&row, &self.opts.text_field, idx)?;
             rows.push(self.tokenizer.encode(text)?);
         }
-        // Reverse ordering as a deterministic "shuffle" placeholder;
-        // a later stage wires a real RNG seed once the trainer opts
-        // land (same placeholder as `JsonlDataset::materialize_all`).
-        rows.reverse();
+        shuffle_rows(&mut rows, self.opts.seed);
         self.total_rows = rows.len();
         self.buffer = rows;
         self.buffer_cursor = 0;
@@ -886,9 +1029,10 @@ impl Dataset for ParquetDataset {
                 .iter()
                 .map(|row| pad_or_truncate(row, ctx, pad))
                 .collect();
+            let loss_mask = pad_loss_mask(&self.buffer[start..end], ctx, self.opts.mask_pad);
             return Ok(Some(Batch {
                 input_ids,
-                loss_mask: None,
+                loss_mask,
                 is_last: end == self.buffer.len(),
                 allowed_ids: None,
                 conds: None,
@@ -908,9 +1052,10 @@ impl Dataset for ParquetDataset {
             .iter()
             .map(|row| pad_or_truncate(row, ctx, pad))
             .collect();
+        let loss_mask = pad_loss_mask(&rows, ctx, self.opts.mask_pad);
         Ok(Some(Batch {
             input_ids,
-            loss_mask: None,
+            loss_mask,
             is_last: short_batch,
             allowed_ids: None,
             conds: None,
@@ -925,6 +1070,22 @@ impl Dataset for ParquetDataset {
     }
 }
 
+/// Shuffle `rows` in place under `seed`, or under a system-drawn seed
+/// when there is none.
+///
+/// A real draw: this used to reverse the rows, which is a fixed
+/// permutation and so not a shuffle at all — a corpus grouped by source
+/// came out grouped by source, in the opposite order. Every dataset
+/// built with `shuffle` on before this got that.
+fn shuffle_rows(rows: &mut [Vec<u32>], seed: Option<u64>) {
+    use rand::seq::SliceRandom;
+    let mut rng: rand::rngs::StdRng = match seed {
+        Some(seed) => rand::SeedableRng::seed_from_u64(seed),
+        None => rand::make_rng(),
+    };
+    rows.shuffle(&mut rng);
+}
+
 /// Pad `row` up to `ctx` with `pad`, or truncate to `ctx` when longer.
 fn pad_or_truncate(row: &[u32], ctx: usize, pad: u32) -> Vec<u32> {
     if row.len() >= ctx {
@@ -935,6 +1096,34 @@ fn pad_or_truncate(row: &[u32], ctx: usize, pad: u32) -> Vec<u32> {
         out.resize(ctx, pad);
         out
     }
+}
+
+/// Per-row loss mask marking which of the `ctx` positions each row
+/// actually filled, or `None` when no row was padded.
+///
+/// `None` rather than an all-ones mask on the unpadded case: the loss
+/// treats a missing mask as uniform, so the two mean the same thing and
+/// the cheaper one keeps a packed corpus paying nothing for a switch it
+/// does not need. It also keeps `Batch::loss_mask == Some(..)` reading
+/// as "some position here is excluded".
+///
+/// Derived from `row.len()`, not from comparing tokens against
+/// `pad_id`: a row may legitimately hold the pad id (at the default
+/// `pad_id = 0` it is GPT-2's `<|endoftext|>`), and those occurrences
+/// are content, not filler.
+fn pad_loss_mask(rows: &[Vec<u32>], ctx: usize, mask_pad: bool) -> Option<Vec<Vec<f32>>> {
+    if !mask_pad || rows.iter().all(|row| row.len() >= ctx) {
+        return None;
+    }
+    Some(
+        rows.iter()
+            .map(|row| {
+                let mut mask = vec![1.0f32; row.len().min(ctx)];
+                mask.resize(ctx, 0.0);
+                mask
+            })
+            .collect(),
+    )
 }
 
 /// Pad `mask` up to `ctx` with `0.0` (positions past the real content
@@ -1088,7 +1277,9 @@ mod tests {
             batch_size: 2,
             ctx_len: 4,
             shuffle: false,
+            seed: None,
             pad_id: 0,
+            mask_pad: true,
             text_field: "text".into(),
         };
         let mut ds = TokenizedDataset::new(rows, opts);
@@ -1449,5 +1640,157 @@ mod tests {
     fn pad_or_truncate_trims_long_rows() {
         let trimmed = pad_or_truncate(&[1, 2, 3, 4, 5], 3, 0);
         assert_eq!(trimmed, vec![1, 2, 3]);
+    }
+
+    /// Opts with `mask_pad` on and a pad id that is *not* 0, so a test
+    /// can tell "this position was filler" from "this position held the
+    /// pad id as content".
+    fn mask_pad_opts(batch_size: usize, ctx_len: usize, mask_pad: bool) -> DatasetOpts {
+        DatasetOpts {
+            batch_size,
+            ctx_len,
+            shuffle: false,
+            seed: None,
+            pad_id: 0,
+            mask_pad,
+            text_field: "text".into(),
+        }
+    }
+
+    #[test]
+    fn a_padded_batch_carries_a_mask_that_covers_only_the_padding() {
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(
+            batch.loss_mask,
+            Some(vec![vec![1.0, 1.0, 1.0, 0.0], vec![1.0, 1.0, 0.0, 0.0]]),
+            "the mask must be 1 over the tokens each row held and 0 over the filler behind them"
+        );
+    }
+
+    #[test]
+    fn a_pad_id_inside_a_row_is_still_scored() {
+        // Row 0 holds the pad id at position 1 as content and is then
+        // padded from position 3. A token-equality test would zero both
+        // and stop training the model on its own `<|endoftext|>`.
+        let rows = vec![vec![1u32, 0, 3], vec![4, 5, 6, 7]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        let mask = batch.loss_mask.expect("row 0 is short, so a mask is built");
+        assert_eq!(
+            mask[0],
+            vec![1.0, 1.0, 1.0, 0.0],
+            "position 1 holds the pad id as content and must stay scored"
+        );
+        assert_eq!(mask[1], vec![1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn a_batch_whose_rows_all_reach_ctx_len_carries_no_mask() {
+        // A packed corpus pays nothing for the switch: `None` and an
+        // all-ones mask mean the same thing to the loss.
+        let rows = vec![vec![1u32, 2, 3, 4], vec![5, 6, 7, 8]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, true));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.loss_mask, None);
+    }
+
+    #[test]
+    fn mask_pad_off_reproduces_the_run_that_scored_its_padding() {
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5]];
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 4, false));
+        let batch = ds.next_batch().unwrap().unwrap();
+        assert_eq!(batch.loss_mask, None);
+    }
+
+    #[test]
+    fn a_holdout_split_takes_the_tail_and_leaves_the_rest() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i, i, i, i]).collect();
+        let mut train = TokenizedDataset::new(rows, mask_pad_opts(10, 4, true));
+        let mut held = train.split_off_holdout(0.2).expect("2 of 10 rows");
+        assert_eq!(train.row_count(), 8);
+        assert_eq!(held.row_count(), 2);
+        let held_batch = held.next_batch().unwrap().unwrap();
+        assert_eq!(
+            held_batch.input_ids,
+            vec![vec![8, 8, 8, 8], vec![9, 9, 9, 9]],
+            "the held-out side is the tail, in the order this dataset settled on"
+        );
+        let train_batch = train.next_batch().unwrap().unwrap();
+        assert_eq!(train_batch.input_ids.len(), 8);
+        assert_eq!(train_batch.input_ids[0], vec![0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn a_holdout_split_carries_the_opts_the_training_side_uses() {
+        // Both sides pad and mask identically, or the two losses would
+        // not be measuring the same thing.
+        let rows = vec![vec![1u32, 2, 3], vec![4, 5], vec![6], vec![7, 8]];
+        let mut train = TokenizedDataset::new(rows, mask_pad_opts(4, 4, true));
+        let mut held = train.split_off_holdout(0.25).expect("1 of 4 rows");
+        let batch = held.next_batch().unwrap().unwrap();
+        assert_eq!(batch.input_ids, vec![vec![7, 8, 0, 0]]);
+        assert_eq!(batch.loss_mask, Some(vec![vec![1.0, 1.0, 0.0, 0.0]]));
+    }
+
+    #[test]
+    fn a_holdout_that_would_empty_a_side_is_refused() {
+        let rows: Vec<Vec<u32>> = (0..4u32).map(|i| vec![i]).collect();
+        for fraction in [0.0, 1.0, 1.5, -0.1, f64::NAN, 0.1] {
+            let mut ds = TokenizedDataset::new(rows.clone(), mask_pad_opts(1, 1, true));
+            let err = ds
+                .split_off_holdout(fraction)
+                .expect_err("fraction {fraction} must be refused");
+            assert!(
+                matches!(err, DatasetError::HoldoutEmptySide { .. }),
+                "fraction {fraction}: {err}"
+            );
+            assert_eq!(ds.row_count(), 4, "a refused split leaves the rows alone");
+        }
+    }
+
+    #[test]
+    fn a_holdout_is_refused_once_iteration_has_begun() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i]).collect();
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true));
+        let _ = ds.next_batch().unwrap().unwrap();
+        let err = ds
+            .split_off_holdout(0.2)
+            .expect_err("rows already handed out");
+        assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
+    }
+
+    #[test]
+    fn a_holdout_is_refused_while_a_positional_side_channel_is_attached() {
+        let rows: Vec<Vec<u32>> = (0..10u32).map(|i| vec![i]).collect();
+        let conds: Vec<CondIndex> = (0..10)
+            .map(|_| CondIndex::new(0, 1).expect("single-slot condition"))
+            .collect();
+        let mut ds = TokenizedDataset::new(rows, mask_pad_opts(2, 1, true))
+            .with_conditions(conds)
+            .expect("conditions attach to an unshuffled dataset");
+        let err = ds
+            .split_off_holdout(0.2)
+            .expect_err("the pairing is positional");
+        assert!(matches!(err, DatasetError::HoldoutRefused { .. }), "{err}");
+    }
+
+    #[test]
+    fn the_jsonl_and_parquet_paths_mask_their_padding_too() {
+        // Same contract on the streaming adapters; asserted through the
+        // helper both of them call, since standing up a tokenizer here
+        // would test the tokenizer instead.
+        let rows = vec![vec![1u32, 2], vec![3, 4, 5]];
+        assert_eq!(
+            pad_loss_mask(&rows, 3, true),
+            Some(vec![vec![1.0, 1.0, 0.0], vec![1.0, 1.0, 1.0]])
+        );
+        assert_eq!(
+            pad_loss_mask(&rows, 2, true),
+            None,
+            "nothing is padded at ctx 2"
+        );
+        assert_eq!(pad_loss_mask(&rows, 3, false), None);
     }
 }

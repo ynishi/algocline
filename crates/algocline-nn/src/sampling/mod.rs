@@ -46,19 +46,23 @@
 //! given the state semantics) is expected to serialise access
 //! themselves.
 
+pub mod beam;
 pub mod constraint;
 pub mod json_schema;
+pub mod penalty;
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
+pub use beam::{beam_search, Beam, BeamModel, BeamOptions};
 pub use constraint::{
     AllowListConstraint, ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint,
-    TokenMask,
+    TokenBitset, TokenMask,
 };
 pub use json_schema::JsonSchemaConstraint;
+pub use penalty::{apply_penalties, PenalizedSampler, Penalties};
 
 /// Next-token sampler.
 ///
@@ -70,8 +74,8 @@ pub use json_schema::JsonSchemaConstraint;
 ///
 /// - `logits.dims()` MUST be `[vocab]` and `logits.dtype() == DType::F32`;
 ///   an ill-shaped tensor is a caller programming error, not something
-///   the sampler tries to reinterpret. `[batch, vocab]` inputs must be
-///   split by the caller (one `sample` call per batch row).
+///   the sampler tries to reinterpret. A `[batch, vocab]` input goes to
+///   [`Sampler::sample_batch`] instead.
 /// - The returned `u32` MUST be a valid vocab index (`0..vocab`). Every
 ///   impl here upholds this by construction; a Layer-2 constraint that
 ///   masks *every* logit to `-inf` would produce NaNs on softmax, so
@@ -80,6 +84,37 @@ pub use json_schema::JsonSchemaConstraint;
 pub trait Sampler {
     /// Sample a single token id from `logits`.
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32>;
+
+    /// Sample one token id per row of a `[batch, vocab]` logits tensor.
+    ///
+    /// The default splits the rows and calls [`Self::sample`] on each,
+    /// which is what a caller had to write by hand and is correct for
+    /// every stateless sampler: a draw for row `i` depends on row `i`
+    /// alone, and the RNG advancing once per row is the same sequence
+    /// the caller's own loop would have produced.
+    ///
+    /// # Not for a sampler that carries a sequence's state
+    ///
+    /// A [`ConstrainedSampler`] holds one prefix and a
+    /// [`PenalizedSampler`](penalty::PenalizedSampler) one history, and
+    /// a batch is several sequences. Those two override this to refuse
+    /// rather than mixing every row's tokens into one state — which
+    /// would return valid ids, in the right shape, describing a
+    /// sequence none of the rows is. A batch of constrained or
+    /// penalised generations wants one sampler per row.
+    fn sample_batch(&mut self, logits: &Tensor) -> CandleResult<Vec<u32>> {
+        let (batch, _vocab) = logits.dims2().map_err(|e| {
+            candle_core::Error::Msg(format!(
+                "sample_batch: logits must be [batch, vocab] ({e}); a single row goes to sample"
+            ))
+        })?;
+        let mut out = Vec::with_capacity(batch);
+        for row in 0..batch {
+            let logits = logits.narrow(0, row, 1)?.squeeze(0)?.contiguous()?;
+            out.push(self.sample(&logits)?);
+        }
+        Ok(out)
+    }
 }
 
 /// A boxed, type-erased sampler is still a [`Sampler`].
@@ -101,6 +136,13 @@ pub trait Sampler {
 impl Sampler for Box<dyn Sampler + Send> {
     fn sample(&mut self, logits: &Tensor) -> CandleResult<u32> {
         (**self).sample(logits)
+    }
+
+    /// Delegated rather than defaulted, so a boxed sampler that
+    /// overrides `sample_batch` — to refuse it, in both cases here —
+    /// keeps its override through the erasure.
+    fn sample_batch(&mut self, logits: &Tensor) -> CandleResult<Vec<u32>> {
+        (**self).sample_batch(logits)
     }
 }
 
@@ -343,6 +385,78 @@ mod tests {
 
     fn cpu_logits(vals: &[f32]) -> Tensor {
         Tensor::from_slice(vals, (vals.len(),), &Device::Cpu).unwrap()
+    }
+
+    /// `sample_batch` is what a caller had to write by hand: one draw
+    /// per row, in row order, off the same RNG.
+    #[test]
+    fn sample_batch_matches_the_loop_a_caller_would_have_written() {
+        let rows = [
+            vec![0.1f32, 3.2, 0.5],
+            vec![5.0, 0.0, 0.0],
+            vec![0.0, 0.0, 9.9],
+        ];
+        let flat: Vec<f32> = rows.iter().flatten().copied().collect();
+        let batched = Tensor::from_vec(flat, (3, 3), &Device::Cpu).unwrap();
+
+        let mut by_hand = TemperatureSampler::new(0.7, 99);
+        let expected: Vec<u32> = rows
+            .iter()
+            .map(|r| by_hand.sample(&cpu_logits(r)).unwrap())
+            .collect();
+
+        let mut batch = TemperatureSampler::new(0.7, 99);
+        assert_eq!(batch.sample_batch(&batched).unwrap(), expected);
+    }
+
+    /// A `[vocab]` row handed to the batch entry is refused with a
+    /// message naming the single-row entry, rather than read as a batch
+    /// of `vocab` one-token rows.
+    #[test]
+    fn sample_batch_refuses_a_single_row() {
+        let mut s = GreedySampler;
+        let err = s
+            .sample_batch(&cpu_logits(&[0.1, 3.2]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("sample"), "{err}");
+    }
+
+    /// The two stateful wrappers refuse a batch: one prefix and one
+    /// history cannot describe several sequences, and answering anyway
+    /// would return valid ids constrained against a sequence none of
+    /// the rows is.
+    #[test]
+    fn a_sampler_that_tracks_a_sequence_refuses_a_batch() {
+        let batched = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), &Device::Cpu).unwrap();
+
+        let mut constrained =
+            ConstrainedSampler::new(GreedySampler, StopTokensConstraint::new(vec![0]));
+        let err = constrained.sample_batch(&batched).unwrap_err().to_string();
+        assert!(err.contains("one prefix"), "{err}");
+
+        let mut penalized = penalty::PenalizedSampler::new(
+            GreedySampler,
+            penalty::Penalties {
+                presence: 1.0,
+                ..penalty::Penalties::default()
+            },
+        )
+        .unwrap();
+        let err = penalized.sample_batch(&batched).unwrap_err().to_string();
+        assert!(err.contains("one token history"), "{err}");
+    }
+
+    /// The refusal survives type erasure: a boxed constrained sampler
+    /// must not fall back to the trait's default and quietly mix rows.
+    #[test]
+    fn the_batch_refusal_survives_boxing() {
+        let mut boxed: Box<dyn Sampler + Send> = Box::new(ConstrainedSampler::new(
+            GreedySampler,
+            StopTokensConstraint::new(vec![0]),
+        ));
+        let batched = Tensor::from_vec(vec![1.0f32, 0.0, 0.0, 1.0], (2, 2), &Device::Cpu).unwrap();
+        assert!(boxed.sample_batch(&batched).is_err());
     }
 
     /// `GreedySampler` picks the highest-scoring token. Baseline.

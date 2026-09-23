@@ -980,11 +980,13 @@ against a list of known mistakes, so `padid` or `batchsize` is refused
 instead of silently leaving the default in place.
 
 **`pad_id`** fills every row short of `ctx_len`, and rows are stored
-unpadded, so it is trained on. It is checked against the
+unpadded, so it reaches the model as input. It is checked against the
 `meta.vocab_size` the corpora declare — the one id that reaches
 training without coming out of a file — because a pad id inside the
-model's vocabulary but outside the corpus's would train the model to
-emit an id the corpus says does not exist.
+model's vocabulary but outside the corpus's would put an id the corpus
+says does not exist in front of the model at every padded position.
+It is **not scored**: every dataset attaches a loss mask covering the
+filler behind each short row (see *Padding and the loss* below).
 
 **Several files are merged round-robin**, not concatenated: source 1
 row 1, source 2 row 1, source 1 row 2, … with a source dropping out of
@@ -1465,6 +1467,39 @@ arch-directional error.
 `dataset` must be a `DatasetHandle` produced by
 `alc.nn.data.jsonl` / `.from_card` / `.synthetic` / `.parquet`.
 
+**Padding and the loss.** A row shorter than `ctx_len` is filled with
+`pad_id`, and those positions are excluded from the loss: the batch
+carries a mask that is `1` over the tokens the row held and `0` over
+the filler. Without it the run spends part of its gradient learning to
+predict padding and the reported loss sits below the model's real
+next-token loss by whatever share of the batch was filler — a property
+of the row lengths rather than of the model.
+
+The mask is derived from how long each row was, not from comparing
+tokens against `pad_id`: a row may hold the pad id as content (at the
+default `pad_id = 0` it is GPT-2's `<|endoftext|>`), and a
+token-equality test would stop training the model on its own end
+token. A row that should teach where it ends carries that token
+itself; the filler behind it is not scored. Batches whose rows all
+reach `ctx_len` carry no mask at all, so a packed corpus is unaffected.
+
+`opts.mask_pad = false` on the dataset turns this off, which is how a
+run recorded before the mask existed is reproduced.
+
+**Repeatability.** Two runs of one config differ in two places, and
+both have a seed:
+
+- `opts.seed` on the dataset fixes the `shuffle` order.
+- `opts.seed` on `alc.nn.preset.gpt2` / `.tinyllama` fixes the
+  parameter initialisation. It is refused together with
+  `pretrained = true`, where nothing is drawn.
+
+What stays outside a seed's reach is reduction order on the GPU, cuDNN
+algorithm selection, and any sampling inside a forward pass — the same
+position PyTorch takes. Fixing both seeds makes a CPU run repeatable
+and makes a GPU run differ only in the last bits, which over a few
+thousand steps can still become visible.
+
 `opts` (required, table) — LoRA config + train config in one flat
 table:
 
@@ -1668,6 +1703,46 @@ Checkpoint before assembling the Card.
     kept some parameters at their initial values cannot be
     told from a real one once training is under way. An empty
     string is refused rather than read as "no checkpoint".
+    Whether this is a **resume** or a **warm start** depends on
+    what sits beside the file — see `save_optimizer_state`.
+  - `save_optimizer_state` (boolean, optional, default `false`)
+    — write the optimizer's own state to a
+    `<checkpoint>.opt.safetensors` sidecar beside every
+    checkpoint. With one in place, a later `init_from` restores
+    the moments and the step count, the schedule continues from
+    that step, and `steps` reads as the **total** the run is
+    working towards rather than a count of further steps.
+    Without one, `init_from` restores weights into a zeroed
+    optimizer — the first updates after the restart are the
+    updates of a fresh run, the loss curve bends, and nothing in
+    the record says why. Off by default because AdamW's state is
+    roughly three times the parameters again. A resume into a
+    total already reached is refused. Not resumed either way:
+    the data order, which a one-pass dataset has no position to
+    restore.
+  - `clip_grad_norm` (number, optional) — cap the joint L2 norm
+    of the gradient before each optimizer step, scaling every
+    parameter's gradient by `max_norm / norm` when it is over.
+    Global-norm, so the direction is untouched and only the
+    length changes; `1.0` is where most transformer recipes sit.
+    Uncapped when absent. A non-finite norm is left unscaled
+    (multiplying by `max_norm / NaN` only spreads the NaN), and
+    `info.grad_norm` keeps reporting the norm as measured rather
+    than the cap. Zero or negative is refused.
+  - `eval_every` (integer, optional, default `0`) — score the
+    held-out set every N optimizer steps. Requires
+    `val_dataset`, and `val_dataset` requires this: either half
+    alone is an error rather than a run that looks configured
+    and measures nothing.
+  - `val_dataset` (`alc.nn.dataset`, optional) — the held-out
+    rows. Scored through the same forward path and the same loss
+    as training, so the two numbers are comparable; the batches
+    are drained once and re-scored at each boundary, so the
+    sequence of values is a curve over fixed rows. Passing the
+    training dataset here is refused — the number it would
+    produce is a training loss under another name. The result
+    reaches `info.val_loss`, the Card's `metrics.val_loss`, and
+    `metrics.min_val_loss`.
   - `mask_disallowed_logits` (boolean, optional, default
     `false`) — score each target among the ids its position
     allowed instead of among the whole vocabulary. Requires
@@ -1698,7 +1773,12 @@ Checkpoint before assembling the Card.
 **Checkpoint search.** `on_ckpt` is where a caller measures the
 model mid-run and decides what to do about what it measured. The
 `info` table carries `step`, `ckpt_path`, `train_loss`, `lr`,
-`grad_norm`, `elapsed_ms` and `min_train_loss`; the checkpoint at
+`grad_norm`, `elapsed_ms`, `min_train_loss` and — on a run with a
+held-out set — `val_loss` (absent otherwise, rather than a
+stand-in number). `val_loss` is the reading a keep decision
+usually wants: `train_loss` falls whether the model is learning
+the task or the corpus, and from inside the training set the two
+are indistinguishable. The checkpoint at
 `info.ckpt_path` is already on disk, so a hook can load it
 (`alc.nn.card.load_ckpt`) and evaluate it while the run waits.
 
@@ -2038,50 +2118,6 @@ as `load_handle` during the deprecation window). The old `load`
 name continues to work as an alias for `load_vars` until the
 deprecation cycle closes; new callers should use `load_vars`
 explicitly.
-
-#### `alc.nn.metric.bootstrap_ci(clusters, opts) -> table`
-
-Put a 95% confidence interval around the mean of a sample whose
-observations arrive in groups that are not independent of each other.
-
-`clusters` is an array of observation arrays: `clusters[i]` holds every
-number belonging to group `i`. The resampling unit is the **group**,
-not the observation — a bootstrap that drew observations would treat
-two readings from one group as two independent facts and return an
-interval narrower than the sample supports. Which readings belong
-together is something only the caller knows, so it is stated rather
-than inferred.
-
-**opts:**
-
-| key | type | notes |
-|-----|------|-------|
-| `seed` | integer | **required** — the same seed over the same sample reproduces the interval exactly |
-| `draws` | integer | resamples, default `2000` |
-
-`seed` has no default on purpose: an interval nothing can reproduce
-looks exactly like one that can.
-
-**Returns** a table with `point` (the statistic on the sample as
-walked, no resampling), `low` / `high` (the percentile bounds), `draws`
-(resamples that produced a usable value), `undefined_draws` (those that
-did not, reported rather than swallowed — dropping draws biases the
-interval), `clusters`, and `seed`.
-
-**Errors** (prefixed `alc.nn.metric.bootstrap_ci:`): an empty cluster
-list, a cluster that is not an array of numbers, a non-finite
-observation, `draws = 0`, a statistic undefined on the whole sample,
-and one that survives the whole sample but no resample of it (which
-means it rests on too few clusters to resample).
-
-```lua
-local ci = alc.nn.metric.bootstrap_ci(
-    { { 1, 0, 1 }, { 0, 0 }, { 1, 1, 1 } },   -- three groups
-    { draws = 2000, seed = 42 })
-if ci.low > 0 then
-    -- the whole interval lies above zero
-end
-```
 
 ---
 

@@ -103,6 +103,7 @@ use std::path::Path;
 
 use algocline_nn::gguf::{export_gguf, parse_precision, GgufArch, GgufSpec, PRECISION_NAMES};
 use algocline_nn::pooling::{pool, Pooling};
+use algocline_nn::sampling::{beam_search, Beam, BeamModel, BeamOptions};
 use algocline_nn::tokenizer::{HfTokenizer, Message};
 use algocline_nn::train::DeviceView;
 use candle_core::quantized::GgmlDType;
@@ -1278,6 +1279,149 @@ fn embed_tinyllama(
 
 /// Error prefix for the embedding surface.
 const EMBED_ERR_PREFIX: &str = "alc.nn handle:embed";
+
+/// Error prefix for the beam-search surface.
+const BEAM_ERR_PREFIX: &str = "alc.nn handle:beam_search";
+
+/// A [`BeamModel`] over a closure, so each architecture contributes
+/// five lines rather than an impl.
+struct ClosureBeam<F>(F);
+
+impl<F> BeamModel for ClosureBeam<F>
+where
+    F: FnMut(&[u32]) -> candle_core::Result<Vec<f32>>,
+{
+    fn next_log_probs(&mut self, tokens: &[u32]) -> candle_core::Result<Vec<f32>> {
+        (self.0)(tokens)
+    }
+}
+
+/// Read `{ beams, max_new, length_penalty, eos }` off a Lua table.
+fn beam_options(opts: Option<&LuaTable>, vocab: usize) -> LuaResult<BeamOptions> {
+    let mut out = BeamOptions::default();
+    let Some(t) = opts else {
+        return Ok(out);
+    };
+    if let Some(v) = t.get::<Option<usize>>("beams")? {
+        out.beams = v;
+    }
+    if let Some(v) = t.get::<Option<usize>>("max_new")? {
+        out.max_new = v;
+    }
+    if let Some(v) = t.get::<Option<f32>>("length_penalty")? {
+        out.length_penalty = v;
+    }
+    if let Some(v) = t.get::<Option<i64>>("eos")? {
+        out.eos = Some(check_token(v, vocab, "opts.eos")?);
+    }
+    Ok(out)
+}
+
+/// Project the search's beams into the Lua array a caller gets back.
+fn beams_to_lua(lua: &Lua, beams: Vec<Beam>) -> LuaResult<LuaTable> {
+    let out = lua.create_table()?;
+    for (i, beam) in beams.into_iter().enumerate() {
+        let row = lua.create_table()?;
+        row.set("tokens", beam.tokens)?;
+        row.set("score", beam.score)?;
+        row.set("finished", beam.finished)?;
+        out.set(i + 1, row)?;
+    }
+    Ok(out)
+}
+
+/// The last position's log-probabilities from a full-sequence forward.
+///
+/// Log-probabilities rather than logits because the search sums them
+/// across steps, and summing unnormalised scores compares sequences
+/// under different normalisers.
+fn last_log_probs(logits: &Tensor) -> candle_core::Result<Vec<f32>> {
+    use candle_core::IndexOp;
+    let t = logits.dims()[1];
+    let row = logits.i((0, t - 1))?.to_dtype(DType::F32)?;
+    candle_nn::ops::log_softmax(&row, 0)?.to_vec1()
+}
+
+/// Register `handle:beam_search(prompt, opts?)` on the GPT-2 handle.
+pub(super) fn add_gpt2_beam_search_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<Gpt2Handle>,
+{
+    methods.add_method(
+        "beam_search",
+        |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            let vocab = this.vocab();
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx())?;
+            let options = beam_options(opts.as_ref(), vocab)?;
+            let model = this.model();
+            let guard = model
+                .lock()
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: model lock: {e}")))?;
+            let device = guard.device().clone();
+            let mut beam_model = ClosureBeam(|tokens: &[u32]| {
+                let input = Tensor::from_slice(tokens, (1, tokens.len()), &device)?;
+                last_log_probs(&guard.forward(&input)?)
+            });
+            let beams = beam_search(&mut beam_model, &ids, &options)
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: {e}")))?;
+            beams_to_lua(lua, beams)
+        },
+    );
+}
+
+/// Register `handle:beam_search(prompt, opts?)` on the TinyLlama
+/// handle.
+pub(super) fn add_tinyllama_beam_search_method<M>(methods: &mut M)
+where
+    M: mlua::UserDataMethods<TinyLlamaHandle>,
+{
+    methods.add_method(
+        "beam_search",
+        |lua, this, (prompt, opts): (Vec<i64>, Option<LuaTable>)| {
+            let vocab = this.vocab();
+            let ids = validate_beam_prompt(&prompt, vocab, this.ctx())?;
+            let options = beam_options(opts.as_ref(), vocab)?;
+            let model = this.model();
+            let guard = model
+                .lock()
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: model lock: {e}")))?;
+            let device = guard.device().clone();
+            let mut beam_model = ClosureBeam(|tokens: &[u32]| {
+                let input = Tensor::from_slice(tokens, (1, tokens.len()), &device)?;
+                last_log_probs(&guard.forward(&input)?)
+            });
+            let beams = beam_search(&mut beam_model, &ids, &options)
+                .map_err(|e| LuaError::external(format!("{BEAM_ERR_PREFIX}: {e}")))?;
+            beams_to_lua(lua, beams)
+        },
+    );
+}
+
+/// Check a beam-search prompt, leaving room for what it will generate.
+///
+/// The window is checked against prompt plus budget rather than against
+/// the prompt alone: a search that would run past `ctx` half way
+/// through is better refused before it starts than after it has spent
+/// the forwards.
+fn validate_beam_prompt(prompt: &[i64], vocab: usize, ctx: usize) -> LuaResult<Vec<u32>> {
+    if prompt.is_empty() {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: prompt_tokens is empty; there is no sequence to continue"
+        )));
+    }
+    if prompt.len() >= ctx {
+        return Err(LuaError::external(format!(
+            "{BEAM_ERR_PREFIX}: a prompt of {} fills the model context window ({ctx}), \
+             leaving nothing to generate",
+            prompt.len()
+        )));
+    }
+    prompt
+        .iter()
+        .enumerate()
+        .map(|(i, id)| check_token(*id, vocab, &format!("prompt_tokens[{}]", i + 1)))
+        .collect()
+}
 
 /// Error prefix for the GGUF export surface.
 const GGUF_ERR_PREFIX: &str = "alc.nn handle:export_gguf";

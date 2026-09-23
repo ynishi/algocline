@@ -1626,6 +1626,58 @@ fn eval_with_handle<T: mlua::FromLuaMulti>(lua: &Lua, body: &str, what: &str) ->
         .unwrap_or_else(|e| panic!("{what}: {e}"))
 }
 
+/// `handle:beam_search` returns ranked beams, and the refusals it owns.
+#[test]
+fn alc_nn_handle_beam_search_returns_ranked_beams() {
+    let lua = nn_vm();
+    let (count, first_len, ordered): (usize, usize, bool) = lua
+        .load(
+            r#"
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        local beams = h:beam_search({ 1, 2, 3 }, { beams = 3, max_new = 4 })
+        assert(#beams == 3, "three beams were asked for")
+        local ordered = true
+        for i = 2, #beams do
+            if beams[i].score > beams[i - 1].score then ordered = false end
+        end
+        for _, b in ipairs(beams) do
+            assert(#b.tokens == 7, "3 prompt + 4 generated")
+            assert(b.tokens[1] == 1 and b.tokens[2] == 2 and b.tokens[3] == 3,
+                   "every beam keeps the prompt")
+            assert(type(b.finished) == "boolean")
+        end
+        return #beams, #beams[1].tokens, ordered
+    "#,
+        )
+        .eval()
+        .expect("beam_search");
+    assert_eq!(count, 3);
+    assert_eq!(first_len, 7);
+    assert!(ordered, "beams come back best first");
+
+    let errors: Vec<String> = lua
+        .load(
+            r#"
+        local function err(f)
+            local ok, e = pcall(f)
+            assert(not ok, "expected a refusal")
+            return tostring(e)
+        end
+        local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+        return {
+            err(function() return h:beam_search({}) end),
+            err(function() return h:beam_search({ 1 }, { beams = 0 }) end),
+            err(function() return h:beam_search({ 1 }, { eos = 999999 }) end),
+        }
+    "#,
+        )
+        .eval()
+        .expect("beam_search refusals");
+    assert!(errors[0].contains("empty"), "{}", errors[0]);
+    assert!(errors[1].contains("at least 1"), "{}", errors[1]);
+    assert!(errors[2].contains("vocab"), "{}", errors[2]);
+}
+
 /// `handle:export_gguf` writes a file that reports what went into it,
 /// and refuses the handles that have nothing to write.
 #[test]

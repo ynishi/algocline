@@ -1666,6 +1666,7 @@ impl mlua::UserData for Gpt2Handle {
         // model trained here can be used as an encoder.
         super::nn_gen::add_gpt2_embed_method(methods);
         super::nn_gen::add_gpt2_export_gguf_method(methods);
+        super::nn_gen::add_gpt2_beam_search_method(methods);
     }
 }
 
@@ -2497,6 +2498,7 @@ impl mlua::UserData for TinyLlamaHandle {
         super::nn_gen::add_tinyllama_generate_session_method(methods);
         super::nn_gen::add_tinyllama_embed_method(methods);
         super::nn_gen::add_tinyllama_export_gguf_method(methods);
+        super::nn_gen::add_tinyllama_beam_search_method(methods);
     }
 }
 

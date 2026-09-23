@@ -46,6 +46,7 @@
 //! given the state semantics) is expected to serialise access
 //! themselves.
 
+pub mod beam;
 pub mod constraint;
 pub mod json_schema;
 pub mod penalty;
@@ -55,6 +56,7 @@ use rand::distr::weighted::WeightedIndex;
 use rand::prelude::*;
 use rand::rngs::StdRng;
 
+pub use beam::{beam_search, Beam, BeamModel, BeamOptions};
 pub use constraint::{
     AllowListConstraint, ConstrainedSampler, Constraint, RegexConstraint, StopTokensConstraint,
     TokenMask,

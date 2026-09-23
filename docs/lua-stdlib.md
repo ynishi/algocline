@@ -1058,6 +1058,93 @@ past 10000, a numeric option that is not whole or is above 4294967295
 (the same ceiling whichever of Lua's two number carriers it arrives
 in), and any key this entry does not read.
 
+#### `handle:embed(tokens, opts?)`
+
+One vector for a token sequence: the model's hidden state, pooled.
+
+The generation surface returns logits, which are a distribution over the
+next token and not a description of the input. The hidden state is the
+tensor the language-model head reads, and it cannot be recovered from
+the head's output — the projection from `dim` onto a vocabulary is not
+invertible. This returns it, pooled to a single vector, which is what
+makes a model trained here usable as an encoder.
+
+**Parameters:**
+
+| name   | type            | required | notes |
+|--------|-----------------|----------|-------|
+| tokens | array of integer | yes     | non-empty, in vocabulary, no longer than `ctx` |
+| opts   | table           | no       | `{ pooling = "mean" \| "last" \| "max" }` — default `"mean"` |
+
+**Returns:** a flat array of numbers, one per hidden dimension. An
+array rather than a handle, because an embedding is consumed by a
+distance, a store or a file, none of which would take a handle this
+crate defines.
+
+**Which pooling** is a real choice, not a detail:
+
+- **`"mean"`** averages every position. The usual default for a
+  sequence embedding.
+- **`"last"`** takes the final position — what a decoder-only model's
+  own objective builds, since that position is the only one that has
+  read the whole sequence.
+- **`"max"`** keeps the strongest activation of each feature rather
+  than its average.
+
+Available on the trainable handles (`gpt2` / `tinyllama`) and on the
+union a reloaded Card carries. The llama adapter refuses it by name: its
+forward returns the head's output and there is no hidden state behind it
+to pool.
+
+```lua
+local h = alc.nn.preset.gpt2("tiny", { pretrained = false })
+local v = h:embed(alc.nn.tokenize("gpt2", "the cat sat"))
+local w = h:embed(alc.nn.tokenize("gpt2", "a cat sits"), { pooling = "last" })
+```
+
+#### `alc.nn.sampler.penalized(sampler, opts?)`
+
+Wrap a sampler so what the generation has already produced weighs on
+what it produces next.
+
+Every other sampler reads one logits row and nothing else, so none of
+them can tell a token the model has emitted six times from one it has
+never emitted — and a model that starts repeating keeps repeating.
+
+**opts** (every key optional, every default off):
+
+| key | type | notes |
+|-----|------|-------|
+| `repetition` | number | CTRL-style factor on any token in the history; `1.0` is off, `1.2` is the value that paper reports. Divides a positive logit and multiplies a negative one — one rule for both signs would *raise* the negative logit and reward the repeat |
+| `frequency` | number | subtracted once per occurrence, so pressure accumulates |
+| `presence` | number | subtracted once for any occurrence at all, which pushes towards new vocabulary rather than away from repetition as such |
+| `window` | integer | count only the last N tokens; without it a long generation accumulates a penalty against every word it has used |
+| `history` | array of integer | tokens already counted, usually the prompt |
+
+The prompt is **not** counted unless `history` says so. Penalising it
+discourages a summary from reusing the words it was given, which is
+sometimes exactly wrong and sometimes exactly right, and is not a choice
+this bridge makes silently.
+
+**Consumes the sampler handle**, as `alc.nn.sampler.constrained` does:
+two Lua handles onto one sampler would each hold half of a history. The
+composed sampler carries `sample` / `is_done` / `reset` as before, plus
+`observe(id)` for a loop that decides some steps elsewhere (a forced
+prefix, a spliced tool call) and still wants them to weigh.
+
+Wrap the *constrained* sampler in this one rather than the reverse: the
+penalty then reads logits the mask has already applied and is never
+spent on a token the constraint forbids. Wrapping twice is refused —
+two histories over one generation would count every token in both.
+
+```lua
+local s = alc.nn.sampler.penalized(
+    alc.nn.sampler.constrained(
+        alc.nn.sampler.temperature(0.8, 42),
+        alc.nn.constraint.stop_tokens({ 50256 })),
+    { repetition = 1.15, frequency = 0.1, window = 256 })
+```
+
 #### `alc.nn.logits.mix(a, b, beta, opts?)`
 
 Combine two logits rows into one, with `beta` the weight on `a`.
@@ -1729,6 +1816,30 @@ Checkpoint before assembling the Card.
     (multiplying by `max_norm / NaN` only spreads the NaN), and
     `info.grad_norm` keeps reporting the norm as measured rather
     than the cap. Zero or negative is refused.
+  - `metrics_every` (integer, optional, default `0`) — append one
+    line per N optimizer steps to `<card_id>-metrics.jsonl`
+    beside the checkpoints: `{"step":…,"loss":…,"lr":…}`, plus
+    `grad_norm` and `val_loss` where the run has them. Converged,
+    stalled, diverged and still-descending-when-it-ran-out are
+    four different runs with the same final loss, and none of
+    them is legible from it. JSON Lines, appended as the run
+    goes, so an interrupted run leaves a file valid up to its
+    last complete line. A key is absent rather than null where
+    the run has no number for it — a `grad_norm` of zero and no
+    gradient norm at all are different facts.
+  - `early_stop` (table, optional) —
+    `{ patience = N, min_delta = x }`, ending the run when the
+    held-out loss has not improved for `patience` evaluations.
+    Both keys are required: `patience` alone stops on noise and
+    `min_delta` alone never stops a run creeping down by
+    nothing, so neither is supplied on the caller's behalf. It
+    watches the held-out loss and nothing else — stopping on the
+    training loss would stop when the model stopped fitting the
+    data it is being fitted to — so a rule without `eval_every`
+    and `val_dataset` is refused rather than left never to fire.
+    A non-finite loss counts against patience, so a diverged run
+    stops on the same rule. A stopped run writes its terminal
+    checkpoint and records `metrics.early_stop = 1`.
   - `eval_every` (integer, optional, default `0`) — score the
     held-out set every N optimizer steps. Requires
     `val_dataset`, and `val_dataset` requires this: either half

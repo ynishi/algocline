@@ -23,8 +23,9 @@ use std::time::Instant;
 use serde::Serialize;
 
 use candle_core::backprop::GradStore;
+use candle_core::TensorId;
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
-use candle_nn::{AdamW, Module, Optimizer, ParamsAdamW, VarMap};
+use candle_nn::{Module, Optimizer, ParamsAdamW, VarMap};
 
 use crate::arch::{AllowedSets, CondIndex, LoraConfig, LoraWrappable};
 use crate::train::ckpt::{
@@ -34,24 +35,35 @@ use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::lion::{Lion, ParamsLion};
 use crate::train::loss::Loss;
 use crate::train::mixed::MixedAdamW;
+use crate::train::optstate::{names_by_tensor_id, sidecar_path, OptimizerState};
 use crate::train::scheduler::{ScheduleKind, Scheduler};
 use crate::train::AllowedForward;
 use crate::train::Checkpoint;
 use crate::train::ConditionedForward;
 use crate::train::DeviceView;
 
-/// Optimizer flavour selected by the parameter dtype (design §7.1).
+/// Optimizer flavour, over the parameter dtypes each one accepts
+/// (design §7.1).
 ///
-/// - All-F32 vars → the stock [`candle_nn::AdamW`], keeping the
-///   established baseline bit-identical.
-/// - All-BF16 vars → [`MixedAdamW`] (FP32 master weights + FP32
-///   moments; gradients upcast per step).
+/// - AdamW → [`MixedAdamW`] on both F32 and BF16 (FP32 master weights +
+///   FP32 moments; gradients upcast per step).
+/// - Lion → [`Lion`], which keeps its own FP32 master where the dtype
+///   needs one.
 /// - Anything else (F16, F64, a mixed set) is a loud
-///   [`TrainError::Candle`]: stock AdamW on BF16 keeps its moments in
-///   BF16 and stalls silently, and F16 needs a loss scaler that does
-///   not ship here.
+///   [`TrainError::Candle`]: an optimizer holding BF16 moments stalls
+///   silently, and F16 needs a loss scaler that does not ship here.
+///
+/// # Why F32 AdamW no longer routes through `candle_nn::AdamW`
+///
+/// It used to, as the bit-identical baseline. But that type keeps its
+/// moments in private fields with no accessor, so a run using it could
+/// not write its optimizer state and `init_from` could never be more
+/// than a warm start — for the default optimizer at the default dtype,
+/// which is nearly every run. [`MixedAdamW`] implements the same update
+/// term for term and its FP32-on-FP32 case is pinned against the stock
+/// one to within `1e-6` by `mixed::tests::f32_parity_with_stock_adamw`.
+/// Resumable state for every run is worth that much.
 enum FtOptimizer {
-    Stock(AdamW),
     Mixed(MixedAdamW),
     Lion(Lion),
 }
@@ -90,6 +102,29 @@ impl OptimizerKind {
 
     /// Every wire name this version accepts.
     pub const NAMES: [&'static str; 4] = ["adamw", "adam_w", "adam", "lion"];
+
+    /// Stable number for this flavour, written into an optimizer-state
+    /// file so a resume can refuse to read one optimizer's tensors into
+    /// another's slots.
+    ///
+    /// Spelt out rather than taken from the enum's layout: a variant
+    /// added above another must not renumber a file already on disk.
+    pub fn discriminant(self) -> u32 {
+        match self {
+            Self::AdamW => 0,
+            Self::Lion => 1,
+        }
+    }
+
+    /// Inverse of [`Self::discriminant`]. `None` for a number this
+    /// build has no optimizer for.
+    pub fn from_discriminant(value: u32) -> Option<Self> {
+        match value {
+            0 => Some(Self::AdamW),
+            1 => Some(Self::Lion),
+            _ => None,
+        }
+    }
 }
 
 impl FtOptimizer {
@@ -126,8 +161,7 @@ impl FtOptimizer {
             };
         }
         match dtypes.as_slice() {
-            [DType::F32] => Ok(Self::Stock(AdamW::new(vars, params)?)),
-            [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
+            [DType::F32] | [DType::BF16] => Ok(Self::Mixed(MixedAdamW::new(vars, params)?)),
             [DType::F16] => Err(TrainError::Candle(
                 "run_ft_core: f16 parameters need loss scaling, which is not \
                  implemented — build the model with dtype bf16 (CUDA) or f32"
@@ -142,9 +176,61 @@ impl FtOptimizer {
 
     fn set_learning_rate(&mut self, lr: f64) {
         match self {
-            Self::Stock(o) => o.set_learning_rate(lr),
             Self::Mixed(o) => o.set_learning_rate(lr),
             Self::Lion(o) => o.set_learning_rate(lr),
+        }
+    }
+
+    /// Which flavour this is, for the state file's own record of what
+    /// wrote it.
+    fn kind(&self) -> OptimizerKind {
+        match self {
+            Self::Mixed(_) => OptimizerKind::AdamW,
+            Self::Lion(_) => OptimizerKind::Lion,
+        }
+    }
+
+    /// Everything this optimizer would need to carry on, as tensors
+    /// named after the parameters they belong to.
+    fn state(&self, names: &HashMap<TensorId, String>) -> Result<OptimizerState, String> {
+        let mut tensors = HashMap::new();
+        let step = match self {
+            Self::Mixed(o) => {
+                o.write_state(names, &mut tensors)?;
+                o.step_count()
+            }
+            Self::Lion(o) => {
+                o.write_state(names, &mut tensors)?;
+                // Lion has no bias correction and keeps no counter; the
+                // loop's own step is written so a resume can pick the
+                // schedule back up.
+                0
+            }
+        };
+        Ok(OptimizerState {
+            kind: self.kind(),
+            step,
+            tensors,
+        })
+    }
+
+    /// Read a state back in, refusing one written by a different
+    /// optimizer.
+    fn load_state(
+        &mut self,
+        names: &HashMap<TensorId, String>,
+        state: &OptimizerState,
+    ) -> Result<(), String> {
+        if state.kind != self.kind() {
+            return Err(format!(
+                "optimizer state: the file was written by {:?} and this run uses {:?};                  their tensors are not the same quantity",
+                state.kind,
+                self.kind()
+            ));
+        }
+        match self {
+            Self::Mixed(o) => o.read_state(names, &state.tensors, state.step),
+            Self::Lion(o) => o.read_state(names, &state.tensors),
         }
     }
 
@@ -158,7 +244,6 @@ impl FtOptimizer {
     /// for `grad_accum == 1`) so a single code path serves both cases.
     fn step(&mut self, grads: &GradStore) -> CandleResult<()> {
         match self {
-            Self::Stock(o) => o.step(grads),
             Self::Mixed(o) => o.step(grads),
             Self::Lion(o) => o.step(grads),
         }
@@ -231,6 +316,28 @@ pub struct FullFtConfig {
     /// Number of rotating checkpoints kept (clamped to at least 1
     /// inside [`CheckpointStore`]).
     pub ckpt_keep: usize,
+    /// Write the optimizer's own state beside every checkpoint, so
+    /// [`Self::init_from`] can resume rather than warm-start.
+    ///
+    /// `false` (default) leaves checkpoints the size they have always
+    /// been. AdamW's state is an FP32 master plus two FP32 moments per
+    /// parameter — roughly three times the parameters again — and it is
+    /// of no use to anything but a resume of this exact run, so it goes
+    /// in a `<checkpoint>.opt.safetensors` sidecar rather than into the
+    /// bundle every inference path loads.
+    ///
+    /// What turning it on buys: `init_from` currently restores weights
+    /// into a zeroed optimizer, and AdamW's bias-corrected
+    /// `m̂ / (√v̂ + ε)` makes the first steps after that behave like the
+    /// first steps of a run. The loss bends at the restart and nothing
+    /// in the record says why. With the state in place the moments and
+    /// the step count carry over and the schedule picks up where it
+    /// stopped.
+    ///
+    /// What it does not buy: the data order. A [`Dataset`] is a
+    /// one-pass stream with no position to restore, so a resumed run
+    /// starts the corpus again from the top.
+    pub save_optimizer_state: bool,
     /// Cap the joint L2 norm of the gradient at this value before each
     /// optimizer step, or `None` (default) for no cap.
     ///
@@ -280,6 +387,16 @@ pub struct FullFtConfig {
     /// not start: a resume that quietly kept some parameters at their
     /// initial values is the failure that costs a run, and it is
     /// indistinguishable from a real one once training is under way.
+    ///
+    /// A resume or a warm start, depending on what is beside the file.
+    /// With a `<checkpoint>.opt.safetensors` sidecar (written by
+    /// [`Self::save_optimizer_state`]) the optimizer state and the step
+    /// count come back too, the schedule continues from that step, and
+    /// [`Self::steps`] is read as the total the run is working towards
+    /// rather than a count of further steps. Without one the weights
+    /// are restored into a fresh optimizer at step 0, and the run says
+    /// so through `tracing` rather than leaving the two cases looking
+    /// alike.
     ///
     /// Not supported on [`run_lora_ft`], which never sees the base
     /// map — see [`TrainError::InitFromUnsupported`].
@@ -331,6 +448,7 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            save_optimizer_state: false,
             clip_grad_norm: None,
             eval_every: 0,
             init_from: None,
@@ -452,6 +570,31 @@ pub enum TrainError {
         /// The value the config carried.
         value: f64,
     },
+    /// A resumed run had already reached or passed
+    /// [`FullFtConfig::steps`].
+    ///
+    /// With optimizer state in hand, `steps` is the total the run is
+    /// working towards, so there is nothing left to do. Refused rather
+    /// than returned as a zero-step run, which would write a fresh
+    /// terminal checkpoint whose recorded loss came from no step at
+    /// all.
+    #[error(
+        "the checkpoint resumes at step {resumed} and cfg.steps is {steps}, so this run has          already finished; raise steps to extend it"
+    )]
+    ResumeBeyondSteps {
+        /// Step the optimizer state was written at.
+        resumed: usize,
+        /// Total the config asks for.
+        steps: usize,
+    },
+    /// Optimizer state was found beside a checkpoint and could not be
+    /// read into this run's optimizer.
+    ///
+    /// Refused rather than skipped: the caller asked to resume, and a
+    /// silent fall back to a warm start is the failure the state file
+    /// exists to remove.
+    #[error("init_from: {0}")]
+    OptState(String),
     /// One half of the validation setup arrived without the other.
     ///
     /// [`FullFtConfig::eval_every`] and the entry point's validation
@@ -920,6 +1063,67 @@ where
     )
 }
 
+/// Write the optimizer's state beside a checkpoint that was just
+/// saved, when the config asked for it.
+///
+/// `step` is the loop's global step, which is what a resume needs for
+/// the schedule. For AdamW it also has to match the optimizer's own
+/// counter, and it does: both count optimizer steps from the start of
+/// the original run.
+fn save_optimizer_state(
+    opt: &FtOptimizer,
+    names: &HashMap<TensorId, String>,
+    cfg: &FullFtConfig,
+    ckpt_path: &Path,
+    step: usize,
+) -> Result<(), TrainError> {
+    if !cfg.save_optimizer_state {
+        return Ok(());
+    }
+    let mut state = opt.state(names).map_err(TrainError::OptState)?;
+    // The loop's step wins over the optimizer's own: Lion keeps no
+    // counter, and on a resumed AdamW run the two agree anyway.
+    state.step = step;
+    state
+        .save(&sidecar_path(ckpt_path))
+        .map_err(TrainError::OptState)
+}
+
+/// Read the optimizer state beside `ckpt_path` into `opt`, returning
+/// the step it was written at.
+///
+/// `0` when there is no sidecar: the caller asked to start from a
+/// checkpoint that carries no optimizer state, which is a warm start
+/// and is logged as one. The two cases used to be indistinguishable
+/// from the outside, which is the whole complaint.
+fn resume_optimizer(
+    opt: &mut FtOptimizer,
+    names: &HashMap<TensorId, String>,
+    ckpt_path: &Path,
+    device: &Device,
+) -> Result<usize, TrainError> {
+    let path = sidecar_path(ckpt_path);
+    if !path.exists() {
+        tracing::info!(
+            target: "algocline_nn::train",
+            checkpoint = %ckpt_path.display(),
+            "init_from is a warm start: no optimizer state beside the checkpoint, so the \
+             moments begin at zero and the schedule at step 0"
+        );
+        return Ok(0);
+    }
+    let state = OptimizerState::load(&path, device).map_err(TrainError::OptState)?;
+    opt.load_state(names, &state)
+        .map_err(TrainError::OptState)?;
+    tracing::info!(
+        target: "algocline_nn::train",
+        checkpoint = %ckpt_path.display(),
+        step = state.step,
+        "init_from is a resume: optimizer state restored"
+    );
+    Ok(state.step)
+}
+
 /// Restore [`FullFtConfig::init_from`] into `varmap`, if one was named.
 ///
 /// Strict: [`restore_into`] refuses anything short of a complete
@@ -1085,6 +1289,22 @@ fn run_ft_core(
     };
     let mut opt = FtOptimizer::for_vars(cfg.optimizer, vars, adamw_params)?;
 
+    // The weights were restored before the loop was entered (see
+    // `apply_init_from`); the optimizer exists only now, so its own
+    // state is read here. `resumed_step` is 0 for a fresh run and for a
+    // warm start, and the step the state was written at otherwise.
+    let names = names_by_tensor_id(opt_vm);
+    let resumed_step = match cfg.init_from.as_ref() {
+        Some(path) => resume_optimizer(&mut opt, &names, path, device)?,
+        None => 0,
+    };
+    if resumed_step >= cfg.steps {
+        return Err(TrainError::ResumeBeyondSteps {
+            resumed: resumed_step,
+            steps: cfg.steps,
+        });
+    }
+
     let scheduler = {
         let s = Scheduler::new(cfg.schedule, cfg.lr, cfg.min_lr, cfg.warmup, cfg.steps);
         match cfg.decay_steps {
@@ -1129,7 +1349,11 @@ fn run_ft_core(
     // updated the parameters".
     let grad_accum = cfg.grad_accum;
     let scale = 1.0f64 / grad_accum as f64;
-    for step in 0..cfg.steps {
+    // `step` is the global index: on a resumed run it starts where the
+    // state left off, so the schedule, the checkpoint filenames and the
+    // hook's `info.step` all continue the earlier run rather than
+    // restarting alongside it.
+    for step in resumed_step..cfg.steps {
         let lr = scheduler.lr_at(step);
         opt.set_learning_rate(lr);
 
@@ -1222,6 +1446,7 @@ fn run_ft_core(
             let ckpt_path = ckpt_store
                 .save_step(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+            save_optimizer_state(&opt, &names, cfg, &ckpt_path, step + 1)?;
 
             if let Some(hook_fn) = hook.as_mut() {
                 let info = CkptInfo {
@@ -1273,10 +1498,14 @@ fn run_ft_core(
                         let final_path = ckpt_store
                             .save_final(save_vm)
                             .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+                        save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
                         let mut metrics: HashMap<String, f32> = HashMap::new();
                         metrics.insert("min_train_loss".into(), running_min_loss);
                         metrics.insert("final_lr".into(), lr as f32);
                         metrics.insert("early_break".into(), 1.0);
+                        if resumed_step > 0 {
+                            metrics.insert("resumed_from_step".into(), resumed_step as f32);
+                        }
                         if last_val_loss.is_some() {
                             metrics.insert("min_val_loss".into(), min_val_loss);
                         }
@@ -1300,10 +1529,14 @@ fn run_ft_core(
     let final_path = ckpt_store
         .save_final(save_vm)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+    save_optimizer_state(&opt, &names, cfg, &final_path, cfg.steps)?;
 
     let mut metrics: HashMap<String, f32> = HashMap::new();
     metrics.insert("min_train_loss".into(), running_min_loss);
     metrics.insert("final_lr".into(), scheduler.lr_at(cfg.steps - 1) as f32);
+    if resumed_step > 0 {
+        metrics.insert("resumed_from_step".into(), resumed_step as f32);
+    }
     // A last evaluation whenever the final step was not one, so the
     // returned record always carries the held-out loss of the weights
     // it names rather than of some earlier step.
@@ -2008,7 +2241,289 @@ mod tests {
         )
     }
 
-    /// The cap scales the gradient down to exactly `max_norm` and
+    /// With optimizer state on disk, `init_from` resumes: the step
+    /// count carries over, `steps` is the total the run works towards,
+    /// and the record says where it picked up.
+    #[test]
+    fn init_from_with_optimizer_state_resumes_the_step_count_and_the_schedule() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 4,
+            warmup: 2,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        let a = run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "resume",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.step, 4);
+        let ckpt = tmp.path().join("resume.safetensors");
+        let sidecar = crate::train::optstate::sidecar_path(&ckpt);
+        assert!(sidecar.exists(), "the sidecar must sit beside {ckpt:?}");
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 7,
+            warmup: 2,
+            save_optimizer_state: true,
+            init_from: Some(ckpt),
+            ..FullFtConfig::default()
+        };
+        let b = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "resume2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            b.step, 7,
+            "steps is the total, not a count of further steps"
+        );
+        assert_eq!(
+            b.metrics.get("resumed_from_step").copied(),
+            Some(4.0),
+            "the record has to say the run did not start at zero"
+        );
+    }
+
+    /// A checkpoint with no state beside it is still accepted, and the
+    /// run reports itself as starting from zero rather than looking
+    /// like a resume.
+    #[test]
+    fn init_from_without_optimizer_state_is_still_a_warm_start() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "warm",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        let ckpt = tmp.path().join("warm.safetensors");
+        assert!(
+            !crate::train::optstate::sidecar_path(&ckpt).exists(),
+            "save_optimizer_state was off, so nothing should sit beside it"
+        );
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            init_from: Some(ckpt),
+            ..FullFtConfig::default()
+        };
+        let b = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "warm2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        assert_eq!(b.step, 2);
+        assert!(!b.metrics.contains_key("resumed_from_step"));
+    }
+
+    /// Resuming into a total the run has already reached is refused
+    /// rather than answered with a zero-step run and a fresh terminal
+    /// checkpoint.
+    #[test]
+    fn a_resume_past_the_requested_total_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let first = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &first,
+            &loss,
+            tmp.path(),
+            "done",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let second = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            init_from: Some(tmp.path().join("done.safetensors")),
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &second,
+            &loss,
+            tmp.path(),
+            "done2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                TrainError::ResumeBeyondSteps {
+                    resumed: 4,
+                    steps: 4
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// State written by one optimizer is not read into another's slots.
+    #[test]
+    fn a_state_written_by_another_optimizer_is_refused() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let adamw = FullFtConfig {
+            steps: 2,
+            warmup: 0,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &adamw,
+            &loss,
+            tmp.path(),
+            "kind",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+
+        let (_, vm2, model2) = tiny_cfg_and_model();
+        let mut ds2 = overfit_dataset();
+        let lion = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            optimizer: OptimizerKind::Lion,
+            lr: 1e-4,
+            init_from: Some(tmp.path().join("kind.safetensors")),
+            ..FullFtConfig::default()
+        };
+        let err = run_full_ft(
+            &model2,
+            &vm2,
+            &mut ds2,
+            None,
+            &lion,
+            &loss,
+            tmp.path(),
+            "kind2",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err, TrainError::OptState(_)), "{err}");
+    }
+
+    /// A rotated-out checkpoint takes its state file with it.
+    #[test]
+    fn rotation_drops_the_optimizer_state_alongside_the_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let loss = CrossEntropyLoss::new();
+        let (_, vm, model) = tiny_cfg_and_model();
+        let mut ds = overfit_dataset();
+        let cfg = FullFtConfig {
+            steps: 4,
+            warmup: 0,
+            ckpt_every: 1,
+            ckpt_keep: 2,
+            save_optimizer_state: true,
+            ..FullFtConfig::default()
+        };
+        run_full_ft(
+            &model,
+            &vm,
+            &mut ds,
+            None,
+            &cfg,
+            &loss,
+            tmp.path(),
+            "rot",
+            Arc::new(TrainingLease::new()),
+            None,
+        )
+        .unwrap();
+        let sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains("-step") && n.ends_with(".opt.safetensors"))
+            .collect();
+        assert_eq!(
+            sidecars.len(),
+            2,
+            "one per surviving step checkpoint, not one per step: {sidecars:?}"
+        );
+    }
+
+    /// The cap scales the gradient down to exactly `max_norm` and    /// The cap scales the gradient down to exactly `max_norm` and
     /// leaves its direction alone.
     #[test]
     fn clipping_shortens_the_gradient_without_turning_it() {

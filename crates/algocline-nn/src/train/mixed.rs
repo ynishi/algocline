@@ -26,10 +26,14 @@
 //! ships here. BF16 shares FP32's 8-bit exponent, which is why it
 //! trains without a scaler.
 
+use std::collections::HashMap;
+
 use candle_core::backprop::GradStore;
-use candle_core::{DType, Result as CandleResult, Tensor, Var};
+use candle_core::{DType, Result as CandleResult, Tensor, TensorId, Var};
 use candle_nn::optim::Optimizer;
 use candle_nn::ParamsAdamW;
+
+use super::optstate::{param_name, slot_tensor};
 
 /// Per-parameter optimizer state: the live low-precision `Var` plus
 /// its FP32 master / moment tensors.
@@ -143,6 +147,69 @@ impl MixedAdamW {
     pub fn params(&self) -> &ParamsAdamW {
         &self.params
     }
+
+    /// Steps applied so far. The bias corrections read it, so a resume
+    /// that restored the moments but not this would apply a correction
+    /// for step 1 to moments that are hundreds of steps old.
+    pub fn step_count(&self) -> usize {
+        self.step_t
+    }
+
+    /// Write every slot's master and moments into `out`, keyed
+    /// `<parameter name>.{master,m,v}`.
+    ///
+    /// # Errors
+    ///
+    /// When a parameter the optimizer holds is absent from `names` —
+    /// its state would have no name to be stored under, and skipping it
+    /// would produce a file that restores into a partly-fresh
+    /// optimizer.
+    pub fn write_state(
+        &self,
+        names: &HashMap<TensorId, String>,
+        out: &mut HashMap<String, Tensor>,
+    ) -> Result<(), String> {
+        for slot in &self.slots {
+            let name = param_name(names, slot.var.as_tensor().id())?;
+            out.insert(format!("{name}.master"), slot.master.clone());
+            out.insert(format!("{name}.m"), slot.first_moment.clone());
+            out.insert(format!("{name}.v"), slot.second_moment.clone());
+        }
+        Ok(())
+    }
+
+    /// Read the slots back out of a loaded state, and set the step
+    /// count the bias corrections read.
+    ///
+    /// All or nothing: the first slot that is missing or shaped wrong
+    /// ends the restore with an error and the optimizer is left
+    /// untouched, because a half-restored optimizer trains and reports
+    /// a loss exactly like a working one.
+    pub fn read_state(
+        &mut self,
+        names: &HashMap<TensorId, String>,
+        src: &HashMap<String, Tensor>,
+        step: usize,
+    ) -> Result<(), String> {
+        // Built to completion before anything is written, so a refusal
+        // leaves the live optimizer as it was.
+        let mut staged = Vec::with_capacity(self.slots.len());
+        for slot in &self.slots {
+            let name = param_name(names, slot.var.as_tensor().id())?;
+            staged.push((
+                slot_tensor(src, name, "master", &slot.master)?,
+                slot_tensor(src, name, "m", &slot.first_moment)?,
+                slot_tensor(src, name, "v", &slot.second_moment)?,
+            ));
+        }
+        for (slot, (master, m, v)) in self.slots.iter_mut().zip(staged) {
+            slot.master = master;
+            slot.first_moment = m;
+            slot.second_moment = v;
+        }
+        self.step_t = step;
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for MixedAdamW {
@@ -205,7 +272,105 @@ mod tests {
         }
     }
 
-    /// BF16 parameters keep their dtype, and repeated small updates
+    /// A restored optimizer takes the same next step the original would
+    /// have. This is the whole claim behind saving the state: without
+    /// the moments and the step count, the step after a restart is the
+    /// step of a fresh run.
+    #[test]
+    fn a_restored_optimizer_continues_the_step_the_original_would_have_taken() {
+        use candle_nn::VarMap;
+
+        let dev = Device::Cpu;
+        let params = ParamsAdamW {
+            lr: 0.05,
+            weight_decay: 0.1,
+            ..Default::default()
+        };
+        let target = Tensor::new(&[0.0f32, 0.0, 0.0, 0.0], &dev).unwrap();
+        let init = vec![0.5f32, -1.25, 2.0, 0.03125];
+
+        // One optimizer runs five steps and keeps going; the other runs
+        // the same five, is saved, and is replaced by a fresh optimizer
+        // that reads the state back.
+        let vm_a = VarMap::new();
+        let _ = vm_a
+            .get(4, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var_a = vm_a.data().lock().unwrap()["w"].clone();
+        var_a
+            .set(&Tensor::new(init.clone(), &dev).unwrap())
+            .unwrap();
+
+        let vm_b = VarMap::new();
+        let _ = vm_b
+            .get(4, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var_b = vm_b.data().lock().unwrap()["w"].clone();
+        var_b.set(&Tensor::new(init, &dev).unwrap()).unwrap();
+
+        let mut a = MixedAdamW::new(vec![var_a.clone()], params.clone()).unwrap();
+        let mut b = MixedAdamW::new(vec![var_b.clone()], params.clone()).unwrap();
+        for _ in 0..5 {
+            a.step(&quadratic_grad(&var_a, &target).unwrap()).unwrap();
+            b.step(&quadratic_grad(&var_b, &target).unwrap()).unwrap();
+        }
+
+        let names = crate::train::optstate::names_by_tensor_id(&vm_b);
+        let mut tensors = HashMap::new();
+        b.write_state(&names, &mut tensors).unwrap();
+        let saved_step = b.step_count();
+        assert_eq!(saved_step, 5);
+        drop(b);
+
+        let mut restored = MixedAdamW::new(vec![var_b.clone()], params).unwrap();
+        restored.read_state(&names, &tensors, saved_step).unwrap();
+
+        a.step(&quadratic_grad(&var_a, &target).unwrap()).unwrap();
+        restored
+            .step(&quadratic_grad(&var_b, &target).unwrap())
+            .unwrap();
+
+        let after_a: Vec<f32> = var_a.as_tensor().to_vec1().unwrap();
+        let after_b: Vec<f32> = var_b.as_tensor().to_vec1().unwrap();
+        for (i, (x, y)) in after_a.iter().zip(after_b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-7,
+                "element {i}: uninterrupted={x} restored={y}"
+            );
+        }
+    }
+
+    /// A state that does not cover every parameter is refused, and the
+    /// optimizer it was read into is left as it was.
+    #[test]
+    fn an_incomplete_state_is_refused_and_changes_nothing() {
+        use candle_nn::VarMap;
+
+        let dev = Device::Cpu;
+        let vm = VarMap::new();
+        let _ = vm
+            .get(2, "w", candle_nn::Init::Const(0.0), DType::F32, &dev)
+            .unwrap();
+        let var = vm.data().lock().unwrap()["w"].clone();
+        var.set(&Tensor::new(&[1.0f32, 2.0], &dev).unwrap())
+            .unwrap();
+        let mut opt = MixedAdamW::new(vec![var.clone()], ParamsAdamW::default()).unwrap();
+        let target = Tensor::zeros(2, DType::F32, &dev).unwrap();
+        opt.step(&quadratic_grad(&var, &target).unwrap()).unwrap();
+        let before: Vec<f32> = opt.slots[0].first_moment.to_vec1().unwrap();
+
+        let names = crate::train::optstate::names_by_tensor_id(&vm);
+        let mut partial = HashMap::new();
+        opt.write_state(&names, &mut partial).unwrap();
+        partial.remove("w.v");
+
+        let err = opt.read_state(&names, &partial, 1).unwrap_err();
+        assert!(err.contains("w.v"), "message: {err}");
+        let after: Vec<f32> = opt.slots[0].first_moment.to_vec1().unwrap();
+        assert_eq!(before, after, "a refused restore must not have written");
+    }
+
+    /// BF16 parameters keep their dtype, and repeated small updates    /// BF16 parameters keep their dtype, and repeated small updates
     /// accumulate through the FP32 master instead of rounding away at
     /// BF16 precision.
     #[test]

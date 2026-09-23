@@ -8756,9 +8756,17 @@ mod loss_mask_from_card_tests {
         let mut ds = handle.inner_lock().expect("lock");
         let batch = ds.next_batch().expect("next_batch").expect("batch");
 
-        // Invariant: identical token ids, mask-free legacy path.
+        // Invariant: identical token ids, and no *response* mask — the
+        // undeclared card scores the whole row rather than its answer
+        // region. The mask that is here covers the padding behind the
+        // row (`DatasetOpts::mask_pad`), which every dataset path
+        // attaches and which says nothing about prompt versus response.
         assert_eq!(batch.input_ids, masked_ids);
-        assert!(batch.loss_mask.is_none());
+        assert_eq!(
+            batch.loss_mask,
+            Some(vec![vec![1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0]]),
+            "the four tokens the row held are scored and the filler behind them is not"
+        );
     }
 
     #[test]

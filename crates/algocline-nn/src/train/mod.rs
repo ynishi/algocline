@@ -34,6 +34,7 @@ pub mod data;
 pub mod lion;
 pub mod loss;
 pub mod mixed;
+pub mod optstate;
 pub mod scheduler;
 
 #[path = "loop.rs"]

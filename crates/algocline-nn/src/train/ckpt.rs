@@ -230,6 +230,14 @@ impl CheckpointStore {
             if !name.starts_with(&step_prefix) || !name.ends_with(".safetensors") {
                 continue;
             }
+            // A `<checkpoint>.opt.safetensors` sidecar shares both the
+            // prefix and the extension, and it is not a checkpoint.
+            // Counted here it would fill the rotation window and push
+            // live checkpoints out to make room for the state of
+            // checkpoints that had already gone.
+            if name.ends_with(crate::train::optstate::OPT_SIDECAR_SUFFIX) {
+                continue;
+            }
             let mtime = entry.metadata()?.modified().unwrap_or(UNIX_EPOCH);
             entries.push((path, mtime));
         }
@@ -255,6 +263,16 @@ impl CheckpointStore {
         let drop_count = rotating.len() - self.keep;
         for path in rotating.into_iter().take(drop_count) {
             fs::remove_file(&path)?;
+            // The optimizer-state sidecar belongs to the checkpoint it
+            // sits beside and is useless without it, so it leaves with
+            // it. Absent on runs that did not ask for one, which is why
+            // a missing file is not an error here.
+            let sidecar = crate::train::optstate::sidecar_path(&path);
+            match fs::remove_file(&sidecar) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
         Ok(())
     }

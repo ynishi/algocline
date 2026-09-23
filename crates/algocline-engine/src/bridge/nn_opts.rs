@@ -587,6 +587,13 @@ fn apply_optional_overrides(
     if let Some(v) = opts.get::<Option<usize>>("ckpt_keep")? {
         cfg.ckpt_keep = v;
     }
+    // Whether each checkpoint gets an optimizer-state sidecar, which
+    // is what makes a later `init_from` a resume rather than a warm
+    // start. Off by default — the state is about three times the
+    // parameters again.
+    if let Some(v) = opts.get::<Option<bool>>("save_optimizer_state")? {
+        cfg.save_optimizer_state = v;
+    }
     // Global-norm gradient cap. Absent means uncapped; the loop
     // refuses a value that cannot cap anything.
     if let Some(v) = opts.get::<Option<f64>>("clip_grad_norm")? {

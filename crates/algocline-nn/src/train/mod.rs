@@ -167,8 +167,9 @@ pub trait AllowedForward {
 }
 
 pub use ckpt::{
-    checkpoint_from_path, restore_into, restore_into_partial, ApplyStage, Candidate,
-    CheckpointStore, MetricPoint, RestoreError, RestoreReport, TensorMismatch,
+    checkpoint_from_path, identity_sidecar_path, read_bundle_header, restore_into,
+    restore_into_partial, ApplyStage, BundleIdentity, Candidate, CheckpointStore, MetricPoint,
+    RestoreError, RestoreReport, TensorMismatch, BUNDLE_FORMAT,
 };
 // The types carry their noun and are re-exported; `interleave` /
 // `interleave_labelled` do not, and `train::interleave` would read as

@@ -30,7 +30,8 @@ use candle_nn::{Module, Optimizer, ParamsAdamW, VarMap};
 use crate::arch::{AllowedSets, Checkpointable, CondIndex, LoraConfig, LoraWrappable};
 use crate::train::checkpointing::checkpointed_step;
 use crate::train::ckpt::{
-    checkpoint_from_path, restore_into, Candidate, CheckpointStore, MetricPoint, RestoreError,
+    checkpoint_from_path, restore_into, BundleIdentity, Candidate, CheckpointStore, MetricPoint,
+    RestoreError,
 };
 use crate::train::data::{Batch, Dataset, DatasetError};
 use crate::train::lion::{Lion, ParamsLion};
@@ -364,6 +365,20 @@ pub struct FullFtConfig {
     /// measured before this scaling, so it says what the step actually
     /// produced rather than what the cap allowed through.
     pub clip_grad_norm: Option<f64>,
+    /// What the checkpoints this run writes should say about
+    /// themselves, or `None` (default) to leave them describing
+    /// nothing.
+    ///
+    /// A bare `.safetensors` file carries no architecture, no
+    /// vocabulary and no dtype; everything that identified a bundle
+    /// lived in its Card, which does not travel with the file. With
+    /// this set, every checkpoint carries a header and a `.json`
+    /// sidecar saying what model loads it — see [`BundleIdentity`].
+    ///
+    /// Provenance rather than a hyperparameter, and it sits here
+    /// because the loop has no other way to learn it: a `VarMap` does
+    /// not say what architecture registered it.
+    pub bundle_identity: Option<BundleIdentity>,
     /// Recompute each block's activations during the backward pass
     /// instead of keeping them from the forward.
     ///
@@ -499,6 +514,7 @@ impl Default for FullFtConfig {
             eps: 1e-8,
             ckpt_every: 0,
             ckpt_keep: 3,
+            bundle_identity: None,
             grad_checkpoint: false,
             metrics_every: 0,
             early_stop: None,
@@ -1496,6 +1512,9 @@ fn run_ft_core(
     // terminal `<prefix>.safetensors` file through it.
     let mut ckpt_store = CheckpointStore::new(ckpt_dir, ckpt_prefix.to_string(), cfg.ckpt_keep)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
+    if let Some(identity) = cfg.bundle_identity.clone() {
+        ckpt_store = ckpt_store.with_identity(identity);
+    }
 
     let device = device.clone();
     let mut last_train_loss = f32::NAN;
@@ -1668,7 +1687,7 @@ fn run_ft_core(
                 "early stop: the held-out loss stopped improving"
             );
             let final_path = ckpt_store
-                .save_final(save_vm)
+                .save_final(save_vm, step + 1)
                 .map_err(|e| TrainError::Ckpt(e.to_string()))?;
             save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
             let mut metrics: HashMap<String, f32> = HashMap::new();
@@ -1740,7 +1759,7 @@ fn run_ft_core(
                         // early stop from a full-run save without
                         // walking `step` against `cfg.steps`.
                         let final_path = ckpt_store
-                            .save_final(save_vm)
+                            .save_final(save_vm, step + 1)
                             .map_err(|e| TrainError::Ckpt(e.to_string()))?;
                         save_optimizer_state(&opt, &names, cfg, &final_path, step + 1)?;
                         let mut metrics: HashMap<String, f32> = HashMap::new();
@@ -1771,7 +1790,7 @@ fn run_ft_core(
 
     // Terminal save under the stable `<prefix>.safetensors` filename.
     let final_path = ckpt_store
-        .save_final(save_vm)
+        .save_final(save_vm, cfg.steps)
         .map_err(|e| TrainError::Ckpt(e.to_string()))?;
     save_optimizer_state(&opt, &names, cfg, &final_path, cfg.steps)?;
 

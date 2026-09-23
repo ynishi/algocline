@@ -102,8 +102,8 @@ use algocline_nn::card::{
     bundle_ref_for, CardId, NnCustomBranch, NnLoraBranch, NnModelCard, TrainingPath,
 };
 use algocline_nn::train::{
-    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, CrossEntropyLoss,
-    Dataset, DistillLossKind, DistillSpec, TrainingLease,
+    run_allowed_ft, run_conditioned_ft, run_distill, run_full_ft, run_lora_ft, BundleIdentity,
+    CrossEntropyLoss, Dataset, DistillLossKind, DistillSpec, TrainingLease,
 };
 use mlua::prelude::*;
 
@@ -684,6 +684,22 @@ fn run_full_ft_impl(
     // would only offer the caller a way to disagree with the model.
     let channel = trained_channel(custom.as_ref());
     let (device_str, dtype_str) = candle_branch_device_dtype_of(&handle);
+
+    // 8.5. What the checkpoints will say about themselves. The handle
+    //      is the only place these four facts live together, and a
+    //      `.safetensors` file carries none of them unless they are
+    //      written in — see `BundleIdentity`.
+    let mut train_cfg = train_cfg;
+    train_cfg.bundle_identity = Some(BundleIdentity {
+        architecture: architecture.clone(),
+        vocab: handle.vocab(),
+        ctx: handle.ctx(),
+        // The handle always reports one; the `Option` is the Card
+        // schema's, where a pretrained bundle may not have said.
+        dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
+        run: Some(card_id.to_string()),
+    });
+    let train_cfg = train_cfg;
 
     // 9. Fresh per-call TrainingLease (design §0, matches
     //    run_lora_ft_impl step 9).
@@ -1549,6 +1565,48 @@ mod run_ft_bridge_tests {
             "warmup": 0,
             "schedule": "CosineWithWarmup",
         })
+    }
+
+    /// A bundle written by the trainer says what it is: the header and
+    /// the sidecar carry the architecture, vocabulary, context window,
+    /// dtype and the Card that produced it. Without them a copied
+    /// checkpoint is a bag of tensors and the only description lives in
+    /// a card store that does not travel with it.
+    #[test]
+    fn run_full_ft_writes_a_bundle_that_identifies_itself() {
+        let (_tmp, store, nn_dir, base, lua) = setup_gpt2_scaffold();
+        let ds_ud = make_dataset_handle(&lua, overfit_row(), 20);
+        let base_ud = lua.create_userdata(NnHandle::Gpt2(base)).unwrap();
+
+        let opts = opts_table(&lua, base_full_ft_opts());
+        let (card_id, _candidates) = run_full_ft_impl(
+            &store,
+            &nn_dir,
+            &lua,
+            &LuaValue::UserData(base_ud),
+            &LuaValue::UserData(ds_ud),
+            opts,
+        )
+        .expect("run_full_ft");
+
+        let bundle = nn_dir.join(format!("{card_id}.safetensors"));
+        let header = algocline_nn::train::read_bundle_header(&bundle)
+            .expect("readable")
+            .expect("the trainer writes a header");
+        assert_eq!(
+            header.get("architecture").map(String::as_str),
+            Some("gpt2-tiny")
+        );
+        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
+        assert_eq!(header.get("dtype").map(String::as_str), Some("f32"));
+        assert_eq!(
+            header.get("run").map(String::as_str),
+            Some(card_id.as_str())
+        );
+        assert_eq!(header.get("step").map(String::as_str), Some("3"));
+
+        let sidecar = algocline_nn::train::identity_sidecar_path(&bundle);
+        assert!(sidecar.exists(), "and a sidecar beside it");
     }
 
     /// A second dataset under `opts.val_dataset` is scored every

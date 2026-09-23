@@ -5798,6 +5798,16 @@ impl NnHandle {
     /// Thin delegate to [`HandleMeta::arch_family_variant`], which
     /// documents the two storage conventions this normalises between.
     #[allow(dead_code)]
+    /// Vocabulary size the handle was built at.
+    pub(super) fn vocab(&self) -> usize {
+        self.meta().vocab
+    }
+
+    /// Context window the handle was built at.
+    pub(super) fn ctx(&self) -> usize {
+        self.meta().ctx
+    }
+
     pub(super) fn arch_family_variant(&self) -> String {
         self.meta().arch_family_variant()
     }

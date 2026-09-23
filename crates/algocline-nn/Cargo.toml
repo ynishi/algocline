@@ -85,6 +85,9 @@ rand = { workspace = true }
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "dfa-build", "unicode"] }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+# safetensors — for the `__metadata__` header candle's `save` omits.
+# Same version candle links, so the two agree on the format.
+safetensors = { workspace = true }
 
 [dev-dependencies]
 # tempfile — used by the ckpt / training-loop unit tests to sandbox

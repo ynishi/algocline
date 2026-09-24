@@ -1,0 +1,8 @@
+# The toolchain CI and local checks both build with. CI installs exactly
+# this (see .github/workflows/ci.yml), so a new stable release cannot fail
+# CI through a lint the local toolchain does not have yet. Bump it on
+# purpose, together with whatever the new clippy asks for.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

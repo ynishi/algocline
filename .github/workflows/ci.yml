@@ -15,7 +15,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the pinned Rust toolchain
+        # Installs what rust-toolchain.toml names (channel + components), so
+        # CI builds with the same compiler and clippy as local checks. A new
+        # stable release no longer changes the result until the file is bumped.
+        run: |
+          rustup toolchain install
+          rustup show active-toolchain
+          cargo clippy --version
 
       - uses: Swatinem/rust-cache@v2
 

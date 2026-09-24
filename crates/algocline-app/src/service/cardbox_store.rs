@@ -53,8 +53,8 @@
 //!
 //! # Which cardbox this needs
 //!
-//! **One that has `started_ms` / `ended_ms`**, which the published 0.1.2
-//! predates (the version string alone does not tell the two apart).
+//! **0.1.3 or newer.** 0.1.3 is the release that adds `started_ms` /
+//! `ended_ms`.
 //! `created_at` is the run's own time, and that is what cardbox's
 //! `started_ms` is: `open --started-at` sets it, `get` returns it, and
 //! `compat find` matches a `created_at` predicate or sort key against it
@@ -75,10 +75,10 @@
 //! # Stated gaps
 //!
 //! Places where this backend is honestly not the file backend. Each is a
-//! property of cardbox 0.1.2, not an omission here.
+//! property of cardbox 0.1.3, not an omission here.
 //!
 //! * **An `append`ed `review` / `caveats` cannot be read back.** It is
-//!   recorded as an eval, and cardbox 0.1.2 has no read verb that
+//!   recorded as an eval, and cardbox 0.1.3 has no read verb that
 //!   returns eval payloads — `get` reports only a count, surfaced here
 //!   as `cardbox.evals`. (`export` writes the whole store's event log to
 //!   a file, and the payload is in there, but that is a store-level

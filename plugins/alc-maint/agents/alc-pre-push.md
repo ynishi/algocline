@@ -55,11 +55,21 @@ The caller (main thread) provides:
 - optional `recipes`: an ordered list of recipe names (e.g.
   `["fmt-check", "lua-fmt-check", "clippy"]`), required when
   `mode: custom`, ignored otherwise
+- optional `test_scope`: one of
+  - `workspace` (default) — run `test` as defined (`cargo test
+    --workspace`), the same command CI runs
+  - `per-crate` — run `test-each` in place of `test`, wherever `test`
+    appears in the resolved list (from `full` or from `recipes`). Same
+    tests, but one crate's test binaries are linked at a time; use it on
+    a host where a workspace-wide link runs out of memory. The report
+    names the step `test-each`, so the substitution is visible
 
 ## Process
 
-1. **Preflight** — Read `justfile` and confirm the requested recipes
-   exist (grep for `^<name>:` at column 0). If a requested recipe is
+1. **Preflight** — Resolve the recipe list from `mode` / `recipes`,
+   then apply `test_scope` (replace `test` with `test-each` when it is
+   `per-crate`). Read `justfile` and confirm every resolved recipe
+   exists (grep for `^<name>:` at column 0). If a requested recipe is
    missing, report `VERDICT: BLOCKED` immediately with
    `reason: recipe <name> not defined in justfile` and stop — do not
    guess a synonym.
@@ -89,6 +99,8 @@ The caller (main thread) provides:
      re-run"
    - `test` → "N test(s) failed; see tail for panics and re-run
      `cargo test --test <name>` locally"
+   - `test-each` → "the tail's `test-each: failed in:` line names the
+     crate(s); re-run `cargo test -p <crate>` locally"
    - `check-invariants` → "an Inv-N failure means a service-layer or
      engine-crate boundary broke; consult `justfile` §check-invariants
      comment for the whitelist"
@@ -102,7 +114,7 @@ The caller (main thread) provides:
 A single report block returned to the main thread:
 
 ```
-### Pre-Push Check (mode: <mode>)
+### Pre-Push Check (mode: <mode>, test_scope: <test_scope>)
 
 VERDICT: PASS | BLOCKED
 
@@ -160,4 +172,7 @@ exit 0. A single BLOCKED step ⇒ top-level BLOCKED.
 - **`test` recipe boundary**. `test` invokes the full workspace test
   suite (unit + integration + e2e) and can take several minutes plus
   network egress (e2e tests spawn the `alc` binary). Use `mode: quick`
-  when the caller only wants a fast fmt/clippy sanity check.
+  when the caller only wants a fast fmt/clippy sanity check, and
+  `test_scope: per-crate` when the host cannot link the whole workspace
+  at once. `per-crate` changes how the tests are linked, not which tests
+  run.

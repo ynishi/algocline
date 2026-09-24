@@ -1297,6 +1297,29 @@ generated sequence follows either source depends on the models and the
 states they reach; `beta` weights one step's distribution and the rest
 is measured.
 
+**`beta` weights the row, not the choice a constrained sampler makes.**
+Drawing from a mixed row through `alc.nn.constraint.allow_list` renormalises
+over the allowed ids, and that division re-weights the mixture by how much
+mass each source put on the allowed set: the distribution actually sampled
+is the mixture at `β' = β·Z_a / (β·Z_a + (1-β)·Z_b)`, where `Z_x` is source
+`x`'s mass on those ids. `β' = β` only when the two sources agree on how
+much of their mass the constraint keeps. Sampling temperature moves the row
+too, and not symmetrically — `p^(1/t)` for `t < 1` lifts the peaks, so the
+sharper of the two sources gains.
+
+Taking the highest-ranked allowed id instead is unaffected by both. Dividing
+by a constant and raising to a positive power are monotone, so neither
+changes the order the ids are in; a gated-greedy decode reads `beta` as
+given. A caller calibrating `beta` as a dial should fix the decode path
+first and calibrate against that path, because the two paths do not carry
+`beta` the same way.
+
+Measured over a 12-cell sweep on a pair of small sequence models under an
+allow-list constraint (16 generated sequences per cell): `beta` = 0.25 /
+0.5 / 0.75 was sampled as an effective 0.38 / 0.58 / 0.63 — the span
+compressed to about half — and the compression held across temperatures
+0.5 to 1.5, while the gated-greedy share tracked `beta` over the same cells.
+
 ```lua
 local one = model_a:generate_session(prompt)
 local other = model_b:generate_session(prompt)

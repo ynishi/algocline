@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `docs/lua-stdlib.md` now states what a constrained sampler does to `alc.nn.logits.mix`'s `beta`. Drawing a mixed row through `alc.nn.constraint.allow_list` renormalises over the allowed ids, so what is sampled is the mixture at `β' = β·Z_a / (β·Z_a + (1-β)·Z_b)`, where `Z_x` is each source's mass on the allowed set — `beta` itself only when the two sources keep the same share. Temperature moves it too, towards the sharper source for `t < 1`. Taking the highest-ranked allowed id is invariant to both. Measured on a pair of small sequence models, `beta` 0.25 / 0.5 / 0.75 was sampled as 0.38 / 0.58 / 0.63 while the gated-greedy share tracked `beta`. Behaviour is unchanged.
+
 ### Security
 
 ## [0.50.0] - 2026-09-24

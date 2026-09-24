@@ -240,6 +240,23 @@ check-invariants:
         echo "Inv-5 FAILED: crates/algocline-nn names a specific game (see the file:line above)" >&2
         fail=1
     fi
+    # Inv-6: tests never run alc over the developer's ~/.algocline.
+    # tests/common is the one place the alc binary is started: it drops every
+    # inherited ALC_* and roots the child at a tempdir home. A test that
+    # starts the binary itself would inherit the real home — and with it a
+    # config.toml that can switch the Card backend under the test, and a real
+    # store the test then writes into. Reading HOME to reach ~/.algocline
+    # (e.g. installing from the developer's packages) is the same leak from
+    # the other side. `dirs::home_dir()` stays allowed: it only redacts the
+    # path out of test output.
+    if grep -rnE 'CARGO_BIN_EXE_alc|target/debug/alc' tests/ | grep -v '^tests/common/'; then
+        echo "Inv-6 FAILED: a test starts the alc binary outside tests/common (use common::spawn_alc / isolated_command)" >&2
+        fail=1
+    fi
+    if grep -rnE 'env::var(_os)?\("HOME"\)' tests/; then
+        echo "Inv-6 FAILED: a test reads HOME (use a fixture under tests/fixtures instead)" >&2
+        fail=1
+    fi
     if [ "$fail" -ne 0 ]; then
         exit 1
     fi

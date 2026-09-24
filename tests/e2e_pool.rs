@@ -11,21 +11,18 @@
 //! Each test uses an isolated `ALC_HOME` temp directory so pool state does not
 //! bleed between tests or affect the developer's `~/.algocline/` installation.
 //!
-//! Tests spawn the `alc` binary (via `CARGO_BIN_EXE_alc` or `target/debug/alc`).
-//! `connect_with_home()` sets `ALC_HOME` env so pool registry and socket files
-//! land under the temp dir.
+//! Tests start the `alc` binary through `tests/common` (`spawn_alc`), which
+//! points `ALC_HOME` at the temp dir so pool registry and socket files land
+//! under it, and drops every `ALC_*` the test process inherited.
 
 use std::borrow::Cow;
 
-use rmcp::{model::CallToolRequestParams, transport::TokioChildProcess, ServiceExt};
+use rmcp::model::CallToolRequestParams;
 use serde_json::{json, Value};
 
-// ─── Helpers ─────────────────────────────────────────────────────
+mod common;
 
-fn alc_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")))
-}
+// ─── Helpers ─────────────────────────────────────────────────────
 
 fn call_params(name: &str, args: Value) -> CallToolRequestParams {
     let arguments = match args {
@@ -51,15 +48,8 @@ fn extract_text(result: &rmcp::model::CallToolResult) -> &str {
 ///
 /// Setting ALC_HOME scopes all algocline state (pool registry, packages, cards)
 /// under the temp directory, isolating tests from the developer's installation.
-async fn connect_with_home(
-    alc_home: &std::path::Path,
-) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let mut cmd = tokio::process::Command::new(alc_bin());
-    cmd.env("ALC_HOME", alc_home);
-    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
-    ().serve(transport)
-        .await
-        .expect("failed to initialize MCP session")
+async fn connect_with_home(alc_home: &std::path::Path) -> common::AlcClient {
+    common::spawn_alc(alc_home, &[]).await
 }
 
 /// Create a short-path tempdir suitable for pool worker Unix domain socket paths.

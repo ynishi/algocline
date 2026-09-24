@@ -1,6 +1,6 @@
 ---
 source: tests/e2e.rs
-assertion_line: 301
+assertion_line: 275
 expression: redacted
 ---
 {
@@ -42,7 +42,7 @@ expression: redacted
       "source": "ALC_PACKAGES_PATH"
     },
     {
-      "path": "<HOME>/.algocline/packages",
+      "path": "<ALC_HOME>/packages",
       "source": "default"
     }
   ],

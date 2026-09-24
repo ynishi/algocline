@@ -48,6 +48,26 @@ install:
 test:
     cargo test --workspace
 
+# Run each workspace member's tests, one crate at a time. Same tests as
+# `test`, but only one crate's test binaries are linked at a time — for a
+# host where a workspace-wide link runs out of memory. Every crate runs
+# even after a failure, and the recipe fails if any of them did.
+[group('allow-agent')]
+test-each:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    members=$(cargo metadata --no-deps --format-version 1 \
+        | jq -r '.workspace_members[] as $id | .packages[] | select(.id == $id) | .name')
+    failed=()
+    for p in $members; do
+        echo "== cargo test -p $p"
+        cargo test -p "$p" || failed+=("$p")
+    done
+    if [ ${#failed[@]} -gt 0 ]; then
+        echo "test-each: failed in: ${failed[*]}" >&2
+        exit 1
+    fi
+
 # Run tests matching a pattern
 [group('allow-agent')]
 filter PATTERN:

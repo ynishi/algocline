@@ -316,12 +316,12 @@ check-agent-index:
 # Generate LLM-facing docs (llms.txt / llms-full.txt) under docs/aidoc/
 [group('allow-agent')]
 aidoc-gen:
-    cargo aidoc
+    cargo aidoc --title algocline
 
 # CI drift + lint gate (exit 2 on drift, --strict promotes lint warnings to errors)
 [group('allow-agent')]
 aidoc-check:
-    cargo aidoc --check --strict
+    cargo aidoc --title algocline --check --strict
 
 # ─── Codegen ────────────────────────────────────────────────────
 

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.50.0] - 2026-09-24
+
+### Added
+
 - **Training can now hold rows out and score them.** `opts.eval_every` plus `opts.val_dataset` on `alc.nn.trainer.run_full_ft` evaluate the held-out set every N optimizer steps, and the reading reaches `on_ckpt`'s `info.val_loss`, the returned checkpoint record, the Card's `metrics.val_loss` and `metrics.min_val_loss`. `Checkpoint::val_loss` has been a field since the record type existed and both call sites passed `None`, so every keep decision a hook made was made on `train_loss` — which falls whether the model is learning the task or the corpus, and from inside the training set the two are indistinguishable. Either half of the pair without the other is refused rather than run: a period with no set never evaluates, and a set with no period is a slice held out of training that nothing reads. The held-out batches are drained once and re-scored at each boundary, so the sequence of values is a curve over fixed rows rather than a walk through different ones — `Dataset` is a one-pass stream with no rewind. Evaluation goes through the same forward path, side-channel checks, F32 cast, allowed-id mask and loss as a training step (one shared `forward_loss`), because two numbers that get compared have to be the same measurement. `TokenizedDataset::split_off_holdout` cuts the tail off an in-memory dataset, refusing an empty side, a positional side channel, or a split after iteration has begun. Passing the training dataset as its own holdout is refused — the number it would produce is a training loss under another name — and so is `opts.val_dataset` on `run_lora_ft` / `run_distill`, which reach no entry point that scores one: a key read and dropped there leaves the run unvalidated while its caller believes otherwise. (#13)
 - **`opts.clip_grad_norm` caps the joint L2 norm of the gradient before each optimizer step**, scaling every trainable parameter's gradient by `max_norm / norm` when it is over — global-norm, so the direction is untouched and only the length changes. There was no clipping anywhere in the crate; one outlier batch produced a step that landed outside the region the loss was measured in, and the run either came back worse or left with non-finite weights. Only the optimizer's own variables are scaled: a `GradStore` from `backward()` also holds gradients for intermediate tensors, and measuring against those would cap by a norm no step uses. A non-finite norm is left unscaled, and `info.grad_norm` still reports the norm as measured rather than what the cap allowed through. Zero or negative is refused at the loop entry — both produce a run that reports steps and a loss while moving nowhere or backwards. (#13)
 - **`opts.save_optimizer_state` makes `init_from` a resume instead of a warm start.** A checkpoint was `varmap.save()` and nothing else, so AdamW's moments, Lion's momentum and the step count died with the process and `init_from` restored weights into a zeroed optimizer: with the bias corrections reading step 0, the updates right after a restart are the updates of a fresh run, the loss curve bends, and nothing in the record says why. The state now goes to a `<checkpoint>.opt.safetensors` sidecar — a sidecar because it is roughly three times the parameters again for AdamW and is of no use to anything but a resume of that run, while the checkpoint is what every inference path loads. With it in place the moments and step come back, the schedule continues from that step, `steps` reads as the total the run is working towards, and `metrics.resumed_from_step` records where it picked up; without it `init_from` is the warm start it always was and says so through `tracing`. Restores are all-or-nothing, and state written by a different optimizer is refused rather than read into slots where it means something else. Not resumed: the data order, which a one-pass dataset has no position to restore. Off by default. (#13)

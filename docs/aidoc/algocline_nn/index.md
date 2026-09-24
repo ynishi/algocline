@@ -1,4 +1,4 @@
-# algocline-nn 0.49.0
+# algocline-nn 0.50.0
 
 algocline-nn — thin candle wrapper for the `alc.nn` Lua surface.
 

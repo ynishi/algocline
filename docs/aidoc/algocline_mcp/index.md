@@ -1,4 +1,4 @@
-# algocline-mcp 0.49.0
+# algocline-mcp 0.50.0
 
 MCP (Model Context Protocol) server layer.
 

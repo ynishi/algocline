@@ -1,4 +1,4 @@
-# algocline-engine 0.49.0
+# algocline-engine 0.50.0
 
 Lua strategy execution engine.
 

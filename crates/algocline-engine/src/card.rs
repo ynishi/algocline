@@ -279,7 +279,7 @@ fn stable_json_into(v: &Json, buf: &mut String) {
 }
 
 /// Derive the short name segment of a `card_id` (e.g. "claude-opus-4-6"
-/// -> "opus46", "coding_orch" -> "codingorch").
+/// -> "opus46", "code_review" -> "codereview").
 ///
 /// Takes whichever string names what ran — a `run.flow` when the Card
 /// has one, otherwise a `model.id` — and reduces it to ASCII
@@ -458,7 +458,7 @@ pub enum RunStatus {
 ///   (`skip_serializing_if`).
 ///
 /// `flow` names **what ran**: the orchestrator, driver or pipeline that
-/// produced this Card (`coding_orch`, `flow_design`). It is not a model.
+/// produced this Card (`code_review`, `nightly_eval`). It is not a model.
 /// `model.id` stays reserved for an actual model identifier
 /// (`claude-opus-4-6`, `cyankiwi/Qwen3.8-27B-AWQ-INT4`).
 ///
@@ -3769,7 +3769,7 @@ mod tests {
     /// [`short_name`] sanitizes.
     #[test]
     fn run_section_round_trips_with_flow() {
-        for flow in ["coding_orch", "flow_design", "team/pipeline"] {
+        for flow in ["code_review", "nightly_eval", "team/pipeline"] {
             let input = json!({ "run": { "status": "succeeded", "flow": flow } });
             let section = RunSection::from_json(&input)
                 .unwrap_or_else(|e| panic!("flow '{flow}' should parse: {e}"))
@@ -4161,8 +4161,8 @@ name = "{pkg}"
         assert_eq!(short_name("gpt-4o"), "4o");
         assert_eq!(short_name(""), "model");
         // A flow name reaches the same helper.
-        assert_eq!(short_name("coding_orch"), "codingorch");
-        assert_eq!(short_name("flow_design"), "flowdesign");
+        assert_eq!(short_name("code_review"), "codereview");
+        assert_eq!(short_name("nightly_eval"), "nightlyeval");
     }
 
     /// Regression guard for `[run].flow`: a Card that does not set
@@ -4210,7 +4210,7 @@ name = "{pkg}"
             "created_by": "test",
             "pkg": { "name": pkg },
             "model": { "id": "claude-opus-4-6" },
-            "run": { "status": "succeeded", "flow": "coding_orch" },
+            "run": { "status": "succeeded", "flow": "code_review" },
         });
         let expected_hash = hash6(&stable_json(&input));
 
@@ -4218,8 +4218,8 @@ name = "{pkg}"
         let tail = id.strip_prefix(&format!("{pkg}_")).unwrap();
         let parts: Vec<&str> = tail.split('_').collect();
         assert_eq!(parts.len(), 3, "unexpected card_id shape: {id}");
-        assert_eq!(parts[0], "codingorch", "flow must win over model.id");
-        assert_eq!(id, format!("{pkg}_codingorch_{}_{expected_hash}", parts[1]));
+        assert_eq!(parts[0], "codereview", "flow must win over model.id");
+        assert_eq!(id, format!("{pkg}_codereview_{}_{expected_hash}", parts[1]));
     }
 
     /// A flow whose characters cannot appear in a file name is reduced
@@ -4647,7 +4647,7 @@ name = "{pkg}"
         let pkg = "find_order_flow_pkg";
         for (suffix, flow) in [
             ("a", Some("saas_scan")),
-            ("b", Some("coding_orch")),
+            ("b", Some("code_review")),
             ("c", None),
         ] {
             let mut input = json!({
@@ -4676,7 +4676,7 @@ name = "{pkg}"
         .unwrap();
         assert_eq!(
             flows_of(&rows),
-            vec![None, Some("coding_orch".into()), Some("saas_scan".into())]
+            vec![None, Some("code_review".into()), Some("saas_scan".into())]
         );
 
         let rows = find_with_store(
@@ -4690,7 +4690,7 @@ name = "{pkg}"
         .unwrap();
         assert_eq!(
             flows_of(&rows),
-            vec![Some("saas_scan".into()), Some("coding_orch".into()), None]
+            vec![Some("saas_scan".into()), Some("code_review".into()), None]
         );
 
         // Full path: a `where` clause forces the full-TOML load, where
@@ -4707,7 +4707,7 @@ name = "{pkg}"
         .unwrap();
         assert_eq!(
             flows_of(&rows),
-            vec![Some("coding_orch".into()), Some("saas_scan".into()), None]
+            vec![Some("code_review".into()), Some("saas_scan".into()), None]
         );
 
         // And the path filters, which is the query the whole field
@@ -4716,13 +4716,13 @@ name = "{pkg}"
             &store,
             FindQuery {
                 pkg: Some(pkg.to_string()),
-                where_: Some(where_from(json!({ "run": { "flow": "coding_orch" } }))),
+                where_: Some(where_from(json!({ "run": { "flow": "code_review" } }))),
                 ..Default::default()
             },
         )
         .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].flow.as_deref(), Some("coding_orch"));
+        assert_eq!(rows[0].flow.as_deref(), Some("code_review"));
     }
 
     #[test]

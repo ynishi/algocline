@@ -2932,7 +2932,7 @@ per-run outcome data to a Card without leaving the primary
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
 | `status` | string enum | yes (when `run` is present) | One of `"succeeded"`, `"failed"`, `"skipped"`. Unrecognized values raise a Lua error before the write. |
-| `flow` | string | no | **What ran**: the orchestrator / driver / pipeline that produced this Card (`"coding_orch"`, `"flow_design"`). Distinct from `model.id`, which is reserved for an actual model identifier. Also names the Card — see below. |
+| `flow` | string | no | **What ran**: the orchestrator / driver / pipeline that produced this Card (`"code_review"`, `"nightly_eval"`). Distinct from `model.id`, which is reserved for an actual model identifier. Also names the Card — see below. |
 | `reason` | string | no | Free-text explanation. Passed through to the LLM prompt when this Card is later injected via `card_context` (see `alc.llm`), so newlines are stripped there for template safety. |
 | `action` | string | no | Free-form tag for the action tried (e.g. `"write"`, `"read"`, `"refine"`). |
 
@@ -2948,13 +2948,13 @@ Card's name — `alc.card.create` mints `card_id` as
 `{pkg}_{short name}_{timestamp}_{hash}` — so a strategy that wanted its
 orchestrator visible in the id had exactly one field to put it in.
 **`flow` now feeds that name segment in `model.id`'s stead whenever it
-is present**, so a Card produced by `coding_orch` on Opus is named for
+is present**, so a Card produced by `code_review` on Opus is named for
 the flow *and* records the model honestly. A Card that sets no `flow`
 mints exactly the id it always did.
 
 `flow` is not name-validated: it is a data field, and the one place it
 reaches a name is that segment, which is reduced to ASCII
-alphanumerics (`"flow_design"` → `flowdesign`) exactly as a model id
+alphanumerics (`"nightly_eval"` → `nightlyeval`) exactly as a model id
 containing `/` already is.
 
 `run.flow` is a sortable and filterable dotted path like any other, so
@@ -2962,7 +2962,7 @@ containing `/` already is.
 
 ```lua
 alc.card.find({
-    where = { run = { flow = "coding_orch" } },
+    where = { run = { flow = "code_review" } },
     order_by = "-created_at",
 })
 ```
@@ -2999,7 +2999,7 @@ alc.card.create({
     stats = { pass_rate = 0.75 },
     run = {
         status = "failed",
-        flow = "coding_orch",
+        flow = "code_review",
         reason = "grader returned rating < 3",
         action = "write",
     },
@@ -3007,10 +3007,10 @@ alc.card.create({
 -- With [setting.card].run = true: writes a Card whose TOML carries
 --   [run]
 --   status = "failed"
---   flow = "coding_orch"
+--   flow = "code_review"
 --   reason = "grader returned rating < 3"
 --   action = "write"
--- ...and whose card_id reads cot_codingorch_<ts>_<hash>.
+-- ...and whose card_id reads cot_codereview_<ts>_<hash>.
 -- With [setting.card].run absent or false: returns nil, no write.
 ```
 
@@ -3086,7 +3086,7 @@ local o = alc.card.open({
     pkg = { name = "cot" },
     model = { id = "claude-opus-4-6" },
     params = { temperature = 0.0 },
-    run = { flow = "coding_orch" },
+    run = { flow = "code_review" },
 })
 -- o.card_id, o.path  — nil when [setting.card].run is off
 ```

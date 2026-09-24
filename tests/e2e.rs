@@ -9629,7 +9629,11 @@ async fn test_nn_mixing_refusals_reach_the_wire() {
 /// caller guessing.
 #[tokio::test]
 async fn test_alc_card_open_errors_on_backend_without_lifecycle() {
-    let client = connect().await;
+    // An isolated ALC_HOME, so the developer's own config.toml cannot
+    // select a backend that does implement the lifecycle (and cannot be
+    // written to).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
 
     let outcome = client
         .call_tool(call_params(
@@ -9663,7 +9667,11 @@ async fn test_alc_card_open_errors_on_backend_without_lifecycle() {
 /// the file backend implements neither half.
 #[tokio::test]
 async fn test_alc_card_close_errors_on_backend_without_lifecycle() {
-    let client = connect().await;
+    // An isolated ALC_HOME, so the developer's own config.toml cannot
+    // select a backend that does implement the lifecycle (and cannot be
+    // written to).
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let client = connect_with_alc_home(tmp.path()).await;
 
     let outcome = client
         .call_tool(call_params(

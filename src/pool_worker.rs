@@ -674,11 +674,11 @@ fn resolve_lib_paths() -> Vec<PathBuf> {
         }
     }
 
-    if let Some(home) = dirs::home_dir() {
-        let packages = home.join(".algocline").join("packages");
-        if packages.is_dir() {
-            paths.push(packages);
-        }
+    // `$ALC_HOME/packages`, else `~/.algocline/packages` — the server's own
+    // resolution, so a worker searches where its server installs.
+    let packages = algocline_app::AppConfig::resolve_app_dir().packages_dir();
+    if packages.is_dir() {
+        paths.push(packages);
     }
 
     paths

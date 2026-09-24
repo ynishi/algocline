@@ -141,7 +141,11 @@ impl AppConfig {
     /// 2. `~/.algocline/` — home-based default.
     /// 3. `./.algocline/` — fallback when `HOME` is unavailable; matches
     ///    the sandbox-friendly fallback used for log directories.
-    fn resolve_app_dir() -> AppDir {
+    ///
+    /// Public so the `alc` binary's own startup and `init` paths (type
+    /// stubs, bundled packages, the config template) land where the server
+    /// reads them from, rather than resolving `~/.algocline` a second way.
+    pub fn resolve_app_dir() -> AppDir {
         if let Ok(path) = std::env::var("ALC_HOME") {
             if !path.is_empty() {
                 return AppDir::new(PathBuf::from(path));

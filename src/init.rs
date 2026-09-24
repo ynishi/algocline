@@ -19,6 +19,7 @@
 //!   alc init --dev       — Force local source (development)
 //!   alc update           — Alias for `alc init --force`
 
+use algocline_app::AppConfig;
 use anyhow::Context;
 use std::path::{Path, PathBuf};
 
@@ -49,16 +50,16 @@ const BUNDLED_SOURCES: &[BundledSource] = &[
     },
 ];
 
+// The app root is resolved by `AppConfig` (`$ALC_HOME`, else
+// `~/.algocline`), the same way the server resolves it, so what `init` and
+// startup write is what the server later reads.
+
 fn packages_dir() -> anyhow::Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    Ok(home.join(".algocline").join("packages"))
+    Ok(AppConfig::resolve_app_dir().packages_dir())
 }
 
 fn types_dir() -> anyhow::Result<PathBuf> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    Ok(home.join(".algocline").join("types"))
+    Ok(AppConfig::resolve_app_dir().types_dir())
 }
 
 /// Comment-only template written to `~/.algocline/config.toml` on first `alc init`.
@@ -122,21 +123,17 @@ fn print_luarc_guidance(types_path: &Path) {
     );
 }
 
-/// Write `~/.algocline/config.toml` from [`CONFIG_TOML_TEMPLATE`] if absent.
+/// Write `{app root}/config.toml` from [`CONFIG_TOML_TEMPLATE`] if absent.
 ///
 /// This is the public entrypoint used by [`finalize_init`]. It locates the
-/// user's home directory via `dirs::home_dir` and delegates to
-/// [`ensure_config_toml_template_at`].
+/// app root through `AppConfig` (`$ALC_HOME`, else `~/.algocline`) and
+/// delegates to [`ensure_config_toml_template_at`].
 ///
 /// # Errors
 ///
-/// Returns an error if the home directory cannot be determined or if the
-/// underlying file-system write fails.
+/// Returns an error if the underlying file-system write fails.
 fn ensure_config_toml_template() -> anyhow::Result<()> {
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?;
-    let path = home.join(".algocline").join("config.toml");
-    ensure_config_toml_template_at(&path)
+    ensure_config_toml_template_at(&AppConfig::resolve_app_dir().config_toml())
 }
 
 /// Write `CONFIG_TOML_TEMPLATE` to `path` unless the file already exists.

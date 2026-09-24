@@ -142,12 +142,11 @@ fn resolve_lib_paths() -> Vec<algocline_app::SearchPath> {
         }
     }
 
-    // 2. ~/.algocline/packages/ (installed packages)
-    if let Some(home) = dirs::home_dir() {
-        let packages = home.join(".algocline").join("packages");
-        if packages.is_dir() {
-            paths.push(SearchPath::default_global(packages));
-        }
+    // 2. {app root}/packages/ (installed packages) — `$ALC_HOME`, else
+    //    `~/.algocline`, resolved the same way the server resolves it.
+    let packages = AppConfig::resolve_app_dir().packages_dir();
+    if packages.is_dir() {
+        paths.push(SearchPath::default_global(packages));
     }
 
     paths

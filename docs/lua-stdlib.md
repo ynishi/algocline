@@ -3093,6 +3093,14 @@ therefore round-trips as `skipped` and stays distinguishable in a
 `where` on `run.status` — it is never silently folded into
 `succeeded`.
 
+`created_at` on the cardbox backend is the run's start time, cardbox's
+`started_ms`, so `get`, `list` / `find` rows and a `where` / `order_by`
+on `created_at` all read the same column as Cards brought in by
+cardbox's `tools/import_v0.py`. It must be ISO 8601 in UTC (`2026-09-01T00:00:00Z`),
+a `where` on it needs a full timestamp rather than a date, and it is
+compared as a time, so `contains` / `starts_with` on it are refused.
+Left out, it is the time the Card was opened.
+
 Gated by `[setting.card].run` together with `close` (see the `[run]`
 section above): with the gate off this returns `nil` without touching
 the store.

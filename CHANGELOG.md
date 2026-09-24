@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING (cardbox backend): `created_at` is cardbox's `started_ms`, not a tag.** The backend wrote a Card's `created_at` to its own tag `created_at` and read it back from there in `get`, in `list` / `find` rows and in a `where` / `order_by` — so Cards brought in by cardbox's `tools/import_v0.py`, which carry the time in `started_ms` and no such tag, came back with no `created_at` and fell outside every `created_at` query that cardbox's own `compat find` answers. `open` / `create` now pass `created_at` as `cardbox open --started-at`; `get` renders `created_at` from `started_ms`; a listing row takes the `created_at` that `compat find` renders from `started_ms`; and a `where` / `order_by` on `created_at` is handed to `compat find`, which matches it against `started_ms`. `get` also reports `started_ms` / `ended_ms` under `cardbox`. Migration: this needs a cardbox that has `started_ms` / `ended_ms`, which the published 0.1.2 predates (a binary without it refuses `--started-at`, and its version string can still read 0.1.2); a `created_at` must be ISO 8601 in UTC, a `where` on it needs a full timestamp (`2026-09-01T00:00:00Z`, not `2026-09-01`), and `contains` / `starts_with` on it are refused. A Card written through the cardbox backend by 0.50.0 keeps its old tag, which is no longer read: for one opened as its run started, `started_ms` agrees with it to the second; for one written after the fact through `create` / `import`, `started_ms` is the write time.
+
 ### Deprecated
 
 ### Removed

@@ -1558,6 +1558,115 @@ local merged_id = alc.nn.card.merge_lora(wrapped, {
 local h = alc.nn.card.load_handle(merged_id)
 ```
 
+#### `alc.nn.card.export(card_id, out_dir, opts?) -> { dir, tensor_sha256, files }`
+
+Write a Card out in the vocabulary the rest of the ecosystem reads. A
+Card lives in a card store that does not travel with the weights; each
+outside reader looks in its own place — the Hugging Face Hub reads a
+model card's YAML front matter, GGUF runtimes read `general.*`, and a
+safetensors reader has `__metadata__`, whose only shared key is
+`format`. This writes all of them from one mapping:
+
+```
+out_dir/
+  README.md           model card: YAML front matter + Markdown body
+  config.json         the shape, for algocline's loader
+  model.safetensors   the weights + __metadata__
+  model.gguf          only when opts.gguf is given
+```
+
+The Card is resolved the way `alc.nn.card.load_handle` resolves it —
+`bundle_ref` check, arch dispatch, bundle on disk and the channel check
+included — and then loaded, before anything is written, so a Card that
+does not load does not export. That includes the Card's recorded
+device and dtype: **the export needs the Card to be loadable on this
+host**, exactly as `load_handle` does (a Card trained with
+`device = "cuda"` does not export on a machine without CUDA).
+
+**Parameters:**
+
+| name | type | required | notes |
+|------|------|----------|-------|
+| card_id | string | yes | a `full_ft` / `merged` / `distillation` Card |
+| out_dir | string | yes | created if missing |
+| opts.license | string | no | SPDX id. The Card has no license field, so this is the only source. Control characters are refused |
+| opts.gguf | table | no | `{ precision, tokenizer }` — the same values as `handle:export_gguf`; unknown keys are refused |
+
+**Returns** `{ dir, tensor_sha256, files = { readme, config, safetensors, gguf? } }`.
+
+**Mapping.**
+
+| Card | README YAML | GGUF | safetensors `__metadata__` |
+|---|---|---|---|
+| `training_path` `full_ft` / `lora` / `merged` | `base_model_relation` `finetune` / `adapter` / `merge` | — | `alc.training_path` |
+| `training_path` `distillation` | not written; stated in the body | — | `alc.training_path` |
+| `lineage.parent`, a Hub repo id | `base_model` | `general.base_model.count` + `.0.name` / `.0.organization` / `.0.repo_url` | `alc.lineage.parent` |
+| `lineage.parent`, anything else | body only | — | `alc.lineage.parent` |
+| `lineage.training_data`, a Hub dataset id | `datasets` | `general.dataset.count` + `.0.*` | `alc.lineage.training_data` |
+| `lineage.teacher` / `.tokenizer` | body | — | `alc.lineage.teacher` / `.tokenizer` |
+| `name` | body title | `general.name` | — |
+| `architecture` | body | `general.architecture` (the writer's own) | `alc.architecture` |
+| `hyperparams` / `metrics` | body | — | `alc.hyperparams` / `alc.metrics` (JSON strings) |
+| card id | body | — | `alc.card_id` |
+| `opts.license` | `license` | `general.license` | — |
+| fixed | `tags: [algocline, candle]` | `general.tags` | `format = "pt"`, `alc.schema = "1"`, `alc.kind = "export"`, `alc.producer` |
+| computed | body: the definition | — | `alc.tensor_sha256` |
+
+`base_model_relation` is written only when `base_model` is. A value is a
+**Hub repo id** when it is exactly `org/name`, at most 96 characters in
+all, where each segment is non-empty, uses only `[A-Za-z0-9._-]`,
+neither starts nor ends with `-` or `.`, and contains neither `--` nor
+`..` — and it is not one of algocline's own reference forms: a Card id
+has no `/`, and `cards/<id>` and `nn/<stem>` are excluded by prefix.
+That is a check of form, not of existence. `alc.config` holds the
+`config.json` text.
+
+`alc.schema` and `alc.kind` together say which key set the rest of the
+header follows: `alc.kind = "export"` here, `"checkpoint"` in a bundle
+the trainer wrote (`BundleIdentity`).
+
+**`alc.tensor_sha256`** is the lowercase hex SHA-256 of the data section
+of `model.safetensors` — every byte after the header. That is the range
+ModelSpec's `hash_sha256` covers, without its `0x` prefix. It is **not**
+the Hub's LFS `sha256`, which covers the whole file, header included.
+The header is written in a fixed order (metadata keys sorted, tensors by
+offset), so two exports of one Card give byte-identical files.
+
+Not written: `library_name` (candle is not a registered Hub library),
+`pipeline_tag` (a Card's `task` is free-form), `model-index` (metrics go
+in the body), `general.uuid`, and `model_type` / `architectures` in
+`config.json` — the export does not claim `transformers` compatibility.
+
+**Errors:**
+
+- `alc.nn.card.export: card '...' not found`.
+- `alc.nn.card.export: card '...' has training_path="lora"; its bundle is a LoRA delta, not a model — merge it first with alc.nn.card.merge_lora(...)` — a LoRA Card has no model of its own: `run_lora_ft` writes its delta to `<nn_dir>/nn/lora-<card_id>.safetensors`, not to the Card's bundle path.
+- `alc.nn.card.export: unknown gpt2 variant ... (metadata.nn.candle.custom is absent ...)` — a custom-architecture Card without its shape block, e.g. one saved through `alc.nn.card.save`; the loader refuses the same Card.
+- `alc.nn.card.export: card ... is a custom+MoE model ...` — no load path, so no shape to describe.
+- `alc.nn.card.export: card '...' architecture '...' has no self-contained card load, so there is no model to export` (the llama adapter) / `... has no bridge dispatch` (a family with no loader) — the same arch checks `load_handle` runs.
+- `alc.nn.card.export: card '...' does not load on this host: ...` — the load itself failed: the bundle's tensors do not fit the shape the Card names, or the Card's device / dtype is not available here.
+- `alc.nn.card.export: .../README.md already exists; the export does not replace files` — every target is checked before anything is written, and the files are published so that one appearing meanwhile makes the export fail rather than be overwritten (the weights and the GGUF are hard-linked into place, so `out_dir` has to be on a filesystem with hard links).
+- `alc.nn.card.export: opts.<key> is not an export option` — an option it does not read is refused rather than ignored.
+- `alc.nn.card.export: opts.license contains the control character U+....` — a line break or other control character in the license.
+- GGUF refusals as `handle:export_gguf` (unknown precision, a missing tokenizer file, a width a block format cannot take, a custom architecture). The GGUF is written first; if a later step fails, the files the call published are removed.
+
+**Known limitations.**
+
+- When `base_model_relation` is absent the Hub infers a relation, so a
+  distilled model may be shown as a fine-tune. Nothing in the file can
+  prevent that.
+- A `lineage.parent` or `lineage.training_data` that is a local relative
+  path of the form `a/b` (`data/train.jsonl`) cannot be told apart from
+  a Hub repo id, and is written as one (`base_model` / `datasets`).
+
+```lua
+local r = alc.nn.card.export(card_id, "/tmp/export/my-model", {
+    license = "apache-2.0",
+    gguf = { precision = "q8_0", tokenizer = "/path/to/tokenizer.json" },
+})
+print(r.tensor_sha256, r.files.readme)
+```
+
 #### `alc.nn.wrap_lora(base_handle, opts) -> NnHandle`
 
 Layer 5b — wrap a base model in-memory with a fresh LoRA layout and

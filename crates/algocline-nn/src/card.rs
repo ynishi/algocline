@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as Json;
 use thiserror::Error;
 
-use crate::arch::{Gpt2Config, Gpt2Custom, MoeConfig};
+use crate::arch::{Gpt2Config, Gpt2Custom, MoeConfig, TinyLlamaConfig};
 use crate::train::{Checkpoint, FullFtConfig};
 
 /// Content of `[metadata.nn]`.
@@ -186,6 +186,130 @@ impl NnCardMeta {
     pub fn verify_channel_tensors_in_bundle(&self, path: &Path) -> Result<(), ChannelMismatch> {
         let names = bundle_tensor_names(path)?;
         self.verify_channel_tensors(&names)
+    }
+
+    /// Rebuild the [`Gpt2Config`] this Card's bundle was written under.
+    ///
+    /// Two shapes of Card reach here:
+    ///
+    /// - **Named variant** (`"gpt2-medium"` / `"gpt2-tiny"` / ...) —
+    ///   [`Gpt2Config::from_variant`] is the single source of the
+    ///   shape, which is why those Cards record no shape block.
+    /// - **Custom variant** (`"gpt2-custom"`) — the architecture string
+    ///   pins nothing, so the shape comes from `candle.custom`
+    ///   ([`NnCustomBranch`]).
+    ///
+    /// `device` / `dtype` are left at the base config's values: they
+    /// are load-time choices a loader layers on top from `candle`.
+    ///
+    /// The one place these rules live: the engine's `load_handle` and
+    /// the export's `config.json` both call this, so a Card one of them
+    /// refuses the other refuses too.
+    ///
+    /// # Errors
+    ///
+    /// - The architecture is not a known variant and there is no
+    ///   `custom` branch to fall back on (an unknown variant, or a
+    ///   custom-variant Card written before the shape block existed).
+    /// - The `custom` branch carries an MoE block. The bundle's
+    ///   per-block expert Vars have no load path, and rebuilding the
+    ///   config *without* `moe` would hand back a dense-MLP model under
+    ///   the Card's name — a silent architecture swap.
+    /// - The rebuilt config reads none of the optional input channels
+    ///   the Card declares ([`Self::verify_channels_consumed`]).
+    pub fn gpt2_config(&self) -> Result<Gpt2Config, String> {
+        // `Gpt2Config::from_variant` accepts both bare ("medium") and
+        // "gpt2-medium" forms — pass the Card's architecture string
+        // directly.
+        if let Some(cfg) = Gpt2Config::from_variant(&self.architecture) {
+            return self.refuse_dropped_channels(cfg);
+        }
+
+        let Some(branch) = self.candle.as_ref().and_then(|c| c.custom.as_ref()) else {
+            return Err(format!(
+                "unknown gpt2 variant {:?} on card {:?}; if this is a \
+                 custom-variant card it predates custom-shape metadata \
+                 (metadata.nn.candle.custom is absent, so the trained shape cannot be \
+                 recovered — retrain with a current build to make it reloadable)",
+                self.architecture, self.name
+            ));
+        };
+
+        if branch.moe.is_some() {
+            return Err(format!(
+                "card {:?} is a custom+MoE model; MoE safetensors reload \
+                 is not supported yet (the bundle's per-block expert Vars have no load \
+                 path), and loading it as a dense model would silently change the \
+                 architecture — keep using the handle from the session that trained it",
+                self.name
+            ));
+        }
+
+        let cfg = Gpt2Config {
+            vocab: branch.vocab,
+            ctx: branch.ctx,
+            layers: branch.layers,
+            heads: branch.heads,
+            dim: branch.dim,
+            custom: Some(branch.spec.clone()),
+            // Refused above; restated so a future MoE load path has to
+            // revisit this arm rather than inheriting a stale `None`.
+            moe: None,
+            // `eps` is not reachable from the Lua `custom` opts table,
+            // so every custom config was built on the `tiny` base.
+            // Spreading that base keeps the two sides sharing one
+            // epsilon instead of a literal here.
+            ..Gpt2Config::tiny()
+        };
+        // Identical to the declaration by construction on this arm —
+        // the spec above *is* the Card's. Stated anyway so the
+        // guarantee holds per load path rather than per branch.
+        self.refuse_dropped_channels(cfg)
+    }
+
+    /// Rebuild the [`TinyLlamaConfig`] this Card's bundle was written
+    /// under.
+    ///
+    /// # Errors
+    ///
+    /// An architecture that is not a TinyLlama preset, and a Card that
+    /// declares an optional input channel: a TinyLlama config has no
+    /// customization spec, so it reads none whatever its Card says, and
+    /// the table would be left unread rather than refused.
+    pub fn tinyllama_config(&self) -> Result<TinyLlamaConfig, String> {
+        let cfg = TinyLlamaConfig::from_variant(&self.architecture).ok_or_else(|| {
+            format!(
+                "unknown tinyllama variant {:?} on card {:?}",
+                self.architecture, self.name
+            )
+        })?;
+        self.verify_channels_consumed(None).map_err(|e| {
+            format!(
+                "card {:?} names architecture {:?}: {e}",
+                self.name, self.architecture
+            )
+        })?;
+        Ok(cfg)
+    }
+
+    /// Refuse a config that reads none of the optional input channels
+    /// this Card declares.
+    ///
+    /// The bundle comparison ([`Self::verify_channel_tensors_in_bundle`])
+    /// is the wrong pair on its own: what decides whether a channel is
+    /// read is the config the loader builds, and a named variant
+    /// rebuilds its shape from the preset and ignores the shape block
+    /// entirely. No trainer writes that pair, so a Card carrying it was
+    /// hand-edited or written by a foreign pipeline.
+    fn refuse_dropped_channels(&self, cfg: Gpt2Config) -> Result<Gpt2Config, String> {
+        self.verify_channels_consumed(cfg.custom.as_ref())
+            .map_err(|e| {
+                format!(
+                    "card {:?} names architecture {:?}: {e}",
+                    self.name, self.architecture
+                )
+            })?;
+        Ok(cfg)
     }
 }
 

@@ -9,10 +9,15 @@
 //! ```text
 //! alc.nn.card.save(vars, name, meta)               -> card_id
 //! alc.nn.card.save_from_ckpt(path, name, meta)     -> card_id
-//! alc.nn.card.load(card_id)                        -> vars_table
-//! alc.nn.card.load_gpt2(card_id, base)             -> Gpt2Handle (LoRA cards)
+//! alc.nn.card.load_vars(card_id)                   -> vars_table
+//! alc.nn.card.load(card_id)                        -> vars_table (deprecated alias of load_vars)
+//! alc.nn.card.load_handle(card_id)                 -> NnHandle (full_ft / merged / distillation)
+//! alc.nn.card.load_wrap(card_id, base)             -> NnHandle (LoRA cards)
+//! alc.nn.card.load_gpt2(card_id, base)             -> Gpt2Handle (LoRA cards, deprecated)
 //! alc.nn.card.load_ckpt(path, spec)                -> NnHandle (Cardless)
 //! alc.nn.card.register(card_id, model_name)
+//! alc.nn.card.merge_lora(wrapped, opts)            -> merged card_id
+//! alc.nn.card.export(card_id, out_dir, opts?)      -> { dir, tensor_sha256, files }
 //! ```
 //!
 //! Invariants:
@@ -216,6 +221,28 @@ pub(super) fn register_nn_card(
         },
     )?;
     card_ns.set("merge_lora", merge_lora)?;
+
+    // Write a Card out in the vocabulary other tools read: a model card
+    // (README.md), config.json, the weights with a byte-stable header,
+    // and optionally GGUF. Resolves the Card the way `load_handle` does,
+    // so it captures the same store and `nn_dir`.
+    let export_store = Arc::clone(&card_store);
+    let export_nn_dir = nn_dir.clone();
+    let export = lua.create_function(
+        move |lua,
+              (card_id, out_dir, opts): (String, String, Option<LuaTable>)|
+              -> LuaResult<LuaTable> {
+            export_impl(
+                lua,
+                export_store.as_ref(),
+                &export_nn_dir,
+                &card_id,
+                &out_dir,
+                opts.as_ref(),
+            )
+        },
+    )?;
+    card_ns.set("export", export)?;
 
     nn_table.set("card", card_ns)?;
     // `nn_dir` was cloned into each register_* call above; drop the
@@ -505,6 +532,483 @@ fn load_handle_impl(
     })?;
 
     build(&meta, &path)
+}
+
+/// Error prefix for the `alc.nn.card.export` surface.
+const EXPORT_ERR_PREFIX: &str = "alc.nn.card.export";
+
+/// What `alc.nn.card.export` was asked for beyond the Card.
+#[derive(Default)]
+struct ExportOpts {
+    /// SPDX license id for the model card and GGUF. The Card has no
+    /// license field, so this is the only source.
+    license: Option<String>,
+    /// GGUF precision and tokenizer, when a `model.gguf` was asked for.
+    gguf: Option<(candle_core::quantized::GgmlDType, Option<PathBuf>)>,
+}
+
+/// Read `alc.nn.card.export`'s opts.
+///
+/// A key this does not read is refused rather than ignored: `licence`
+/// spelled the British way would otherwise export a model with no
+/// license while its caller believed it had set one.
+fn parse_export_opts(opts: Option<&LuaTable>) -> LuaResult<ExportOpts> {
+    let Some(t) = opts else {
+        return Ok(ExportOpts::default());
+    };
+    refuse_unknown_keys(t, "opts", &["license", "gguf"])?;
+    let license = match t.get::<LuaValue>("license")? {
+        LuaValue::Nil => None,
+        LuaValue::String(s) => {
+            let s = s.to_str()?.to_string();
+            if s.is_empty() {
+                return Err(LuaError::external(format!(
+                    "{EXPORT_ERR_PREFIX}: opts.license is empty; pass an SPDX id or leave it out"
+                )));
+            }
+            // `char::is_control` is Unicode `Cc`: C0, DEL and C1. None of
+            // them belongs in an SPDX id, and a line break would carry
+            // text out of the front matter's `license:` line.
+            if let Some(c) = s.chars().find(|c| c.is_control()) {
+                return Err(LuaError::external(format!(
+                    "{EXPORT_ERR_PREFIX}: opts.license contains the control character \
+                     U+{:04X}; an SPDX license id has none",
+                    c as u32
+                )));
+            }
+            Some(s)
+        }
+        other => {
+            return Err(LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: opts.license must be a string, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    let gguf = match t.get::<LuaValue>("gguf")? {
+        LuaValue::Nil => None,
+        LuaValue::Table(g) => {
+            refuse_unknown_keys(&g, "opts.gguf", &["precision", "tokenizer"])?;
+            Some(super::nn_gen::parse_gguf_opts(EXPORT_ERR_PREFIX, Some(&g))?)
+        }
+        other => {
+            return Err(LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: opts.gguf must be a table {{ precision, tokenizer }}, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    Ok(ExportOpts { license, gguf })
+}
+
+/// Refuse a key of `t` outside `known`.
+fn refuse_unknown_keys(t: &LuaTable, what: &str, known: &[&str]) -> LuaResult<()> {
+    for pair in t.pairs::<LuaValue, LuaValue>() {
+        let (key, _) = pair?;
+        let name = match &key {
+            LuaValue::String(s) => s.to_str()?.to_string(),
+            other => format!("<{}>", other.type_name()),
+        };
+        if !known.contains(&name.as_str()) {
+            return Err(LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: {what}.{name} is not an export option (expected one of: {})",
+                known.join(" / ")
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The bundle's tensors as a `VarMap`, under the names they were saved
+/// with.
+///
+/// What a handle from `load_handle` does not have: its weights sit
+/// behind an mmap-backed builder with no `VarMap`, which is why
+/// `handle:export_gguf` refuses such a handle. The bundle is this
+/// crate's own `VarMap` dump, so its names are the ones the GGUF naming
+/// map is written against.
+fn varmap_from_bundle(path: &std::path::Path) -> LuaResult<VarMap> {
+    let tensors = candle_core::safetensors::load(path, &Device::Cpu).map_err(|e| {
+        LuaError::external(format!("{EXPORT_ERR_PREFIX}: read {}: {e}", path.display()))
+    })?;
+    let varmap = VarMap::new();
+    {
+        let mut data = varmap.data().lock().map_err(|_| {
+            LuaError::external(format!("{EXPORT_ERR_PREFIX}: VarMap lock poisoned"))
+        })?;
+        for (name, tensor) in tensors {
+            let var = candle_core::Var::from_tensor(&tensor)
+                .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {name}: {e}")))?;
+            data.insert(name, var);
+        }
+    }
+    Ok(varmap)
+}
+
+/// `Ok` when nothing is at `path`; an error naming it otherwise.
+fn refuse_existing(path: &std::path::Path) -> LuaResult<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Err(LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: {} already exists; the export does not replace files — \
+             choose another out_dir or remove it",
+            path.display()
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: stat {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
+/// Write `text` to `path`, refusing a file that is already there.
+fn write_new(path: &std::path::Path, text: &str) -> LuaResult<()> {
+    use std::io::Write;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|e| {
+            LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: create {}: {e}",
+                path.display()
+            ))
+        })?;
+    if let Err(e) = file
+        .write_all(text.as_bytes())
+        .and_then(|()| file.sync_all())
+    {
+        drop(file);
+        // Created by this call a moment ago (`create_new`), so the
+        // partial file is ours to remove.
+        let cleanup = match std::fs::remove_file(path) {
+            Ok(()) => String::new(),
+            Err(r) => format!("; the partial file could not be removed: {r}"),
+        };
+        return Err(LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: write {}: {e}{cleanup}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// `alc.nn.card.export(card_id, out_dir, opts?)` — write a Card out in
+/// the vocabulary other tools read.
+///
+/// ```text
+/// out_dir/
+///   README.md           model card: YAML front matter + body
+///   config.json         shape, for algocline's loader
+///   model.safetensors   weights + __metadata__ (format = "pt", alc.*)
+///   model.gguf          only when opts.gguf is given
+/// ```
+///
+/// The Card is resolved as [`load_handle_impl`] resolves it — id,
+/// store, `metadata.nn`, the `bundle_ref` check, the arch dispatch, the
+/// bundle on disk, the channel check — and then **loaded**, through the
+/// same `build_from_safetensors` the loader calls, before any file is
+/// written: the shape the Card names is checked against the bundle's
+/// tensors, and its recorded device / dtype against this host. A Card
+/// that does not load here does not export. The handle is dropped
+/// again before the GGUF path reads the weights, so that path holds at
+/// most two copies of them at once (the tensors and their quantized
+/// output), as `handle:export_gguf` does. The mapping onto each reader's keys is
+/// [`algocline_nn::export::CardExport`]; the weights are rewritten by
+/// [`algocline_nn::export::rewrite_with_metadata`], which records the
+/// data section's SHA-256 as `alc.tensor_sha256`.
+///
+/// # LoRA Cards are refused
+///
+/// A `training_path = "lora"` Card has no model of its own to export.
+/// `alc.nn.trainer.run_lora_ft` writes no `<nn_dir>/<card_id>.safetensors`
+/// at all — its delta goes to `<nn_dir>/nn/lora-<card_id>.safetensors`
+/// and the Card points at it through `candle.lora.delta_path` — and a
+/// LoRA Card saved through `alc.nn.card.save` holds whatever tensors the
+/// caller handed it. Neither is a full model; the only load path for a
+/// LoRA Card, `load_wrap`, needs a base handle. The refusal points at
+/// `alc.nn.card.merge_lora`, whose merged Card exports.
+///
+/// # Files
+///
+/// `out_dir` is created if missing. Every target is checked before
+/// anything is written, and no file is ever replaced: the weights and
+/// the GGUF are written to a temporary file and published with
+/// [`algocline_nn::export::publish_new`] (a hard link, which fails
+/// rather than overwrites), and `config.json` / `README.md` are created
+/// with `create_new`. A file that appears in `out_dir` while the export
+/// runs therefore makes it fail, not lose that file. The GGUF is
+/// written first, because its refusals (a width a block format cannot
+/// take, a custom architecture) come from the weights; if a later step
+/// fails, the files this call published are removed and the error says
+/// whether that removal succeeded.
+///
+/// Returns `{ dir, tensor_sha256, files = { readme, config,
+/// safetensors, gguf? } }`.
+fn export_impl(
+    lua: &Lua,
+    store: &dyn CardBackend,
+    nn_dir: &std::path::Path,
+    card_id: &str,
+    out_dir: &str,
+    opts: Option<&LuaTable>,
+) -> LuaResult<LuaTable> {
+    let card_id = CardId::parse(card_id)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+    let card = store
+        .get(card_id.as_str())
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?
+        .ok_or_else(|| {
+            LuaError::external(format!("{EXPORT_ERR_PREFIX}: card '{card_id}' not found"))
+        })?;
+    let meta = extract_nn_card_meta(EXPORT_ERR_PREFIX, card_id.as_str(), &card)?;
+
+    match meta.training_path.as_str() {
+        "full_ft" | "merged" | "distillation" => {}
+        "lora" => {
+            return Err(LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: card '{card_id}' has training_path=\"lora\"; its bundle \
+                 is a LoRA delta, not a model — merge it first with \
+                 `alc.nn.card.merge_lora(alc.nn.card.load_wrap(card_id, base), {{ name, \
+                 lora_card = card_id }})` and export the merged Card"
+            )));
+        }
+        other => {
+            let msg = match validate_training_path(other) {
+                Err(e) => e,
+                Ok(()) => format!("training_path {other:?} has no export route"),
+            };
+            return Err(LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: card '{card_id}': {msg}"
+            )));
+        }
+    }
+    assert_bundle_ref_matches(EXPORT_ERR_PREFIX, &card_id, &meta)?;
+    let ops = resolve_arch_ops(&meta.architecture).ok_or_else(|| {
+        LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: card '{card_id}' architecture {:?} \
+             has no bridge dispatch (expected one of {})",
+            meta.architecture,
+            registered_arch_names().join(" / ")
+        ))
+    })?;
+    let build = ops.build_from_safetensors.ok_or_else(|| {
+        LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: card '{card_id}' architecture {:?} \
+             has no self-contained card load, so there is no model to export",
+            meta.architecture
+        ))
+    })?;
+    let bundle = nn_dir.join(format!("{card_id}.safetensors"));
+    if !bundle.exists() {
+        return Err(LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: bundle missing at {bundle:?} for card '{card_id}'"
+        )));
+    }
+    meta.verify_channel_tensors_in_bundle(&bundle)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: card '{card_id}': {e}")))?;
+
+    let opts = parse_export_opts(opts)?;
+    let producer = algocline_nn::train::producer();
+    let export = algocline_nn::export::CardExport {
+        card_id: card_id.as_str(),
+        meta: &meta,
+        license: opts.license.as_deref(),
+        producer: &producer,
+    };
+    // Everything that can refuse from the Card alone, before any file.
+    let config = export
+        .config_json()
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+    let header = export
+        .safetensors_metadata()
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+
+    // Load it, whatever the options: this is what makes "a Card that
+    // does not load does not export" true rather than approximately
+    // true — the shape against the bundle, the device / dtype guards.
+    // The handle lives only in this scope. What the GGUF path needs from
+    // it is its shape (`gguf_source`, owned values); the handle and the
+    // weights it holds are dropped before the GGUF path loads its own
+    // copy of them.
+    let gguf_source = {
+        let handle = build(&meta, &bundle).map_err(|e| {
+            LuaError::external(format!(
+                "{EXPORT_ERR_PREFIX}: card '{card_id}' does not load on this host: {e}"
+            ))
+        })?;
+        match (&opts.gguf, &handle) {
+            (None, _) => None,
+            (Some(_), NnHandle::Gpt2(h)) => Some(h.gguf_source()),
+            (Some(_), NnHandle::TinyLlama(h)) => Some(h.gguf_source()?),
+            (Some(_), NnHandle::Llama(_)) => {
+                return Err(LuaError::external(format!(
+                    "{EXPORT_ERR_PREFIX}: the llama adapter has no GGUF writer here"
+                )))
+            }
+        }
+    };
+
+    let dir = PathBuf::from(out_dir);
+    let readme_path = dir.join("README.md");
+    let config_path = dir.join("config.json");
+    let weights_path = dir.join("model.safetensors");
+    let gguf_path = opts.gguf.as_ref().map(|_| dir.join("model.gguf"));
+    for target in [&readme_path, &config_path, &weights_path]
+        .into_iter()
+        .chain(gguf_path.as_ref())
+    {
+        refuse_existing(target)?;
+    }
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: create {}: {e}",
+            dir.display()
+        ))
+    })?;
+
+    let mut written: Vec<PathBuf> = Vec::new();
+    let gguf = match (gguf_source, opts.gguf.as_ref(), gguf_path.as_ref()) {
+        (Some(source), Some((precision, tokenizer)), Some(path)) => Some(GgufJob {
+            source,
+            precision: *precision,
+            tokenizer: tokenizer.as_deref(),
+            path,
+        }),
+        _ => None,
+    };
+    let result = write_export(
+        &export,
+        &bundle,
+        &header,
+        &config,
+        gguf,
+        (&readme_path, &config_path, &weights_path),
+        &mut written,
+    );
+    let digest = match result {
+        Ok(digest) => digest,
+        Err(e) => {
+            // Undo what this call published, and say so if that failed
+            // too: a half-written export left in silence looks like a
+            // whole one to the next reader of the directory. `written`
+            // holds only files this call created or linked into place.
+            let mut leftovers = Vec::new();
+            for path in &written {
+                if let Err(r) = std::fs::remove_file(path) {
+                    leftovers.push(format!("{} ({r})", path.display()));
+                }
+            }
+            if leftovers.is_empty() {
+                return Err(e);
+            }
+            return Err(LuaError::external(format!(
+                "{e}; and these files it wrote could not be removed: {}",
+                leftovers.join(", ")
+            )));
+        }
+    };
+
+    let files = lua.create_table()?;
+    files.set("readme", readme_path.to_string_lossy().to_string())?;
+    files.set("config", config_path.to_string_lossy().to_string())?;
+    files.set("safetensors", weights_path.to_string_lossy().to_string())?;
+    if let Some(p) = gguf_path.as_ref() {
+        files.set("gguf", p.to_string_lossy().to_string())?;
+    }
+    let out = lua.create_table()?;
+    out.set("dir", out_dir)?;
+    out.set("tensor_sha256", digest)?;
+    out.set("files", files)?;
+    Ok(out)
+}
+
+/// What the GGUF step of an export needs: the shape read off the loaded
+/// handle, the options, and where the file goes.
+struct GgufJob<'a> {
+    source: super::nn_gen::GgufSource,
+    precision: candle_core::quantized::GgmlDType,
+    tokenizer: Option<&'a std::path::Path>,
+    path: &'a PathBuf,
+}
+
+/// Write the GGUF to a temporary file beside `job.path` and publish it
+/// there without replacing anything.
+///
+/// `handle:export_gguf` writes its path directly and is left as it is;
+/// this is the export's own no-clobber route to the same writer.
+fn write_gguf(
+    export: &algocline_nn::export::CardExport<'_>,
+    bundle: &std::path::Path,
+    job: GgufJob<'_>,
+) -> LuaResult<()> {
+    let mut source = job.source;
+    // The weights come from the bundle: a loaded handle has no `VarMap`
+    // to name them by, and it has already been dropped.
+    source.varmap = Some(Arc::new(varmap_from_bundle(bundle)?));
+    let (spec, varmap) = super::nn_gen::gguf_spec(EXPORT_ERR_PREFIX, source)?;
+    let tmp = algocline_nn::export::temp_path_for(job.path)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+    // The writer creates its file with `File::create`, which would
+    // truncate a file already at the temporary name; that file is not
+    // this call's, so it is refused instead.
+    refuse_existing(&tmp)?;
+    if let Err(e) = algocline_nn::gguf::export_gguf_with_metadata(
+        &varmap,
+        &spec,
+        job.precision,
+        job.tokenizer,
+        &tmp,
+        &export.gguf_metadata(),
+    ) {
+        let cleanup = match std::fs::remove_file(&tmp) {
+            Ok(()) => String::new(),
+            Err(r) if r.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(r) => format!(
+                "; the temporary {} could not be removed: {r}",
+                tmp.display()
+            ),
+        };
+        return Err(LuaError::external(format!(
+            "{EXPORT_ERR_PREFIX}: {e}{cleanup}"
+        )));
+    }
+    algocline_nn::export::publish_new(&tmp, job.path)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))
+}
+
+/// The writing half of [`export_impl`]: GGUF (when asked for), then the
+/// weights, `config.json` and the model card. Every file it publishes
+/// is pushed onto `written` — and only those — so the caller can remove
+/// them if a later one fails. Returns the tensor digest.
+fn write_export(
+    export: &algocline_nn::export::CardExport<'_>,
+    bundle: &std::path::Path,
+    header: &std::collections::BTreeMap<String, String>,
+    config: &str,
+    gguf: Option<GgufJob<'_>>,
+    (readme_path, config_path, weights_path): (&PathBuf, &PathBuf, &PathBuf),
+    written: &mut Vec<PathBuf>,
+) -> LuaResult<String> {
+    if let Some(job) = gguf {
+        let path = job.path.clone();
+        write_gguf(export, bundle, job)?;
+        written.push(path);
+    }
+
+    let digest = algocline_nn::export::rewrite_with_metadata(bundle, weights_path, header)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+    written.push(weights_path.clone());
+
+    write_new(config_path, config)?;
+    written.push(config_path.clone());
+
+    let readme = export
+        .readme(&digest)
+        .map_err(|e| LuaError::external(format!("{EXPORT_ERR_PREFIX}: {e}")))?;
+    write_new(readme_path, &readme)?;
+    written.push(readme_path.clone());
+    Ok(digest)
 }
 
 /// Error prefix for the `alc.nn.card.load_ckpt` surface.
@@ -1979,114 +2483,21 @@ fn preset_llama_neutral(
 
 /// Rebuild the [`Gpt2Config`] a card's bundle was written under.
 ///
-/// Two shapes of card reach here:
-///
-/// - **Named variant** (`"gpt2-medium"` / `"gpt2-tiny"` / ...) —
-///   [`Gpt2Config::from_variant`] is the single source of the shape,
-///   which is why those cards record no shape block.
-/// - **Custom variant** (`"gpt2-custom"`, written by
-///   `alc.nn.preset.gpt2("custom", ...)` plus a
-///   [`super::nn_trainer`] entry point) — the architecture string pins
-///   nothing, so the shape comes from `meta.candle.custom`
-///   ([`NnCustomBranch`], recorded by
-///   [`custom_branch_of_gpt2`]).
+/// The rules live in [`NnCardMeta::gpt2_config`] — named variant from
+/// the preset, custom variant from `meta.candle.custom` (recorded by
+/// [`custom_branch_of_gpt2`]), and the refusals (unknown variant with
+/// no shape block, custom+MoE, a declared channel the rebuilt config
+/// does not read) — so the loader and `alc.nn.card.export`'s
+/// `config.json` refuse the same Cards. This wrapper only puts the
+/// loader's prefix on the message.
 ///
 /// `device` / `dtype` are deliberately left at the base config's
 /// values: they are load-time choices that
 /// [`apply_candle_branch_device_dtype`] layers on top from
 /// `meta.candle`.
-///
-/// # Errors
-///
-/// - The `custom` branch carries an MoE block. The bundle's per-block
-///   expert Vars have no load path ([`Gpt2Model::from_safetensors_file`]
-///   refuses MoE configs), and rebuilding the config *without* `moe`
-///   would hand back a plain dense-MLP model under the card's name —
-///   a silent architecture swap. Refuse loudly instead.
-/// - The architecture is not a known variant and there is no `custom`
-///   branch to fall back on (an unknown variant, or a custom-variant
-///   card written before the shape block existed).
-/// - The rebuilt config reads none of the optional input channels the
-///   card declares — see [`refuse_dropped_channels`].
 fn gpt2_config_for_card(meta: &NnCardMeta) -> LuaResult<Gpt2Config> {
-    // `Gpt2Config::from_variant` accepts both bare ("medium") and
-    // "gpt2-medium" forms — pass the card's architecture string
-    // directly.
-    if let Some(cfg) = Gpt2Config::from_variant(&meta.architecture) {
-        return refuse_dropped_channels(meta, cfg);
-    }
-
-    let Some(branch) = meta.candle.as_ref().and_then(|c| c.custom.as_ref()) else {
-        return Err(LuaError::external(format!(
-            "alc.nn.card.load: unknown gpt2 variant {:?} on card {:?}; if this is a \
-             custom-variant card it predates custom-shape metadata \
-             (metadata.nn.candle.custom is absent, so the trained shape cannot be \
-             recovered — retrain with a current build to make it reloadable)",
-            meta.architecture, meta.name
-        )));
-    };
-
-    if branch.moe.is_some() {
-        return Err(LuaError::external(format!(
-            "alc.nn.card.load: card {:?} is a custom+MoE model; MoE safetensors reload \
-             is not supported yet (the bundle's per-block expert Vars have no load \
-             path), and loading it as a dense model would silently change the \
-             architecture — keep using the handle from the session that trained it",
-            meta.name
-        )));
-    }
-
-    let cfg = Gpt2Config {
-        vocab: branch.vocab,
-        ctx: branch.ctx,
-        layers: branch.layers,
-        heads: branch.heads,
-        dim: branch.dim,
-        custom: Some(branch.spec.clone()),
-        // Refused above; restated so a future MoE load path has to
-        // revisit this arm rather than inheriting a stale `None`.
-        moe: None,
-        // `eps` is not reachable from the Lua `custom` opts table, so
-        // every custom config was built on the `tiny` base (see
-        // `build_custom_gpt2_config`). Spreading that base keeps the
-        // two sides sharing one epsilon instead of a literal here.
-        ..Gpt2Config::tiny()
-    };
-    // Identical to the declaration by construction on this arm — the
-    // spec above *is* the card's. Stated anyway so the guarantee holds
-    // per load path rather than per branch: a future arm that filtered
-    // or rewrote the spec would have to answer for it here.
-    refuse_dropped_channels(meta, cfg)
-}
-
-/// Refuse a config that reads none of the optional input channels the
-/// card declares.
-///
-/// The verification the load surfaces run before this
-/// ([`NnCardMeta::verify_channel_tensors_in_bundle`]) compares the
-/// card with its bundle. That is the wrong pair on its own: what
-/// decides whether a channel is read is the config the loader builds,
-/// and a named variant rebuilds its shape from the preset and ignores
-/// the shape block entirely. A card naming `"gpt2-tiny"` while its
-/// shape block declares `cond_slots` therefore passes the bundle
-/// comparison (declared, and the table is right there) and then builds
-/// a model that never asks for the tensor — the silence the channel
-/// check exists to remove, reached from the config side.
-///
-/// No trainer writes that pair (`run_full_ft` records the architecture
-/// off the handle that carries the channel, which is `gpt2-custom`), so
-/// a card carrying it was hand-edited or written by a foreign pipeline
-/// — the case `assert_bundle_ref_matches` already refuses rather than
-/// guesses at.
-fn refuse_dropped_channels(meta: &NnCardMeta, cfg: Gpt2Config) -> LuaResult<Gpt2Config> {
-    meta.verify_channels_consumed(cfg.custom.as_ref())
-        .map_err(|e| {
-            LuaError::external(format!(
-                "alc.nn.card.load: card {:?} names architecture {:?}: {e}",
-                meta.name, meta.architecture
-            ))
-        })?;
-    Ok(cfg)
+    meta.gpt2_config()
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))
 }
 
 fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
@@ -2124,22 +2535,13 @@ fn gpt2_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult
 }
 
 fn tinyllama_from_safetensors(meta: &NnCardMeta, path: &std::path::Path) -> LuaResult<NnHandle> {
-    let mut cfg = TinyLlamaConfig::from_variant(&meta.architecture).ok_or_else(|| {
-        LuaError::external(format!(
-            "alc.nn.card.load: unknown tinyllama variant {:?} on card {:?}",
-            meta.architecture, meta.name
-        ))
-    })?;
     // A tinyllama config has no customization spec, so it reads no
-    // optional input channel whatever its card says. The same
-    // reasoning as `refuse_dropped_channels`: a card that declares one
-    // here would have its table left unread rather than refused.
-    meta.verify_channels_consumed(None).map_err(|e| {
-        LuaError::external(format!(
-            "alc.nn.card.load: card {:?} names architecture {:?}: {e}",
-            meta.name, meta.architecture
-        ))
-    })?;
+    // optional input channel whatever its card says; the rule and the
+    // unknown-variant refusal live in `NnCardMeta::tinyllama_config`,
+    // shared with `alc.nn.card.export`.
+    let mut cfg = meta
+        .tinyllama_config()
+        .map_err(|e| LuaError::external(format!("alc.nn.card.load: {e}")))?;
     apply_candle_branch_device_dtype("alc.nn.card.load", meta, &mut cfg.device, &mut cfg.dtype)?;
     guard_device_dtype_matrix("alc.nn.card.load", &cfg.device, cfg.dtype)?;
 

@@ -314,7 +314,7 @@ fn run_lora_ft_impl(
         vocab: handle.vocab(),
         ctx: handle.ctx(),
         dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
-        run: Some(lora_card_id.to_string()),
+        card_id: Some(lora_card_id.to_string()),
     });
     let train_cfg = train_cfg;
     // Same "before any lock" rule: reading the custom spec takes the
@@ -732,7 +732,7 @@ fn run_full_ft_impl(
         // The handle always reports one; the `Option` is the Card
         // schema's, where a pretrained bundle may not have said.
         dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
-        run: Some(card_id.to_string()),
+        card_id: Some(card_id.to_string()),
     });
     let train_cfg = train_cfg;
 
@@ -1060,7 +1060,7 @@ fn run_distill_impl(
                 vocab: handle.vocab(),
                 ctx: handle.ctx(),
                 dtype: dtype_str.clone().unwrap_or_else(|| "unknown".into()),
-                run: Some(card_id.to_string()),
+                card_id: Some(card_id.to_string()),
             }),
             ..train_cfg
         },
@@ -1645,17 +1645,23 @@ mod run_ft_bridge_tests {
         let header = algocline_nn::train::read_bundle_header(&bundle)
             .expect("readable")
             .expect("the trainer writes a header");
+        assert_eq!(header.get("format").map(String::as_str), Some("pt"));
+        assert_eq!(header.get("alc.schema").map(String::as_str), Some("1"));
         assert_eq!(
-            header.get("architecture").map(String::as_str),
+            header.get("alc.kind").map(String::as_str),
+            Some("checkpoint")
+        );
+        assert_eq!(
+            header.get("alc.architecture").map(String::as_str),
             Some("gpt2-tiny")
         );
-        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
-        assert_eq!(header.get("dtype").map(String::as_str), Some("f32"));
+        assert_eq!(header.get("alc.vocab").map(String::as_str), Some("64"));
+        assert_eq!(header.get("alc.dtype").map(String::as_str), Some("f32"));
         assert_eq!(
-            header.get("run").map(String::as_str),
+            header.get("alc.card_id").map(String::as_str),
             Some(card_id.as_str())
         );
-        assert_eq!(header.get("step").map(String::as_str), Some("3"));
+        assert_eq!(header.get("alc.step").map(String::as_str), Some("3"));
 
         let sidecar = algocline_nn::train::identity_sidecar_path(&bundle);
         assert!(sidecar.exists(), "and a sidecar beside it");
@@ -1687,13 +1693,14 @@ mod run_ft_bridge_tests {
         let header = algocline_nn::train::read_bundle_header(&bundle)
             .expect("readable")
             .expect("the trainer writes a header");
+        assert_eq!(header.get("alc.schema").map(String::as_str), Some("1"));
         assert_eq!(
-            header.get("architecture").map(String::as_str),
+            header.get("alc.architecture").map(String::as_str),
             Some("gpt2-tiny")
         );
-        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
+        assert_eq!(header.get("alc.vocab").map(String::as_str), Some("64"));
         assert_eq!(
-            header.get("run").map(String::as_str),
+            header.get("alc.card_id").map(String::as_str),
             Some(card_id.as_str())
         );
     }
@@ -1720,12 +1727,13 @@ mod run_ft_bridge_tests {
         let header = algocline_nn::train::read_bundle_header(&bundle)
             .expect("readable")
             .expect("the trainer writes a header");
+        assert_eq!(header.get("alc.schema").map(String::as_str), Some("1"));
         assert_eq!(
-            header.get("architecture").map(String::as_str),
+            header.get("alc.architecture").map(String::as_str),
             Some("gpt2-tiny")
         );
         assert_eq!(
-            header.get("run").map(String::as_str),
+            header.get("alc.card_id").map(String::as_str),
             Some(card_id.as_str())
         );
     }

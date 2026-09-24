@@ -2,11 +2,11 @@
 
 > # algocline — LLM amplification engine
 
-## algocline 0.45.0
+## algocline 0.49.0
 
 - [algocline overview](algocline/index.md): # algocline — LLM amplification engine
 
-## algocline-app 0.45.0
+## algocline-app 0.49.0
 
 - [algocline-app overview](algocline_app/index.md): Service layer sitting between `algocline-engine` and `algocline-mcp`.
 - [algocline-app::pool](algocline_app/pool.md): Process-pool IPC layer for `host_mode=true` execution.
@@ -16,7 +16,7 @@
 - [algocline-app::pool::protocol](algocline_app/pool__protocol.md): Wire protocol messages exchanged between the pool client (MCP
 - [algocline-app::pool::registry](algocline_app/pool__registry.md): Pool registry: persistent session-to-worker mapping.
 
-## algocline-core 0.45.0
+## algocline-core 0.49.0
 
 - [algocline-core overview](algocline_core/index.md): Core domain types and primitives shared across the algocline workspace.
 - [algocline-core::domain](algocline_core/domain.md): Re-exports for domain types.
@@ -34,7 +34,7 @@
 - [algocline-core::pkg](algocline_core/pkg.md): Canonical projection of a Lua package's `M.meta` block.
 - [algocline-core::recent_log](algocline_core/recent_log.md): Per-session recent-log ring buffer.
 
-## algocline-engine 0.45.0
+## algocline-engine 0.49.0
 
 - [algocline-engine overview](algocline_engine/index.md): Lua strategy execution engine.
 - [algocline-engine::bridge](algocline_engine/bridge.md): Layer 0: Runtime Primitives
@@ -44,7 +44,7 @@
 - [algocline-engine::session](algocline_engine/session.md): Session-based Lua execution with pause/resume on alc.llm() calls.
 - [algocline-engine::state](algocline_engine/state.md): Persistent key-value state backed by JSON files.
 
-## algocline-mcp 0.45.0
+## algocline-mcp 0.49.0
 
 - [algocline-mcp overview](algocline_mcp/index.md): MCP (Model Context Protocol) server layer.
 - [algocline-mcp::progress_forwarder](algocline_mcp/progress_forwarder.md): Progress forwarder task for the v2 MCP adapter.
@@ -52,18 +52,41 @@
 - [algocline-mcp::req_registry](algocline_mcp/req_registry.md): `ReqIdRegistry` — wire-layer adapter exclusive mapping from `RequestId` to [`SessionId`].
 - [algocline-mcp::resources](algocline_mcp/resources.md): MCP Resources catalog for algocline.
 
-## algocline-nn 0.45.0
+## algocline-nn 0.49.0
 
 - [algocline-nn overview](algocline_nn/index.md): algocline-nn — thin candle wrapper for the `alc.nn` Lua surface.
 - [algocline-nn::arch](algocline_nn/arch.md): Architecture presets for `alc.nn.preset.*`.
+- [algocline-nn::arch::adapter](algocline_nn/arch__adapter.md): Inference-only adapters over `candle-transformers` model
+- [algocline-nn::arch::adapter::llama](algocline_nn/arch__adapter__llama.md): Llama-family inference adapter over `candle_transformers::models::llama`.
+- [algocline-nn::arch::blockwise](algocline_nn/arch__blockwise.md): Driving a model one block at a time.
+- [algocline-nn::arch::custom](algocline_nn/arch__custom.md): Spec-driven customization points for the GPT-2 stack (Phase 1).
 - [algocline-nn::arch::gpt2](algocline_nn/arch__gpt2.md): GPT-2 architecture builder.
+- [algocline-nn::arch::kv](algocline_nn/arch__kv.md): Keys and values a session has already computed.
 - [algocline-nn::arch::lora](algocline_nn/arch__lora.md): Low-rank adaptation ("LoRA") wrap for a candle-nn `Linear`.
+- [algocline-nn::arch::moe](algocline_nn/arch__moe.md): Dense Mixture-of-Experts feed-forward for the GPT-2 stack.
+- [algocline-nn::arch::seeded](algocline_nn/arch__seeded.md): Parameter initialisation a seed decides.
+- [algocline-nn::arch::tinyllama](algocline_nn/arch__tinyllama.md): TinyLlama-1.1B trainable architecture.
 - [algocline-nn::card](algocline_nn/card.md): Card metadata schema for `alc.nn.card.*`.
+- [algocline-nn::export](algocline_nn/export.md): Exporting a Card in the vocabulary other tools read.
+- [algocline-nn::export::mapping](algocline_nn/export__mapping.md): A Card's fields in the vocabulary other tools read.
+- [algocline-nn::gguf](algocline_nn/gguf.md): Writing a model out as GGUF.
+- [algocline-nn::merged](algocline_nn/merged.md): Merged inference checkpoint export (Layer 4a of GH #10).
+- [algocline-nn::pooling](algocline_nn/pooling.md): One vector for a sequence.
+- [algocline-nn::sampling](algocline_nn/sampling.md): Next-token samplers for the inference path.
+- [algocline-nn::sampling::beam](algocline_nn/sampling__beam.md): Beam search.
+- [algocline-nn::sampling::constraint](algocline_nn/sampling__constraint.md): Layer 2 of the sampler plan: constraints that mask logits before a
+- [algocline-nn::sampling::json_schema](algocline_nn/sampling__json_schema.md): JSON-schema-constrained decoding: a [`Constraint`] that admits only
+- [algocline-nn::sampling::penalty](algocline_nn/sampling__penalty.md): Penalties that read what a generation has already produced.
 - [algocline-nn::tokenizer](algocline_nn/tokenizer.md): HuggingFace `tokenizers` wrap with first-use download cache.
 - [algocline-nn::train](algocline_nn/train.md): Training-side scaffolding.
-- [algocline-nn::train::ckpt](algocline_nn/train__ckpt.md): Rotating safetensors checkpoint writer.
+- [algocline-nn::train::checkpointing](algocline_nn/train__checkpointing.md): The forward and backward of a gradient-checkpointed step.
+- [algocline-nn::train::ckpt](algocline_nn/train__ckpt.md): Rotating safetensors checkpoint writer, and the restore side that
+- [algocline-nn::train::corpus](algocline_nn/train__corpus.md): Corpus files: pre-tokenized training rows on disk.
 - [algocline-nn::train::data](algocline_nn/train__data.md): Dataset iterator abstraction.
+- [algocline-nn::train::lion](algocline_nn/train__lion.md): Lion — the sign-momentum optimizer from *Symbolic Discovery of
 - [algocline-nn::train::loss](algocline_nn/train__loss.md): Loss functions used by the training loop.
+- [algocline-nn::train::mixed](algocline_nn/train__mixed.md): Mixed-precision AdamW (design §7.1: BF16 weights / activations +
+- [algocline-nn::train::optstate](algocline_nn/train__optstate.md): Optimizer state that outlives the run that produced it.
 - [algocline-nn::train::scheduler](algocline_nn/train__scheduler.md): Learning-rate schedules for the training loop.
 - [algocline-nn::train::fullft](algocline_nn/train__fullft.md): Full FT training loop.
 

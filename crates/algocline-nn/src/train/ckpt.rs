@@ -163,8 +163,13 @@ impl CheckpointStore {
             let data = varmap.data().lock().map_err(|_| {
                 candle_core::Error::Msg("checkpoint save: VarMap lock poisoned".into())
             })?;
-            // Ordered, so two saves of one map produce byte-identical
-            // files rather than differing by hash iteration order.
+            // The tensor data section of two saves of one map is
+            // byte-identical: `safetensors` orders the tensors by dtype
+            // and name itself. The header is not — `safetensors` 0.8
+            // serialises `__metadata__` from a `HashMap`, so its key
+            // order can differ between two saves. A byte-stable file is
+            // what `crate::export::rewrite_with_metadata` writes, and
+            // only the export pays for it.
             let tensors: BTreeMap<String, Tensor> = data
                 .iter()
                 .map(|(name, var)| (name.clone(), var.as_tensor().clone()))
@@ -416,6 +421,10 @@ impl CheckpointStore {
 /// Hyperparameters are deliberately absent: they describe the run, the
 /// Card records them, and a reader trying to load these weights does
 /// not need to know the learning rate.
+///
+/// The header speaks the vocabulary `alc.nn.card.export` writes:
+/// `format = "pt"`, the one key safetensors readers share, and
+/// everything of ours under an `alc.` prefix — see [`Self::header`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BundleIdentity {
     /// Architecture and variant, as the preset names it
@@ -429,17 +438,50 @@ pub struct BundleIdentity {
     pub ctx: usize,
     /// Parameter dtype, as candle names it (`"f32"`, `"bf16"`).
     pub dtype: String,
-    /// The run that wrote it — a Card id, conventionally. `None` for a
-    /// run that has no identifier of its own.
-    pub run: Option<String>,
+    /// The Card the run that wrote it records itself under. `None` for
+    /// a run that has no Card id of its own.
+    pub card_id: Option<String>,
 }
 
-/// Metadata key naming the writer, so a reader can tell these files
-/// from anyone else's before trusting the rest of the header.
-const FORMAT_KEY: &str = "format";
+/// The one `__metadata__` key safetensors readers share.
+pub const FORMAT_KEY: &str = "format";
 
-/// Value of [`FORMAT_KEY`] for a bundle this crate wrote.
-pub const BUNDLE_FORMAT: &str = "algocline-nn";
+/// The de-facto value of [`FORMAT_KEY`]: PyTorch's tensor layout,
+/// which is what every file this crate writes holds. It says nothing
+/// about who wrote the file — [`SCHEMA_KEY`] does that.
+pub const FORMAT_PT: &str = "pt";
+
+/// Key whose presence marks a header as algocline's. Everything else
+/// algocline writes into `__metadata__` sits under the same `alc.`
+/// prefix, because outside [`FORMAT_KEY`] the keys are per-producer.
+pub const SCHEMA_KEY: &str = "alc.schema";
+
+/// Value of [`SCHEMA_KEY`] for the key set this version writes.
+pub const BUNDLE_SCHEMA: &str = "1";
+
+/// Key naming which of algocline's files this is. [`SCHEMA_KEY`] says
+/// the version of the vocabulary, this says which key set of it the
+/// rest of the map follows: [`KIND_CHECKPOINT`] for a bundle the
+/// trainer wrote ([`BundleIdentity::header`]), `"export"` for one
+/// `alc.nn.card.export` wrote.
+pub const KIND_KEY: &str = "alc.kind";
+
+/// Value of [`KIND_KEY`] in a trainer checkpoint's header.
+pub const KIND_CHECKPOINT: &str = "checkpoint";
+
+/// Key naming the program that wrote the file ([`producer`]).
+pub const PRODUCER_KEY: &str = "alc.producer";
+
+/// Key holding the architecture preset id.
+pub const ARCHITECTURE_KEY: &str = "alc.architecture";
+
+/// Key holding the Card id the weights belong to.
+pub const CARD_ID_KEY: &str = "alc.card_id";
+
+/// The value written under [`PRODUCER_KEY`]: `algocline <version>`.
+pub fn producer() -> String {
+    format!("algocline {}", env!("CARGO_PKG_VERSION"))
+}
 
 impl BundleIdentity {
     /// The header this identity writes, at `step`.
@@ -450,42 +492,38 @@ impl BundleIdentity {
     /// constraint, not a choice.
     pub fn header(&self, step: usize) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        out.insert(FORMAT_KEY.into(), BUNDLE_FORMAT.into());
-        out.insert(
-            "algocline_version".into(),
-            env!("CARGO_PKG_VERSION").to_string(),
-        );
-        out.insert("architecture".into(), self.architecture.clone());
-        out.insert("vocab".into(), self.vocab.to_string());
-        out.insert("ctx".into(), self.ctx.to_string());
-        out.insert("dtype".into(), self.dtype.clone());
-        out.insert("step".into(), step.to_string());
-        if let Some(run) = self.run.as_ref() {
-            out.insert("run".into(), run.clone());
+        out.insert(FORMAT_KEY.into(), FORMAT_PT.into());
+        out.insert(SCHEMA_KEY.into(), BUNDLE_SCHEMA.into());
+        out.insert(KIND_KEY.into(), KIND_CHECKPOINT.into());
+        out.insert(PRODUCER_KEY.into(), producer());
+        out.insert(ARCHITECTURE_KEY.into(), self.architecture.clone());
+        out.insert("alc.vocab".into(), self.vocab.to_string());
+        out.insert("alc.ctx".into(), self.ctx.to_string());
+        out.insert("alc.dtype".into(), self.dtype.clone());
+        out.insert("alc.step".into(), step.to_string());
+        if let Some(card_id) = self.card_id.as_ref() {
+            out.insert(CARD_ID_KEY.into(), card_id.clone());
         }
         out
     }
 }
 
-/// Read the header a bundle carries.
+/// Read a safetensors file's header: the length it declares and the
+/// JSON it holds.
 ///
-/// `None` for a file with no header at all, which is every checkpoint
-/// written before this existed and every bundle from anywhere else —
-/// distinguished from a header that exists and says something
-/// unexpected, which comes back as a map for the caller to judge.
-pub fn read_bundle_header(path: &Path) -> Result<Option<BTreeMap<String, String>>, String> {
+/// The header only. A bundle here reaches several gigabytes and the
+/// callers ask questions about a few kilobytes at the front of it; the
+/// data section starts at byte `8 + length`.
+///
+/// Parsed here rather than through `SafeTensors::read_metadata`, which
+/// takes the whole file as one slice and refuses a buffer that does not
+/// cover it exactly (`buffer_end + 8 + n != buffer_len` →
+/// `MetadataIncompleteBuffer`). The format is a little-endian u64
+/// length followed by that many bytes of JSON, so reading the front is
+/// the whole job.
+pub(crate) fn read_header_json(path: &Path) -> Result<(u64, serde_json::Value), String> {
     use std::io::Read;
 
-    // The header only. A bundle here reaches several gigabytes and this
-    // answers a question about a few kilobytes at the front of it.
-    //
-    // Parsed here rather than through `SafeTensors::read_metadata`,
-    // which takes the whole file as one slice and refuses a buffer that
-    // does not cover it exactly (`buffer_end + 8 + n != buffer_len` →
-    // `MetadataIncompleteBuffer`). The format is a little-endian u64
-    // length followed by that many bytes of JSON, and `__metadata__` is
-    // a plain string map inside it, so reading the front is the whole
-    // job.
     let mut file = fs::File::open(path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let mut prefix = [0u8; 8];
     file.read_exact(&mut prefix)
@@ -506,6 +544,24 @@ pub fn read_bundle_header(path: &Path) -> Result<Option<BTreeMap<String, String>
         .map_err(|e| format!("read {}: {e}", path.display()))?;
     let parsed: serde_json::Value = serde_json::from_slice(&header)
         .map_err(|e| format!("read {}: header is not JSON: {e}", path.display()))?;
+    Ok((header_len, parsed))
+}
+
+/// Read the header a bundle carries.
+///
+/// `None` for a file with no header at all, which is every checkpoint
+/// written before this existed and every bundle from anywhere else —
+/// distinguished from a header that exists and says something
+/// unexpected, which comes back as a map for the caller to judge.
+///
+/// A map is not by itself an algocline bundle: [`FORMAT_KEY`] is
+/// `"pt"` for any writer following the PyTorch convention. An
+/// algocline bundle is one whose map carries [`SCHEMA_KEY`]; that key
+/// and [`KIND_KEY`] together say which key set the rest of the map
+/// follows — the schema version, and whether the file is a trainer
+/// checkpoint or an export.
+pub fn read_bundle_header(path: &Path) -> Result<Option<BTreeMap<String, String>>, String> {
+    let (_, parsed) = read_header_json(path)?;
     let Some(metadata) = parsed.get("__metadata__") else {
         return Ok(None);
     };
@@ -1400,7 +1456,7 @@ mod tests {
             vocab: 64,
             ctx: 16,
             dtype: "f32".into(),
-            run: Some("alc_nn_demo_1".into()),
+            card_id: Some("alc_nn_demo_1".into()),
         };
         let store = CheckpointStore::new(tmp.path(), "ident", 3)
             .unwrap()
@@ -1410,20 +1466,35 @@ mod tests {
         let header = read_bundle_header(&path)
             .expect("readable")
             .expect("a bundle written with an identity carries a header");
+        assert_eq!(header.get(FORMAT_KEY).map(String::as_str), Some("pt"));
+        // `format` is shared with every PyTorch-convention writer; the
+        // schema key is what says the file is ours.
+        assert_eq!(header.get(SCHEMA_KEY).map(String::as_str), Some("1"));
+        assert_eq!(header.get(KIND_KEY).map(String::as_str), Some("checkpoint"));
         assert_eq!(
-            header.get("format").map(String::as_str),
-            Some(BUNDLE_FORMAT)
-        );
-        assert_eq!(
-            header.get("architecture").map(String::as_str),
+            header.get("alc.architecture").map(String::as_str),
             Some("gpt2-tiny")
         );
-        assert_eq!(header.get("vocab").map(String::as_str), Some("64"));
-        assert_eq!(header.get("ctx").map(String::as_str), Some("16"));
-        assert_eq!(header.get("dtype").map(String::as_str), Some("f32"));
-        assert_eq!(header.get("step").map(String::as_str), Some("42"));
-        assert_eq!(header.get("run").map(String::as_str), Some("alc_nn_demo_1"));
-        assert!(header.contains_key("algocline_version"));
+        assert_eq!(header.get("alc.vocab").map(String::as_str), Some("64"));
+        assert_eq!(header.get("alc.ctx").map(String::as_str), Some("16"));
+        assert_eq!(header.get("alc.dtype").map(String::as_str), Some("f32"));
+        assert_eq!(header.get("alc.step").map(String::as_str), Some("42"));
+        assert_eq!(
+            header.get("alc.card_id").map(String::as_str),
+            Some("alc_nn_demo_1")
+        );
+        assert_eq!(
+            header.get("alc.producer").map(String::as_str),
+            Some(format!("algocline {}", env!("CARGO_PKG_VERSION")).as_str())
+        );
+        // Nothing of ours outside the prefix: the unprefixed keys of the
+        // first version are gone.
+        for key in header.keys() {
+            assert!(
+                key == FORMAT_KEY || key.starts_with("alc."),
+                "unprefixed key {key:?} in {header:?}"
+            );
+        }
 
         // The sidecar says the same thing, because it is the same map.
         let sidecar = identity_sidecar_path(&path);
@@ -1446,7 +1517,7 @@ mod tests {
                 vocab: 8,
                 ctx: 4,
                 dtype: "f32".into(),
-                run: None,
+                card_id: None,
             });
         let path = store.save_final(&vm, 1).unwrap();
 
@@ -1482,7 +1553,7 @@ mod tests {
                 vocab: 8,
                 ctx: 4,
                 dtype: "f32".into(),
-                run: None,
+                card_id: None,
             });
         let path = identified.save_final(&vm, 1).unwrap();
         assert!(identity_sidecar_path(&path).exists());
@@ -1509,7 +1580,7 @@ mod tests {
                 vocab: 8,
                 ctx: 4,
                 dtype: "f32".into(),
-                run: None,
+                card_id: None,
             });
         let first = store.save_step(&vm, 1).unwrap();
         store.save_step(&vm, 2).unwrap();

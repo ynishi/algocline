@@ -1,6 +1,6 @@
 {
   "crate": "algocline-core",
-  "version": "0.45.0",
+  "version": "0.49.0",
   "items": [
     {
       "path": "algocline_core::domain",

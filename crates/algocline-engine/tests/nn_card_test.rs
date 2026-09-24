@@ -467,6 +467,420 @@ fn save_from_ckpt_roundtrips_a_full_ft_checkpoint_via_load_handle() {
     assert!(!card_id.is_empty(), "captured card_id must be non-empty");
 }
 
+/// Train a `gpt2-tiny` Card for two steps and return its id. The Card
+/// is a real trainer output: its bundle carries the trainer's own
+/// header, which the export has to replace rather than extend.
+fn train_tiny_card(lua: &Lua, name: &str) -> String {
+    lua.load(format!(
+        r#"
+        local h = alc.nn.preset.gpt2("tiny", {{
+            pretrained = false,
+            device = "cpu",
+            dtype = "f32",
+        }})
+        local rows = {{}}
+        for r = 1, 4 do
+            local row = {{}}
+            for j = 1, 8 do row[j] = ((r + j) % 60) + 1 end
+            rows[r] = row
+        end
+        local ds = alc.nn.data.synthetic(rows, {{
+            batch_size = 1,
+            ctx_len = 8,
+            shuffle = false,
+            pad_id = 0,
+        }})
+        return alc.nn.trainer.run_full_ft(h, ds, {{
+            lr = 1e-3,
+            batch = 1,
+            steps = 2,
+            warmup = 0,
+            schedule = "Constant",
+            name = "{name}",
+        }})
+        "#
+    ))
+    .eval::<String>()
+    .expect("run_full_ft on gpt2-tiny")
+}
+
+/// Promote `card_id`'s bundle into a second Card with the given meta —
+/// the way to get a Card with a lineage or a training path the trainer
+/// does not write.
+fn card_from_bundle(lua: &Lua, root: &std::path::Path, card_id: &str, meta_lua: &str) -> String {
+    let bundle = root.join("nn").join(format!("{card_id}.safetensors"));
+    lua.load(format!(
+        r#"return alc.nn.card.save_from_ckpt({:?}, "derived", {meta_lua})"#,
+        bundle.to_string_lossy()
+    ))
+    .eval::<String>()
+    .expect("save_from_ckpt")
+}
+
+/// The YAML front matter of a model card, between its two `---` lines.
+fn front_matter(readme: &str) -> &str {
+    let rest = readme.strip_prefix("---\n").expect("opens with ---");
+    let end = rest.find("\n---\n").expect("closes with ---");
+    &rest[..end + 1]
+}
+
+/// SHA-256 of everything after a safetensors file's header, computed
+/// here from the file's bytes rather than through the exporter.
+fn data_section_sha256(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).expect("read exported bundle");
+    let n = u64::from_le_bytes(bytes[..8].try_into().expect("8-byte prefix")) as usize;
+    Sha256::digest(&bytes[8 + n..])
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// The export writes every file, the weights' header states the Card
+/// in `format = "pt"` + `alc.*`, the digest recomputes from the file,
+/// `config.json` rebuilds the shape, and the GGUF carries the Card's
+/// name and license.
+#[test]
+fn export_writes_a_card_in_the_ecosystem_vocabulary() {
+    let (lua, tmp) = nn_card_vm();
+    let card_id = train_tiny_card(&lua, "export_smoke");
+    let out = tmp.path().join("export_a");
+
+    let (dir, digest, readme_file, gguf_file): (String, String, String, String) = lua
+        .load(format!(
+            r#"
+            local r = alc.nn.card.export("{card_id}", {:?}, {{
+                license = "mit",
+                gguf = {{ precision = "f32" }},
+            }})
+            return r.dir, r.tensor_sha256, r.files.readme, r.files.gguf
+            "#,
+            out.to_string_lossy()
+        ))
+        .eval()
+        .expect("alc.nn.card.export");
+    assert_eq!(dir, out.to_string_lossy());
+    assert_eq!(readme_file, out.join("README.md").to_string_lossy());
+    assert_eq!(gguf_file, out.join("model.gguf").to_string_lossy());
+    for f in [
+        "README.md",
+        "config.json",
+        "model.safetensors",
+        "model.gguf",
+    ] {
+        assert!(out.join(f).is_file(), "{f} missing");
+    }
+
+    let weights = out.join("model.safetensors");
+    let header = algocline_nn::train::read_bundle_header(&weights)
+        .expect("readable")
+        .expect("a header");
+    assert_eq!(header["format"], "pt");
+    assert_eq!(header["alc.schema"], "1");
+    assert_eq!(header["alc.kind"], "export");
+    assert_eq!(header["alc.card_id"], card_id);
+    assert_eq!(header["alc.architecture"], "gpt2-tiny");
+    assert_eq!(header["alc.training_path"], "full_ft");
+    assert!(header["alc.producer"].starts_with("algocline "));
+    assert!(
+        header["alc.hyperparams"].contains("\"steps\":2"),
+        "{header:?}"
+    );
+    assert_eq!(header["alc.tensor_sha256"], digest);
+    assert_eq!(data_section_sha256(&weights), digest);
+    // The trainer's own header keys do not survive into the export.
+    assert!(!header.contains_key("alc.step"), "{header:?}");
+
+    // The weights still load, through the same mmap reader the loader uses.
+    let tensors = candle_core::safetensors::load(&weights, &candle_core::Device::Cpu)
+        .expect("exported weights load");
+    assert!(tensors.contains_key("wte.weight"));
+
+    let config: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(out.join("config.json")).expect("config.json"),
+    )
+    .expect("config.json is JSON");
+    assert_eq!(config["architecture"], "gpt2-tiny");
+    assert_eq!(config["vocab"], 64);
+    assert!(config.get("model_type").is_none());
+    assert_eq!(
+        header["alc.config"],
+        std::fs::read_to_string(out.join("config.json")).unwrap()
+    );
+
+    let readme = std::fs::read_to_string(out.join("README.md")).expect("README.md");
+    assert!(readme.starts_with("---\ntags: [algocline, candle]\nlicense: \"mit\"\n"));
+    assert!(readme.contains("\n# export_smoke\n"), "{readme}");
+    assert!(readme.contains(&digest));
+
+    let mut gguf = std::fs::File::open(out.join("model.gguf")).expect("model.gguf");
+    let content = candle_core::quantized::gguf_file::Content::read(&mut gguf).expect("GGUF");
+    assert_eq!(
+        content.metadata["general.name"].to_string().unwrap(),
+        "export_smoke"
+    );
+    assert_eq!(
+        content.metadata["general.license"].to_string().unwrap(),
+        "mit"
+    );
+    assert_eq!(
+        content.metadata["general.architecture"]
+            .to_string()
+            .unwrap(),
+        "gpt2"
+    );
+    assert!(content.tensor_infos.contains_key("token_embd.weight"));
+}
+
+/// One Card exported twice gives byte-identical files — the header is
+/// written in a fixed order, not the order a `HashMap` happens to yield.
+#[test]
+fn two_exports_of_one_card_are_byte_identical() {
+    let (lua, tmp) = nn_card_vm();
+    let card_id = train_tiny_card(&lua, "export_twice");
+    let a = tmp.path().join("a");
+    let b = tmp.path().join("b");
+    for dir in [&a, &b] {
+        lua.load(format!(
+            r#"alc.nn.card.export("{card_id}", {:?})"#,
+            dir.to_string_lossy()
+        ))
+        .exec()
+        .expect("export");
+    }
+    for f in ["model.safetensors", "config.json", "README.md"] {
+        assert_eq!(
+            std::fs::read(a.join(f)).unwrap(),
+            std::fs::read(b.join(f)).unwrap(),
+            "{f} differs between two exports"
+        );
+    }
+    assert!(!a.join("model.gguf").exists(), "no gguf unless asked for");
+}
+
+/// The relation the model card states follows the training path, a Hub
+/// parent is written as `base_model`, and a Card parent is not.
+#[test]
+fn export_readme_states_the_relation_the_card_has() {
+    let (lua, tmp) = nn_card_vm();
+    let trained = train_tiny_card(&lua, "export_rel");
+    let cases = [
+        ("full_ft", "openai-community/gpt2", Some("finetune")),
+        ("merged", "openai-community/gpt2", Some("merge")),
+        ("distillation", "openai-community/gpt2", None),
+    ];
+    for (i, (path, parent, relation)) in cases.iter().enumerate() {
+        let id = card_from_bundle(
+            &lua,
+            tmp.path(),
+            &trained,
+            &format!(
+                r#"{{ training_path = "{path}", architecture = "gpt2-tiny",
+                     lineage = {{ parent = "{parent}" }} }}"#
+            ),
+        );
+        let out = tmp.path().join(format!("rel_{i}"));
+        lua.load(format!(
+            r#"alc.nn.card.export("{id}", {:?})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect("export");
+        let readme = std::fs::read_to_string(out.join("README.md")).unwrap();
+        let yaml = front_matter(&readme);
+        assert!(
+            yaml.contains(&format!("base_model: {parent}\n")),
+            "{readme}"
+        );
+        match relation {
+            Some(rel) => assert!(
+                yaml.contains(&format!("base_model_relation: {rel}\n")),
+                "{path}: {readme}"
+            ),
+            // The body says why (it names the key in prose); the front
+            // matter must not set it.
+            None => {
+                assert!(!yaml.contains("base_model_relation"), "{path}: {readme}");
+                assert!(readme.contains("distillation"), "{readme}");
+            }
+        }
+    }
+
+    let card_parent = card_from_bundle(
+        &lua,
+        tmp.path(),
+        &trained,
+        r#"{ training_path = "merged", architecture = "gpt2-tiny",
+             lineage = { parent = "cards/domain-lora-042" } }"#,
+    );
+    let out = tmp.path().join("rel_card");
+    lua.load(format!(
+        r#"alc.nn.card.export("{card_parent}", {:?})"#,
+        out.to_string_lossy()
+    ))
+    .exec()
+    .expect("export");
+    let readme = std::fs::read_to_string(out.join("README.md")).unwrap();
+    assert!(!front_matter(&readme).contains("base_model"), "{readme}");
+    assert!(
+        readme.contains("`cards/domain-lora-042`"),
+        "the body names it: {readme}"
+    );
+    let header = algocline_nn::train::read_bundle_header(&out.join("model.safetensors"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(header["alc.lineage.parent"], "cards/domain-lora-042");
+}
+
+/// A file already in `out_dir` is refused, and nothing is written.
+#[test]
+fn export_refuses_to_replace_a_file() {
+    let (lua, tmp) = nn_card_vm();
+    let card_id = train_tiny_card(&lua, "export_exists");
+    let out = tmp.path().join("taken");
+    std::fs::create_dir_all(&out).unwrap();
+    std::fs::write(out.join("README.md"), "someone else's").unwrap();
+    let err = lua
+        .load(format!(
+            r#"alc.nn.card.export("{card_id}", {:?})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect_err("an existing README.md must be refused");
+    assert!(err.to_string().contains("already exists"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(out.join("README.md")).unwrap(),
+        "someone else's"
+    );
+    assert!(!out.join("model.safetensors").exists());
+    assert!(!out.join("config.json").exists());
+}
+
+/// A LoRA Card's bundle is not a model; the refusal names the way to
+/// get one.
+#[test]
+fn export_refuses_a_lora_card() {
+    let (lua, tmp) = nn_card_vm();
+    let trained = train_tiny_card(&lua, "export_lora");
+    let id = card_from_bundle(
+        &lua,
+        tmp.path(),
+        &trained,
+        r#"{ training_path = "lora", architecture = "gpt2-tiny" }"#,
+    );
+    let out = tmp.path().join("lora_out");
+    let err = lua
+        .load(format!(
+            r#"alc.nn.card.export("{id}", {:?})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect_err("a LoRA Card must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("alc.nn.card.export"), "{msg}");
+    assert!(msg.contains("merge_lora"), "{msg}");
+    assert!(!out.exists(), "nothing is written for a refused Card");
+}
+
+/// A custom-architecture Card without its shape block is refused with
+/// the loader's own message: there is no shape to write into
+/// config.json.
+#[test]
+fn export_refuses_a_custom_card_without_its_shape() {
+    let (lua, tmp) = nn_card_vm();
+    let trained = train_tiny_card(&lua, "export_custom");
+    let id = card_from_bundle(
+        &lua,
+        tmp.path(),
+        &trained,
+        r#"{ training_path = "full_ft", architecture = "gpt2-custom" }"#,
+    );
+    let out = tmp.path().join("custom_out");
+    let err = lua
+        .load(format!(
+            r#"alc.nn.card.export("{id}", {:?})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect_err("a custom Card without candle.custom must be refused");
+    let msg = err.to_string();
+    assert!(msg.contains("metadata.nn.candle.custom is absent"), "{msg}");
+    assert!(!out.exists());
+}
+
+/// A Card whose architecture names a bigger preset than its bundle
+/// holds does not load, so it does not export — even without
+/// `opts.gguf`, where nothing else would build the model.
+#[test]
+fn export_refuses_a_card_whose_bundle_does_not_match_its_architecture() {
+    let (lua, tmp) = nn_card_vm();
+    let trained = train_tiny_card(&lua, "export_mismatch");
+    let id = card_from_bundle(
+        &lua,
+        tmp.path(),
+        &trained,
+        r#"{ training_path = "full_ft", architecture = "gpt2-medium" }"#,
+    );
+    let out = tmp.path().join("mismatch_out");
+    let err = lua
+        .load(format!(
+            r#"alc.nn.card.export("{id}", {:?})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect_err("a Card that does not load must not export");
+    let msg = err.to_string();
+    assert!(msg.contains("does not load on this host"), "{msg}");
+    assert!(
+        !out.exists(),
+        "nothing is written for a Card that does not load"
+    );
+}
+
+/// A control character in the license is refused by name: a line break
+/// would carry text out of the front matter's `license:` line.
+#[test]
+fn export_refuses_a_license_with_a_control_character() {
+    let (lua, tmp) = nn_card_vm();
+    let card_id = train_tiny_card(&lua, "export_license");
+    for (i, license) in ["mit\\nbase_model: x/y", "mit\\127", "mit\\194\\133"]
+        .iter()
+        .enumerate()
+    {
+        let out = tmp.path().join(format!("license_out_{i}"));
+        let err = lua
+            .load(format!(
+                r#"alc.nn.card.export("{card_id}", {:?}, {{ license = "{license}" }})"#,
+                out.to_string_lossy()
+            ))
+            .exec()
+            .expect_err("a control character must be refused");
+        assert!(
+            err.to_string()
+                .contains("opts.license contains the control character"),
+            "{err}"
+        );
+        assert!(!out.exists());
+    }
+}
+
+/// An option the export does not read is refused, not ignored.
+#[test]
+fn export_refuses_an_unknown_option() {
+    let (lua, tmp) = nn_card_vm();
+    let card_id = train_tiny_card(&lua, "export_opts");
+    let out = tmp.path().join("opts_out");
+    let err = lua
+        .load(format!(
+            r#"alc.nn.card.export("{card_id}", {:?}, {{ licence = "mit" }})"#,
+            out.to_string_lossy()
+        ))
+        .exec()
+        .expect_err("a misspelled option must be refused");
+    assert!(err.to_string().contains("opts.licence"), "{err}");
+    assert!(!out.exists());
+}
+
 /// ST-D negative path: `save_from_ckpt` refuses a non-existent source
 /// safetensors file loudly, with a message that names the entry so a
 /// caller reading the trace sees which bridge surfaced the error.

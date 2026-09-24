@@ -23,6 +23,16 @@ matrix so a caller can construct a plain `Linear` that produces
 identical outputs for the same input. This is what the merge-
 equivalence integration test asserts within 1e-4 element-wise.
 
+# Initialisation
+
+[`LoraLinear::wrap`] follows the canonical LoRA init from
+Hu et al. 2021 §4.1: `lora_a` gets candle-nn's default (Kaiming
+uniform) random weights, while `lora_b` is initialised to **zero**.
+Because `ΔW = scaling * (B · A)` and `B = 0` at `t=0`, the wrap is
+effectively an identity map at construction — `wrap(base).forward(x)`
+equals `base.forward(x)` bit-for-bit. Only training moves `B` off
+zero, at which point `ΔW` starts contributing.
+
 ## Functions
 
 - `max_abs_diff_f32` — Snapshot two tensors as flat f32 vectors and return the maximum
@@ -31,4 +41,9 @@ equivalence integration test asserts within 1e-4 element-wise.
 
 - `LoraConfig` — LoRA rank + scaling + wrap-target configuration.
 - `LoraLinear` — A `Linear` layer wrapped with a low-rank additive update.
+
+## Traits
+
+- `LoraWrappable` — A trainable model that can be wrapped with LoRA
+- `MergeableLora` — A model that can export a merged inference-ready weight bundle.
 

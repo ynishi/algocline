@@ -129,9 +129,7 @@ impl MergedProvenance {
 /// Errors surfaced by [`export_merged`].
 ///
 /// Explicit variants so the Lua bridge / caller can surface an
-/// actionable error string — no silent fallback (matches the
-/// Service-layer error-propagation discipline in
-/// `.claude/CLAUDE.md`).
+/// actionable error string — no silent fallback.
 #[derive(Debug, thiserror::Error)]
 pub enum MergeError {
     /// Provenance validation failed (empty required field).

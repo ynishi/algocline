@@ -249,13 +249,14 @@ check-invariants:
 
 # Dry-run publish check (dependency order)
 #
-# NOTE: only the leaf (algocline-core) actually verifies — intermediate crates
+# NOTE: only the leaves (algocline-core, algocline-nn) actually verify — intermediate crates
 # (engine/app/mcp/root) fail on dry-run because they reference the new version
 # of upstream crates not yet on crates.io (cargo-release issue #691). Use this
 # for syntax / Cargo.toml metadata checks; real verification happens during
 # `just publish`.
 publish-dry:
     cargo publish -p algocline-core --dry-run
+    cargo publish -p algocline-nn --dry-run
     cargo publish -p algocline-engine --dry-run
     cargo publish -p algocline-app --dry-run
     cargo publish -p algocline-mcp --dry-run
@@ -278,6 +279,8 @@ publish VERSION:
             exit 1; \
         fi
     cargo publish -p algocline-core
+    sleep 60
+    cargo publish -p algocline-nn
     sleep 60
     cargo publish -p algocline-engine
     sleep 60

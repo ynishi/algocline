@@ -193,13 +193,12 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     assert_eq!(hits[0].pass_rate, Some(0.67));
     assert_eq!(hits[0].model.as_deref(), Some("claude-opus-4-6"));
     assert_eq!(hits[0].scenario.as_deref(), Some("sc1"));
-    // Both live in tags, which a row carries from cardbox 0.1.2 on. This
-    // is the assertion that was impossible against 0.1.1, where a row
-    // came back with no tags at all.
+    // `created_at` is the row's own field, rendered from `started_ms`
+    // (which `open --started-at` set); `run.flow` is a tag.
     assert_eq!(
         hits[0].created_at.as_deref(),
         Some("2026-09-01T00:00:00Z"),
-        "a find row carries the created_at tag, not opened_ms"
+        "a find row carries created_at from started_ms, not opened_ms"
     );
     assert_eq!(
         hits[0].flow.as_deref(),
@@ -207,9 +206,9 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
         "a find row carries the run.flow tag"
     );
 
-    // The two translated paths: created_at and run.* are tags.
+    // created_at is compared against started_ms; run.* are tags.
     for predicate in [
-        json!({ "created_at": { "gte": "2026-08-01" } }),
+        json!({ "created_at": { "gte": "2026-08-01T00:00:00Z" } }),
         json!({ "run": { "flow": "code_review" } }),
         json!({ "run": { "status": "failed" } }),
         json!({ "params": { "persona": { "moves_count": 3 } } }),
@@ -430,8 +429,9 @@ fn create_opens_and_closes_in_one_call() {
         Some(&json!("nn/x"))
     );
 
-    // Ordering on created_at is the tag column, which is what makes a
-    // descending sort reproduce the file backend's order.
+    // Ordering on created_at is started_ms, the run's own time, which is
+    // what makes a descending sort reproduce the file backend's order even
+    // for Cards written after the fact.
     let (older, _) = store
         .create(json!({
             "pkg": { "name": "nn" },
@@ -460,8 +460,8 @@ fn create_opens_and_closes_in_one_call() {
         Some("2026-07-04T01:02:03Z")
     );
     assert_eq!(ordered[0].flow.as_deref(), Some("nn_bake"));
-    // The older Card named no flow, so its row has a created_at tag and
-    // no run.flow one — one tag present must not conjure the other.
+    // The older Card named no flow, so its row has a created_at and no
+    // run.flow tag — one field present must not conjure the other.
     assert_eq!(
         ordered[1].created_at.as_deref(),
         Some("2026-01-01T00:00:00Z")

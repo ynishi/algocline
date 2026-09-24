@@ -20,7 +20,7 @@
 //! | `pkg.name` / `scenario.name` | `open --pkg` / `--scenario` (scenario falls back to the literal `none`) |
 //! | `params` | `open --params`, verbatim |
 //! | `model.id` | `open --model` |
-//! | `created_at` | tag `created_at` — **not** `opened_ms`, which is the log's event time |
+//! | `created_at` | `open --started-at` — cardbox's `started_ms`, **not** `opened_ms`, which is the log's event time |
 //! | `metadata.prior_card_id` | `open --parent` |
 //! | `metadata.prior_relation` | tag `lineage.relation` |
 //! | `metadata.<x>` (everything else) | `close --stats` under a `metadata` key |
@@ -53,22 +53,24 @@
 //!
 //! # Which cardbox this needs
 //!
-//! **0.1.2 or newer.** From 0.1.2 `find` / `list` / `compat find` answer
-//! every row with the Card's current `tags`, and `created_at` /
-//! `run.flow` are tags — so a listing row can carry them, which is what
-//! lets [`Summary`] report both. Before 0.1.2 a row carried no `tags` at
-//! all and neither field could reach a summary. Nothing else in the
-//! mapping depends on the version.
+//! **One that has `started_ms` / `ended_ms`**, which the published 0.1.2
+//! predates (the version string alone does not tell the two apart).
+//! `created_at` is the run's own time, and that is what cardbox's
+//! `started_ms` is: `open --started-at` sets it, `get` returns it, and
+//! `compat find` matches a `created_at` predicate or sort key against it
+//! (converting ISO values to milliseconds) and answers every row with
+//! `created_at` rendered back as an ISO string. So `get`, a listing row
+//! and a `where` all read the same column — which is also the column
+//! cardbox's `tools/import_v0.py` fills, so imported Cards and Cards written here
+//! answer the same queries.
 //!
-//! There is deliberately no runtime version gate. On an older cardbox
-//! the writes and `get` are unaffected — `get` has always had both
-//! fields — and a listing row reports `created_at: None` / `flow: None`,
-//! which is what `None` already means here: not known from this row.
-//! `opened_ms` is still not substituted for `created_at`. So an older
-//! binary yields a thinner projection rather than the total failure a
-//! hard floor would produce, and the cost of the gate (a `cardbox
-//! version` spawn per store, reportable only through a log line the MCP
-//! caller never sees) buys nothing the caller can act on.
+//! `run.flow` is still a tag, and a listing row carries it from 0.1.2 on.
+//!
+//! There is deliberately no runtime version gate. An older binary refuses
+//! `--started-at` by name when a Card names a `created_at`, which is the
+//! failure a gate would have produced anyway, and the cost of the gate (a
+//! `cardbox version` spawn per store, reportable only through a log line
+//! the MCP caller never sees) buys nothing the caller can act on.
 //!
 //! # Stated gaps
 //!
@@ -94,6 +96,16 @@
 //!   DSL).
 //! * **No `CardEvent` is published.** Card sinks mirror the file backend
 //!   only; `card_sink_backfill` keeps the trait default, which errors.
+//! * **`created_at` is ISO 8601 in UTC.** cardbox parses it into
+//!   `started_ms` and refuses an offset other than `Z` / `+00:00`, and a
+//!   `created_at` predicate needs a full timestamp (`2026-09-01T00:00:00Z`,
+//!   not `2026-09-01`) — it is compared as a number, not as text, so
+//!   `contains` / `starts_with` on it are refused too.
+//! * **A Card written by algocline 0.50 kept `created_at` in a tag.** That
+//!   tag is no longer read. For a Card opened as its run started the tag
+//!   and `started_ms` agree to the second; for one written after the fact
+//!   through `create` / `import`, `started_ms` is the write time and the
+//!   original value survives only as the tag `created_at`.
 //! * **`card_id` is minted by cardbox** (`{pkg}_{scenario}_{ts}_{hex}`)
 //!   unless the input names one, which is passed through as `--id`.
 
@@ -116,9 +128,6 @@ const SCENARIO_NONE: &str = "none";
 /// `--source` for every Card this backend opens. cardbox records who
 /// produced a Card; for this backend that is always algocline.
 const SOURCE_ALC: &str = "alc";
-
-/// Tag holding the v0 `created_at`. See the module doc.
-const TAG_CREATED_AT: &str = "created_at";
 
 /// Tag holding `metadata.prior_relation`.
 const TAG_PRIOR_RELATION: &str = "lineage.relation";
@@ -302,7 +311,7 @@ impl CardboxStore {
 
     /// `cardbox open` + the tags that carry the v0 fields with no flag.
     fn open_inner(&self, input: &Json, mode: OpenMode) -> Result<String, String> {
-        let plan = open_plan(input, &now_rfc3339(), mode)?;
+        let plan = open_plan(input, mode)?;
         let opened = self.run(&plan.args)?;
         let card_id = opened
             .get("id")
@@ -744,9 +753,7 @@ fn argv(parts: &[&str]) -> Vec<String> {
 
 /// The `cardbox open` invocation for `input`, plus the tags that carry
 /// the v0 fields cardbox has no flag for.
-///
-/// `now` is injected so the `created_at` fallback is testable.
-fn open_plan(input: &Json, now: &str, mode: OpenMode) -> Result<WritePlan, String> {
+fn open_plan(input: &Json, mode: OpenMode) -> Result<WritePlan, String> {
     let obj = input
         .as_object()
         .ok_or_else(|| "alc.card.open: input must be a table".to_string())?;
@@ -812,14 +819,14 @@ fn open_plan(input: &Json, now: &str, mode: OpenMode) -> Result<WritePlan, Strin
         args.push("--id".into());
         args.push(id.to_string());
     }
+    // Absent, cardbox takes the open's own write time, which is the run's
+    // start for a Card opened as the run starts.
+    if let Some(ts) = obj.get("created_at").and_then(|v| v.as_str()) {
+        args.push("--started-at".into());
+        args.push(ts.to_string());
+    }
 
-    let mut tags = vec![(
-        TAG_CREATED_AT.to_string(),
-        obj.get("created_at")
-            .and_then(|v| v.as_str())
-            .unwrap_or(now)
-            .to_string(),
-    )];
+    let mut tags = Vec::new();
 
     if let Some(meta) = obj.get("metadata") {
         let meta = meta
@@ -992,10 +999,10 @@ fn open_metadata_refusal(key: &str) -> String {
 
 /// Rebuild a v0 Card from a `cardbox get` object.
 ///
-/// The inverse of the write mapping: `stats.metadata` comes back out to
-/// `metadata`, the tags come back to `created_at` / `run.*` /
-/// `metadata.prior_relation`, and `parents[0]` comes back to
-/// `metadata.prior_card_id`. What cardbox knows and v0 has no field for
+/// The inverse of the write mapping: `started_ms` comes back to
+/// `created_at`, `stats.metadata` comes back out to `metadata`, the tags
+/// come back to `run.*` / `metadata.prior_relation`, and `parents[0]`
+/// comes back to `metadata.prior_card_id`. What cardbox knows and v0 has no field for
 /// is kept under a `cardbox` sub-table rather than discarded.
 fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
     let obj = cb
@@ -1027,16 +1034,10 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
     if let Some(created_by) = str_at("created_by") {
         out.insert("created_by".into(), json!(created_by));
     }
-    // `created_at` is run data and `opened_ms` is the log's event time;
-    // the fallback is only for a Card this backend did not write, where
-    // the event time is the only timestamp there is.
-    let created_at = tag(TAG_CREATED_AT).or_else(|| {
-        obj.get("opened_ms")
-            .and_then(|v| v.as_i64())
-            .map(rfc3339_from_epoch_ms)
-    });
-    if let Some(ts) = created_at {
-        out.insert("created_at".into(), json!(ts));
+    // `created_at` is the run's time, which is `started_ms`; `opened_ms`
+    // is the log's event time and is not substituted for it.
+    if let Some(ms) = obj.get("started_ms").and_then(|v| v.as_i64()) {
+        out.insert("created_at".into(), json!(rfc3339_from_epoch_ms(ms)));
     }
     if let Some(fp) = str_at("fingerprint") {
         out.insert("param_fingerprint".into(), json!(fp));
@@ -1122,6 +1123,8 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
     for k in [
         "opened_ms",
         "closed_ms",
+        "started_ms",
+        "ended_ms",
         "evals",
         "samples",
         "source",
@@ -1146,11 +1149,10 @@ fn card_from_cardbox(cb: &Json) -> Result<Json, String> {
 
 /// A `compat find` row as a v0 [`Summary`].
 ///
-/// `created_at` and `flow` are read out of the row's own `tags`, which
-/// is where both are written and which a row carries from cardbox 0.1.2
-/// on (see the module doc). A row with no `tags`, or one whose `tags`
-/// lack the key, leaves the field `None` — `opened_ms` is in the row but
-/// it is the log's event time, a different quantity, so it is no more
+/// `created_at` is the row's own `created_at`, which `compat find`
+/// renders from `started_ms`; `flow` is read out of the row's `tags`. A
+/// row without either leaves the field `None` — `opened_ms` is in the row
+/// but it is the log's event time, a different quantity, so it is no more
 /// substituted here than in [`card_from_cardbox`].
 fn summary_from_row(row: &Json) -> Option<Summary> {
     let card_id = row.get("card_id").and_then(|v| v.as_str())?.to_string();
@@ -1167,7 +1169,10 @@ fn summary_from_row(row: &Json) -> Option<Summary> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string(),
-        created_at: tag(TAG_CREATED_AT),
+        created_at: row
+            .get("created_at")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
         model: row
             .get("model")
             .and_then(|v| v.as_str())
@@ -1305,14 +1310,14 @@ fn deep_merge(dst: &mut Json, src: Json) {
 
 /// Translate a v0 Card path into the column `compat find` matches on.
 ///
-/// `metadata.*` is deliberately left alone: cardbox's own compat layer
-/// already rewrites it to `stats.metadata.*`, and translating it here
-/// too would produce `stats.stats.metadata.*`.
+/// `metadata.*` and `created_at` are deliberately left alone: cardbox's
+/// own compat layer already rewrites them (to `stats.metadata.*`, and to
+/// `started_ms` with ISO values converted), and translating either here
+/// too would hand compat a path it no longer recognises.
 fn translate_card_path(path: &[String]) -> Result<Vec<String>, String> {
     let seg = |s: &str| vec![s.to_string()];
     let parts: Vec<&str> = path.iter().map(String::as_str).collect();
     Ok(match parts.as_slice() {
-        ["created_at"] => vec!["tags".into(), TAG_CREATED_AT.into()],
         // `run` has no cardbox column; its fields are tags, and the tag
         // key is the dotted name literally (tags are a flat map).
         ["run", field @ ("status" | "flow" | "reason" | "action")] => {
@@ -1432,15 +1437,6 @@ fn reachable_under_filter(
         }
     }
     keep
-}
-
-/// RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ` for the current system time.
-fn now_rfc3339() -> String {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    rfc3339_from_epoch_ms(ms)
 }
 
 /// RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ` from epoch milliseconds.

@@ -5,12 +5,8 @@
 use super::*;
 use algocline_engine::card::{parse_order_by, parse_where};
 
-/// The literal `now` every `open_plan` test is handed, so the
-/// `created_at` fallback is a value rather than a clock.
-const FIXED_NOW: &str = "2026-09-21T12:00:00Z";
-
 fn plan_for(input: Json, mode: OpenMode) -> WritePlan {
-    open_plan(&input, FIXED_NOW, mode).expect("open_plan")
+    open_plan(&input, mode).expect("open_plan")
 }
 
 /// `--flag value` lookup over an argv.
@@ -32,12 +28,8 @@ fn tag<'a>(plan: &'a WritePlan, key: &str) -> Option<&'a str> {
 
 #[test]
 fn open_requires_pkg_name() {
-    let err = open_plan(
-        &json!({ "params": { "a": 1 } }),
-        FIXED_NOW,
-        OpenMode::Lifecycle,
-    )
-    .expect_err("pkg.name is required");
+    let err = open_plan(&json!({ "params": { "a": 1 } }), OpenMode::Lifecycle)
+        .expect_err("pkg.name is required");
     assert!(err.contains("pkg.name is required"), "{err}");
 }
 
@@ -120,16 +112,24 @@ fn metadata_never_rides_in_params() {
     );
 }
 
+/// `created_at` is the run's start, which is cardbox's `started_ms` —
+/// the column `compat find` matches a `created_at` predicate against.
 #[test]
-fn created_at_is_a_tag_and_falls_back_to_now() {
+fn created_at_is_the_started_at_flag_not_a_tag() {
     let given = plan_for(
         json!({ "pkg": { "name": "cot" }, "created_at": "2026-01-02T03:04:05Z" }),
         OpenMode::Lifecycle,
     );
-    assert_eq!(tag(&given, "created_at"), Some("2026-01-02T03:04:05Z"));
+    assert_eq!(
+        flag(&given.args, "--started-at"),
+        Some("2026-01-02T03:04:05Z")
+    );
+    assert_eq!(tag(&given, "created_at"), None);
 
+    // Absent, cardbox takes the open's own write time.
     let absent = plan_for(json!({ "pkg": { "name": "cot" } }), OpenMode::Lifecycle);
-    assert_eq!(tag(&absent, "created_at"), Some(FIXED_NOW));
+    assert_eq!(flag(&absent.args, "--started-at"), None);
+    assert_eq!(tag(&absent, "created_at"), None);
 }
 
 #[test]
@@ -175,7 +175,6 @@ fn card_id_is_passed_through_when_the_input_names_one() {
 fn a_section_with_no_slot_is_refused_not_dropped() {
     let err = open_plan(
         &json!({ "pkg": { "name": "cot" }, "strategy_params": { "alpha": 0.7 } }),
-        FIXED_NOW,
         OpenMode::Create,
     )
     .expect_err("strategy_params has no slot");
@@ -187,7 +186,6 @@ fn a_section_with_no_slot_is_refused_not_dropped() {
 fn open_refuses_metadata_that_only_close_can_place() {
     let err = open_plan(
         &json!({ "pkg": { "name": "nn" }, "metadata": { "nn": { "architecture": "tiny" } } }),
-        FIXED_NOW,
         OpenMode::Lifecycle,
     )
     .expect_err("non-lineage metadata is close-time data");
@@ -196,7 +194,6 @@ fn open_refuses_metadata_that_only_close_can_place() {
     // create() holds the whole Card, so it can place the same metadata.
     open_plan(
         &json!({ "pkg": { "name": "nn" }, "metadata": { "nn": { "architecture": "tiny" } } }),
-        FIXED_NOW,
         OpenMode::Create,
     )
     .expect("create places metadata at close");
@@ -288,6 +285,8 @@ fn cb_closed() -> Json {
         "fingerprint": "a77603a009aef8ee",
         "id": "demo_sc1_20260921T213520_87354a",
         "opened_ms": 1790026520694i64,
+        "started_ms": 1788220800000i64,
+        "ended_ms": 1788220830000i64,
         "params": { "persona": { "moves_count": 3 } },
         "parents": ["seed_1"],
         "pkg": "demo",
@@ -300,7 +299,6 @@ fn cb_closed() -> Json {
             "pass_rate": 0.8
         },
         "tags": {
-            "created_at": "2026-09-01T00:00:00Z",
             "lineage.relation": "sweep_variant",
             "run.flow": "code_review",
             "run.status": "skipped"
@@ -323,7 +321,7 @@ fn get_rebuilds_the_v0_identity_sections() {
 
 /// `card_context` reads `created_at` and slices `[5..10]` out of it.
 #[test]
-fn created_at_comes_from_the_tag_not_from_opened_ms() {
+fn created_at_comes_from_started_ms_not_from_opened_ms() {
     let card = card_from_cardbox(&cb_closed()).expect("reconstruct");
     assert_eq!(card["created_at"], json!("2026-09-01T00:00:00Z"));
     assert_eq!(
@@ -331,15 +329,30 @@ fn created_at_comes_from_the_tag_not_from_opened_ms() {
         Some("09-01"),
         "card_context renders MM/DD from this slice"
     );
+    assert_eq!(
+        card.pointer("/cardbox/ended_ms"),
+        Some(&json!(1788220830000i64))
+    );
 }
 
-/// Only when the tag is absent — a Card this backend did not write.
+/// A tag left by an algocline 0.50 write is not read: `started_ms` is the
+/// one column `get`, a listing row and a `where` all agree on.
 #[test]
-fn created_at_falls_back_to_the_event_time_when_untagged() {
+fn a_legacy_created_at_tag_does_not_override_started_ms() {
     let mut cb = cb_closed();
-    cb["tags"] = json!({});
+    cb["tags"]["created_at"] = json!("2020-01-01T00:00:00Z");
     let card = card_from_cardbox(&cb).expect("reconstruct");
-    assert_eq!(card["created_at"], json!("2026-09-21T21:35:20Z"));
+    assert_eq!(card["created_at"], json!("2026-09-01T00:00:00Z"));
+}
+
+/// A row with no `started_ms` (a cardbox older than the one this needs)
+/// reports no `created_at` rather than the log's event time.
+#[test]
+fn without_started_ms_created_at_is_unknown() {
+    let mut cb = cb_closed();
+    cb.as_object_mut().expect("object").remove("started_ms");
+    let card = card_from_cardbox(&cb).expect("reconstruct");
+    assert_eq!(card.get("created_at"), None);
 }
 
 /// `bridge/nn_card.rs` reads exactly this path.
@@ -469,11 +482,13 @@ fn metadata_is_handed_to_compat_untranslated() {
     );
 }
 
+/// `created_at` goes to compat untouched: compat maps it to `started_ms`
+/// and converts the ISO value, which a `tags.` path would bypass.
 #[test]
-fn created_at_and_run_fields_are_translated_to_their_tags() {
+fn created_at_is_handed_to_compat_and_run_fields_to_their_tags() {
     assert_eq!(
-        where_for(json!({ "created_at": { "gte": "2026-09-01" } })),
-        json!({ "tags": { "created_at": { "gte": "2026-09-01" } } })
+        where_for(json!({ "created_at": { "gte": "2026-09-01T00:00:00Z" } })),
+        json!({ "created_at": { "gte": "2026-09-01T00:00:00Z" } })
     );
     assert_eq!(
         where_for(json!({ "run": { "flow": "code_review" } })),
@@ -538,7 +553,7 @@ fn order_by_translates_and_carries_the_descending_dash() {
     let keys = parse_order_by(&json!("-created_at")).expect("parse");
     assert_eq!(
         order_by_flag(&keys).expect("flag"),
-        Some("--order-by=-tags.created_at".to_string()),
+        Some("--order-by=-created_at".to_string()),
         "this is what reproduces the file backend's ordering"
     );
     let asc = parse_order_by(&json!("stats.pass_rate")).expect("parse");
@@ -563,7 +578,8 @@ fn a_compat_row_becomes_a_summary_carrying_its_tags() {
     let row = json!({
         "card_id": "demo_sc1_x", "pkg": "demo", "scenario": "sc1",
         "state": "closed_ok", "opened_ms": 1790026907079i64, "pass_rate": 0.8,
-        "tags": { "created_at": "2026-09-01T00:00:00Z", "run.flow": "code_review" }
+        "started_ms": 1788220800000i64, "created_at": "2026-09-01T00:00:00Z",
+        "tags": { "created_at": "2020-01-01T00:00:00Z", "run.flow": "code_review" }
     });
     let s = summary_from_row(&row).expect("summary");
     assert_eq!(s.card_id, "demo_sc1_x");
@@ -573,16 +589,16 @@ fn a_compat_row_becomes_a_summary_carrying_its_tags() {
     assert_eq!(
         s.created_at.as_deref(),
         Some("2026-09-01T00:00:00Z"),
-        "the tag, not opened_ms"
+        "the row's created_at (started_ms), not a legacy tag and not opened_ms"
     );
     assert_eq!(s.flow.as_deref(), Some("code_review"));
 }
 
-/// The row shape of a cardbox older than 0.1.2, and of a 0.1.2 Card
-/// that was never tagged. Both leave the fields absent rather than
-/// standing `opened_ms` in for a `created_at` it is not.
+/// Rows with no `created_at` field and no `run.flow` tag. Both fields
+/// stay absent rather than standing `opened_ms` in for a `created_at` it
+/// is not.
 #[test]
-fn a_row_without_the_tags_leaves_both_fields_unknown() {
+fn a_row_without_either_field_leaves_both_unknown() {
     let no_tags_key = json!({
         "card_id": "demo_sc1_x", "pkg": "demo",
         "state": "open", "opened_ms": 1790026907079i64
@@ -604,13 +620,13 @@ fn a_row_without_the_tags_leaves_both_fields_unknown() {
     }
 }
 
-/// Either tag can be present without the other — a Card that set no
-/// `run.flow` still carries the `created_at` every open writes.
+/// Either field can be present without the other — a Card that set no
+/// `run.flow` still carries the `created_at` every row is answered with.
 #[test]
-fn one_tag_present_does_not_conjure_the_other() {
+fn one_field_present_does_not_conjure_the_other() {
     let dated = json!({
         "card_id": "a", "pkg": "demo",
-        "tags": { "created_at": "2026-09-01T00:00:00Z" }
+        "created_at": "2026-09-01T00:00:00Z", "tags": {}
     });
     let s = summary_from_row(&dated).expect("summary");
     assert_eq!(s.created_at.as_deref(), Some("2026-09-01T00:00:00Z"));

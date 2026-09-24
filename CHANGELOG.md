@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Changed
+
+### Deprecated
+
+### Removed
+
+### Fixed
+
+### Security
+
+## [0.51.0] - 2026-09-24
+
+### Added
+
 - **`examples/corpus_bake` — train from corpus files on a host with no MCP client.** A GPU pod or a CI runner has no `alc.nn` to call, so a run there had no way in. The example reads its whole configuration from `NN_BAKE_*` environment variables, loads the files through `train::CorpusFile` and merges them with `train::corpus::interleave_labelled` — the same loader and rotation `alc.nn.data.corpus` uses, so a file one accepts the other accepts — trains a custom GPT-2 from scratch through `run_full_ft` / `run_conditioned_ft` / `run_allowed_ft` according to the channels the corpora carry, and prints one JSON summary line on stdout. Every 0.50.0 trainer control a long unattended run needs is reachable: `NN_BAKE_SEED`, a held-out corpus with `NN_BAKE_EVAL_EVERY` and early stopping, `NN_BAKE_CLIP_GRAD_NORM`, `NN_BAKE_METRICS_EVERY`, rotating checkpoints with optimizer state and `NN_BAKE_INIT_FROM` to resume, and the schedule / optimizer by their wire names. A value that is set and cannot be read is refused by name rather than replaced by its default.
 
 ### Changed

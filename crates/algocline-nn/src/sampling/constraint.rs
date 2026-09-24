@@ -102,17 +102,13 @@ impl TokenBitset {
     /// the same ids — which is what the mask cache's comparison rests
     /// on.
     pub fn allow_all(&mut self) {
-        for word in &mut self.words {
-            *word = u32::MAX;
-        }
+        self.words.fill(u32::MAX);
         self.clear_tail();
     }
 
     /// Allow nothing.
     pub fn deny_all(&mut self) {
-        for word in &mut self.words {
-            *word = 0;
-        }
+        self.words.fill(0);
     }
 
     /// Allow `id`, if it is in range.

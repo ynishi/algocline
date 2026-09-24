@@ -63,6 +63,8 @@ keywords.workspace = true
 categories.workspace = true
 
 readme = "README.md"
+# Repository tooling config, of no use to anyone building the crate.
+exclude = [".gitignore", ".styluaignore"]
 
 [[bin]]
 name = "alc"

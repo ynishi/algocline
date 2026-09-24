@@ -8,13 +8,9 @@ use std::borrow::Cow;
 use std::io::Write;
 use std::time::Duration;
 
-use rmcp::{
-    model::{
-        ArgumentInfo, CallToolRequestParams, CompleteRequestParams, GetPromptRequestParams,
-        ReadResourceRequestParams, Reference, ResourceReference,
-    },
-    transport::TokioChildProcess,
-    ServiceExt,
+use rmcp::model::{
+    ArgumentInfo, CallToolRequestParams, CompleteRequestParams, GetPromptRequestParams,
+    ReadResourceRequestParams, Reference, ResourceReference,
 };
 use serde_json::{json, Map, Value};
 
@@ -23,7 +19,7 @@ use tokio::time::{sleep, timeout};
 use algocline_app::PRESET_CATALOG_VERSION;
 
 mod common;
-use common::TempAlcHome;
+use common::{connect, TempAlcHome};
 
 // ─── Helpers ─────────────────────────────────────────────────────
 
@@ -45,17 +41,6 @@ fn call_params_empty(name: &str) -> CallToolRequestParams {
     p.name = Cow::Owned(name.to_string());
     p.arguments = Some(Map::new());
     p
-}
-
-/// Connect to the `alc` binary as an MCP client.
-async fn connect() -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let bin = std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
-    let transport = TokioChildProcess::new(tokio::process::Command::new(bin))
-        .expect("failed to spawn alc server");
-    ().serve(transport)
-        .await
-        .expect("failed to initialize MCP session")
 }
 
 /// Extract the first text content from a CallToolResult.
@@ -190,19 +175,8 @@ fn redact_gh_credentials(text: &str) -> String {
 /// Also sets `ALC_PACKAGES_PATH` to `{alc_home}/packages` so that the server's
 /// package search path is scoped to the tmp directory. Without this, `pkg_list`
 /// would scan `~/.algocline/packages/` instead of the test fixture.
-async fn connect_with_alc_home(
-    alc_home: &std::path::Path,
-) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let bin = std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
-    let packages_path = alc_home.join("packages");
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.env("ALC_HOME", alc_home)
-        .env("ALC_PACKAGES_PATH", &packages_path);
-    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
-    ().serve(transport)
-        .await
-        .expect("failed to initialize MCP session")
+async fn connect_with_alc_home(alc_home: &std::path::Path) -> common::AlcClient {
+    common::spawn_alc(alc_home, &[]).await
 }
 
 /// Read a resource by URI, returning the result.
@@ -3485,19 +3459,11 @@ async fn test_mcp_resource_read_hub_unknown_path_errors() {
     client.cancel().await.expect("cancel failed");
 }
 
-/// Read `alc://types/alc.d.lua` when the file exists.
+/// Read `alc://types/alc.d.lua`: the stub the server distributes into
+/// `{ALC_HOME}/types/` at startup, served back verbatim.
 #[tokio::test]
 async fn test_mcp_resource_read_types_alc_d_lua() {
     let tmp = tempfile::tempdir().expect("tempdir");
-
-    let types_dir = tmp.path().join("types");
-    std::fs::create_dir_all(&types_dir).expect("create types dir");
-    std::fs::write(
-        types_dir.join("alc.d.lua"),
-        "-- alc type stubs\n---@class alc\nalc = {}\n",
-    )
-    .expect("write alc.d.lua");
-
     let client = connect_with_alc_home(tmp.path()).await;
 
     let result = read_resource(&client, "alc://types/alc.d.lua")
@@ -3506,28 +3472,21 @@ async fn test_mcp_resource_read_types_alc_d_lua() {
 
     assert_eq!(result.contents.len(), 1);
     let (uri, text) = resource_text(&result.contents[0]);
-    assert!(
-        text.contains("alc type stubs"),
-        "unexpected content: {text}"
+    assert_eq!(
+        text,
+        include_str!("../types/alc.d.lua"),
+        "served stub must be the one distributed at startup"
     );
     assert_eq!(uri, "alc://types/alc.d.lua");
 
     client.cancel().await.expect("cancel failed");
 }
 
-/// Read `alc://types/alc_shapes.d.lua` when the file exists.
+/// Read `alc://types/alc_shapes.d.lua`: the stub the server distributes
+/// into `{ALC_HOME}/types/` at startup, served back verbatim.
 #[tokio::test]
 async fn test_mcp_resource_read_types_alc_shapes_d_lua() {
     let tmp = tempfile::tempdir().expect("tempdir");
-
-    let types_dir = tmp.path().join("types");
-    std::fs::create_dir_all(&types_dir).expect("create types dir");
-    std::fs::write(
-        types_dir.join("alc_shapes.d.lua"),
-        "-- alc_shapes type stubs\n",
-    )
-    .expect("write alc_shapes.d.lua");
-
     let client = connect_with_alc_home(tmp.path()).await;
 
     let result = read_resource(&client, "alc://types/alc_shapes.d.lua")
@@ -3536,7 +3495,11 @@ async fn test_mcp_resource_read_types_alc_shapes_d_lua() {
 
     assert_eq!(result.contents.len(), 1);
     let (_uri, text) = resource_text(&result.contents[0]);
-    assert!(text.contains("alc_shapes"), "unexpected content: {text}");
+    assert_eq!(
+        text,
+        include_str!("../types/alc_shapes.d.lua"),
+        "served stub must be the one distributed at startup"
+    );
 
     client.cancel().await.expect("cancel failed");
 }
@@ -4063,15 +4026,8 @@ async fn test_mcp_resource_read_logs_pagination() {
     )
     .expect("write log json");
 
-    let bin = std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
-    let packages_path = tmp.path().join("packages");
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.env("ALC_HOME", tmp.path())
-        .env("ALC_PACKAGES_PATH", &packages_path)
-        .env("ALC_LOG_DIR", &logs_dir);
-    let transport = TokioChildProcess::new(cmd).expect("spawn alc server");
-    let client = ().serve(transport).await.expect("initialize MCP session");
+    let logs = logs_dir.to_string_lossy().into_owned();
+    let client = common::spawn_alc(tmp.path(), &[("ALC_LOG_DIR", &logs)]).await;
 
     let result = read_resource(
         &client,
@@ -5520,11 +5476,11 @@ async fn test_alc_card_analyze_roundtrip() {
     let client = connect_with_alc_home(tmp.path()).await;
 
     // 1. Install the fixture pkg via absolute path string (K-137: no file:// URL).
-    // Use the user's packages dir as a Collection root so that card_analysis
-    // (at <packages>/card_analysis/init.lua) is discovered via Collection layout.
+    // The fixture dir is a Collection root, so card_analysis (at
+    // <root>/card_analysis/init.lua) is discovered via Collection layout.
     // Single-package mode (root-level init.lua) was removed in v0.36.0.
     let packages_dir =
-        std::path::PathBuf::from(std::env::var("HOME").expect("HOME")).join(".algocline/packages");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/card_analysis_pkg");
     call_json(
         &client,
         "alc_pkg_install",
@@ -5835,7 +5791,6 @@ async fn test_alc_eval_unknown_grader_typed_error() {
     let alc_home = tempfile::tempdir().expect("tempdir");
     write_echo_strategy(alc_home.path());
     let client = connect_with_alc_home(alc_home.path()).await;
-    install_real_collection(&client).await;
 
     let result = client
         .call_tool(call_params(
@@ -5865,7 +5820,6 @@ async fn test_alc_eval_llm_rubric_grader_pause_carries_role() {
     let alc_home = tempfile::tempdir().expect("tempdir");
     write_echo_strategy(alc_home.path());
     let client = connect_with_alc_home(alc_home.path()).await;
-    install_real_collection(&client).await;
 
     let resp = call_json(
         &client,
@@ -5914,7 +5868,6 @@ async fn test_alc_eval_llm_rubric_grader_pause_via_lua_side() {
     let alc_home = tempfile::tempdir().expect("tempdir");
     write_echo_strategy(alc_home.path());
     let client = connect_with_alc_home(alc_home.path()).await;
-    install_real_collection(&client).await;
 
     let lua_code = r#"
 local scenario = {
@@ -5948,7 +5901,6 @@ async fn test_alc_eval_per_case_rubric_override_appears_in_judge_prompt() {
     let alc_home = tempfile::tempdir().expect("tempdir");
     write_echo_strategy(alc_home.path());
     let client = connect_with_alc_home(alc_home.path()).await;
-    install_real_collection(&client).await;
 
     let lua_code = r#"
 local scenario = {
@@ -5996,7 +5948,6 @@ async fn test_alc_eval_llm_rubric_falls_back_to_default_rubric_when_case_has_no_
     let alc_home = tempfile::tempdir().expect("tempdir");
     write_echo_strategy(alc_home.path());
     let client = connect_with_alc_home(alc_home.path()).await;
-    install_real_collection(&client).await;
 
     let lua_code = r#"
 local scenario = {
@@ -6038,34 +5989,19 @@ return M"#,
     .expect("write echo_strat init.lua");
 }
 
-/// Install the real bundled package collection (for `evalframe`) from the
-/// user's `~/.algocline/packages` collection root into the isolated ALC_HOME.
-/// Mirrors the setup used by the card-analysis LLM-path e2e test.
-async fn install_real_collection(client: &rmcp::service::RunningService<rmcp::RoleClient, ()>) {
-    let packages_dir =
-        std::path::PathBuf::from(std::env::var("HOME").expect("HOME")).join(".algocline/packages");
-    call_json(
-        client,
-        "alc_pkg_install",
-        json!({ "url": packages_dir.to_string_lossy().as_ref() }),
-    )
-    .await;
-}
-
 // ─── CLI dry-run tests (no MCP harness) ──────────────────────────────────────
 
-/// Resolve the path to the `alc` binary, mirroring the logic in `connect()`.
-fn alc_bin() -> String {
-    std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")))
+/// `alc` as a CLI process over a throwaway home. The `TempDir` is returned
+/// so it outlives the command.
+fn alc_cli() -> (std::process::Command, tempfile::TempDir) {
+    let home = tempfile::tempdir().expect("tempdir");
+    (common::isolated_std_command(home.path()), home)
 }
 
 #[test]
 fn test_cli_help_short() {
-    let output = std::process::Command::new(alc_bin())
-        .arg("-h")
-        .output()
-        .expect("failed to run alc -h");
+    let (mut cmd, _home) = alc_cli();
+    let output = cmd.arg("-h").output().expect("failed to run alc -h");
 
     assert!(
         output.status.success(),
@@ -6082,7 +6018,8 @@ fn test_cli_help_short() {
 
 #[test]
 fn test_cli_help_long() {
-    let output = std::process::Command::new(alc_bin())
+    let (mut cmd, _home) = alc_cli();
+    let output = cmd
         .arg("--help")
         .output()
         .expect("failed to run alc --help");
@@ -6106,10 +6043,8 @@ fn test_cli_help_long() {
 
 #[test]
 fn test_cli_version() {
-    let output = std::process::Command::new(alc_bin())
-        .arg("-V")
-        .output()
-        .expect("failed to run alc -V");
+    let (mut cmd, _home) = alc_cli();
+    let output = cmd.arg("-V").output().expect("failed to run alc -V");
 
     assert!(
         output.status.success(),
@@ -7446,20 +7381,8 @@ return M"#,
 async fn connect_with_alc_home_and_env(
     alc_home: &std::path::Path,
     extra_env: &[(&str, &str)],
-) -> rmcp::service::RunningService<rmcp::RoleClient, ()> {
-    let bin = std::env::var("CARGO_BIN_EXE_alc")
-        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
-    let packages_path = alc_home.join("packages");
-    let mut cmd = tokio::process::Command::new(bin);
-    cmd.env("ALC_HOME", alc_home)
-        .env("ALC_PACKAGES_PATH", &packages_path);
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
-    ().serve(transport)
-        .await
-        .expect("failed to initialize MCP session")
+) -> common::AlcClient {
+    common::spawn_alc(alc_home, extra_env).await
 }
 
 /// Normal path (target absent): `alc_setting_resolve` with no target returns all

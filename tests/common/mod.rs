@@ -23,13 +23,133 @@
 //! process**; the parent test binary's process-wide env is untouched.
 //! Therefore no `serial_test` crate / `Mutex` guard is required and
 //! parallel tests using this harness are race-free.
+//!
+//! ## One way to start `alc`
+//!
+//! Every test that runs the `alc` binary starts it through this module:
+//! [`isolated_command`] / [`isolated_std_command`] for a raw process,
+//! [`spawn_alc`] for an MCP session over a home the test prepared, and
+//! [`connect`] / [`TempAlcHome::connect`] for one over a fresh tempdir.
+//! Each of them removes every `ALC_*` variable the test process inherited
+//! and points `ALC_HOME` / `ALC_PACKAGES_PATH` into the given home (the
+//! log directory follows `ALC_HOME` by default, which `alc_info` reports),
+//! so no test reads or writes the developer's `~/.algocline`
+//! — a `config.toml` there selecting another Card backend, say, cannot
+//! change what a test observes. `just check-invariants` (Inv-6) refuses a
+//! test outside this module that starts the binary itself.
 
 #![allow(dead_code)] // Not every test file consumes every helper.
 
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 
 use rmcp::{transport::TokioChildProcess, ServiceExt};
 use tempfile::TempDir;
+
+/// An MCP client session to a spawned `alc`.
+pub type AlcClient = rmcp::service::RunningService<rmcp::RoleClient, ()>;
+
+/// Path to the `alc` binary under test.
+pub fn alc_bin() -> String {
+    std::env::var("CARGO_BIN_EXE_alc")
+        .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")))
+}
+
+/// The environment an `alc` child gets for `home`: every inherited `ALC_*`
+/// removed, then `ALC_HOME` and `ALC_PACKAGES_PATH` set.
+///
+/// `{home}/packages` is created here because `resolve_lib_paths()` in
+/// `src/main.rs` drops an `ALC_PACKAGES_PATH` entry that is not a
+/// directory, and `require()` then falls back to the developer's real
+/// `~/.algocline/packages/`.
+fn isolation(home: &Path) -> (Vec<String>, Vec<(&'static str, PathBuf)>) {
+    let packages = home.join("packages");
+    std::fs::create_dir_all(&packages).expect("failed to create {home}/packages");
+    let inherited = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("ALC_"))
+        .collect();
+    let set = vec![
+        ("ALC_HOME", home.to_path_buf()),
+        ("ALC_PACKAGES_PATH", packages),
+    ];
+    (inherited, set)
+}
+
+/// A `tokio` command for `alc` rooted at `home`. See the module doc.
+pub fn isolated_command(home: &Path) -> tokio::process::Command {
+    let (remove, set) = isolation(home);
+    let mut cmd = tokio::process::Command::new(alc_bin());
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in set {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
+/// A `std` command for `alc` rooted at `home`. See the module doc.
+pub fn isolated_std_command(home: &Path) -> std::process::Command {
+    let (remove, set) = isolation(home);
+    let mut cmd = std::process::Command::new(alc_bin());
+    for k in remove {
+        cmd.env_remove(k);
+    }
+    for (k, v) in set {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
+/// Start `alc` as an MCP server rooted at `home` and open a session.
+///
+/// `extra_env` is applied last, so it can override one of the isolated
+/// paths (a test pointing `ALC_LOG_DIR` at a directory it seeded) or add
+/// a variable the test is about. The caller owns `home` and keeps it
+/// alive for the session.
+pub async fn spawn_alc(home: &Path, extra_env: &[(&str, &str)]) -> AlcClient {
+    let mut cmd = isolated_command(home);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
+    let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
+    ().serve(transport)
+        .await
+        .expect("failed to initialize MCP session")
+}
+
+/// An MCP session over a fresh tempdir home that the session owns.
+///
+/// Derefs to the client, so a test uses it where it would use an
+/// [`AlcClient`]; `cancel` keeps the client's own signature. Fields drop
+/// in declaration order: the client (terminating the child) before the
+/// tempdir it has files open in.
+pub struct IsolatedClient {
+    client: AlcClient,
+    _tmp: TempDir,
+}
+
+impl Deref for IsolatedClient {
+    type Target = AlcClient;
+    fn deref(&self) -> &AlcClient {
+        &self.client
+    }
+}
+
+impl IsolatedClient {
+    /// Cancel the session, then drop the tempdir.
+    pub async fn cancel(self) -> Result<rmcp::service::QuitReason, tokio::task::JoinError> {
+        self.client.cancel().await
+    }
+}
+
+/// An MCP session to `alc` over a fresh, empty tempdir home.
+pub async fn connect() -> IsolatedClient {
+    let tmp = TempDir::new().expect("failed to create tempdir");
+    let client = spawn_alc(tmp.path(), &[]).await;
+    IsolatedClient { client, _tmp: tmp }
+}
 
 /// RAII harness that spawns an `alc` MCP server rooted at a fresh tempdir.
 ///
@@ -79,13 +199,7 @@ impl TempAlcHome {
         let types_dir = home.join("types");
         std::fs::create_dir_all(&types_dir).expect("failed to create types dir");
         std::fs::write(types_dir.join("alc.d.lua"), b"").expect("failed to seed alc.d.lua");
-        let bin = std::env::var("CARGO_BIN_EXE_alc")
-            .unwrap_or_else(|_| format!("{}/target/debug/alc", env!("CARGO_MANIFEST_DIR")));
-        let mut cmd = tokio::process::Command::new(bin);
-        cmd.env("ALC_HOME", &home)
-            .env("ALC_PACKAGES_PATH", &packages_path);
-        let transport = TokioChildProcess::new(cmd).expect("failed to spawn alc server");
-        let client = ().serve(transport).await.expect("failed to initialize MCP session");
+        let client = spawn_alc(&home, &[]).await;
         Self {
             client,
             _tmp: tmp,

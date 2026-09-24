@@ -4,7 +4,8 @@
 //! communicates over a Unix-domain socket using `PoolClient`, and verifies
 //! the round-trip behaviour.
 //!
-//! The `alc` binary path is provided by Cargo via `CARGO_BIN_EXE_alc`.
+//! The worker is started through `tests/common` (`isolated_command`), so it
+//! runs over the socket's tempdir as its home and inherits no `ALC_*`.
 //!
 //! # Process lifecycle
 //!
@@ -17,8 +18,9 @@ use std::time::Duration;
 
 use algocline_app::pool::{PoolClient, PoolRequest, PoolResponseData};
 use tempfile::TempDir;
-use tokio::process::Command;
 use tokio::time::sleep;
+
+mod common;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -29,18 +31,14 @@ fn temp_sock() -> (TempDir, PathBuf) {
     (dir, sock)
 }
 
-/// Path to the compiled `alc` binary under test.
-fn alc_bin() -> String {
-    // CARGO_BIN_EXE_alc is set by Cargo in the integration-test context.
-    env!("CARGO_BIN_EXE_alc").to_string()
-}
-
 /// Spawn the `alc pool-worker` subprocess.
 ///
 /// Returns a `tokio::process::Child`. The caller is responsible for calling
 /// `child.kill().await` when done.
 async fn spawn_worker(sid: &str, sock: &std::path::Path) -> tokio::process::Child {
-    Command::new(alc_bin())
+    // The socket's tempdir doubles as the worker's isolated home.
+    let home = sock.parent().expect("socket path has a parent dir");
+    common::isolated_command(home)
         .args(["pool-worker", "--sid", sid, "--sock"])
         .arg(sock)
         // Redirect stdout/stderr so test output stays clean.

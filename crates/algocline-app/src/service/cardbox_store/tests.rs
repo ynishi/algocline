@@ -150,11 +150,11 @@ fn run_fields_become_tags_at_open() {
     let plan = plan_for(
         json!({
             "pkg": { "name": "cot" },
-            "run": { "status": "succeeded", "flow": "coding_orch", "reason": "clean" },
+            "run": { "status": "succeeded", "flow": "code_review", "reason": "clean" },
         }),
         OpenMode::Lifecycle,
     );
-    assert_eq!(tag(&plan, "run.flow"), Some("coding_orch"));
+    assert_eq!(tag(&plan, "run.flow"), Some("code_review"));
     assert_eq!(tag(&plan, "run.reason"), Some("clean"));
     assert_eq!(tag(&plan, "run.action"), None, "absent fields stay absent");
 }
@@ -302,7 +302,7 @@ fn cb_closed() -> Json {
         "tags": {
             "created_at": "2026-09-01T00:00:00Z",
             "lineage.relation": "sweep_variant",
-            "run.flow": "coding_orch",
+            "run.flow": "code_review",
             "run.status": "skipped"
         }
     })
@@ -380,7 +380,7 @@ fn lineage_comes_back_from_the_parent_and_the_tag() {
 fn a_skipped_close_reads_back_as_skipped_not_succeeded() {
     let card = card_from_cardbox(&cb_closed()).expect("reconstruct");
     assert_eq!(card.pointer("/run/status"), Some(&json!("skipped")));
-    assert_eq!(card.pointer("/run/flow"), Some(&json!("coding_orch")));
+    assert_eq!(card.pointer("/run/flow"), Some(&json!("code_review")));
     assert_eq!(card.pointer("/cardbox/state"), Some(&json!("closed_ok")));
 }
 
@@ -424,10 +424,10 @@ fn an_open_card_still_reports_what_is_running() {
         "id": "c1", "opened_ms": 1790026520694i64, "parents": {},
         "pkg": "demo", "samples": { "batches": 0, "rows": 0 },
         "scenario": "none", "source": "alc", "state": "open",
-        "tags": { "run.flow": "coding_orch", "run.reason": "seeded" }
+        "tags": { "run.flow": "code_review", "run.reason": "seeded" }
     });
     let card = card_from_cardbox(&cb).expect("reconstruct");
-    assert_eq!(card.pointer("/run/flow"), Some(&json!("coding_orch")));
+    assert_eq!(card.pointer("/run/flow"), Some(&json!("code_review")));
     assert_eq!(card.pointer("/run/reason"), Some(&json!("seeded")));
     assert_eq!(
         card.pointer("/run/status"),
@@ -476,8 +476,8 @@ fn created_at_and_run_fields_are_translated_to_their_tags() {
         json!({ "tags": { "created_at": { "gte": "2026-09-01" } } })
     );
     assert_eq!(
-        where_for(json!({ "run": { "flow": "coding_orch" } })),
-        json!({ "tags": { "run.flow": "coding_orch" } })
+        where_for(json!({ "run": { "flow": "code_review" } })),
+        json!({ "tags": { "run.flow": "code_review" } })
     );
     assert_eq!(
         where_for(json!({ "run": { "status": "skipped" } })),
@@ -563,7 +563,7 @@ fn a_compat_row_becomes_a_summary_carrying_its_tags() {
     let row = json!({
         "card_id": "demo_sc1_x", "pkg": "demo", "scenario": "sc1",
         "state": "closed_ok", "opened_ms": 1790026907079i64, "pass_rate": 0.8,
-        "tags": { "created_at": "2026-09-01T00:00:00Z", "run.flow": "coding_orch" }
+        "tags": { "created_at": "2026-09-01T00:00:00Z", "run.flow": "code_review" }
     });
     let s = summary_from_row(&row).expect("summary");
     assert_eq!(s.card_id, "demo_sc1_x");
@@ -575,7 +575,7 @@ fn a_compat_row_becomes_a_summary_carrying_its_tags() {
         Some("2026-09-01T00:00:00Z"),
         "the tag, not opened_ms"
     );
-    assert_eq!(s.flow.as_deref(), Some("coding_orch"));
+    assert_eq!(s.flow.as_deref(), Some("code_review"));
 }
 
 /// The row shape of a cardbox older than 0.1.2, and of a 0.1.2 Card

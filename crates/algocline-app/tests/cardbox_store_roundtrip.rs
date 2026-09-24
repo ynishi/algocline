@@ -65,7 +65,7 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     let Some((store, _dir)) = store() else { return };
 
     // ── open ───────────────────────────────────────────────────
-    let (card_id, locator) = store.open(seed("coding_orch")).expect("open");
+    let (card_id, locator) = store.open(seed("code_review")).expect("open");
     assert!(!card_id.is_empty());
     assert_eq!(
         locator,
@@ -76,7 +76,7 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     let opened = store.get(&card_id).expect("get").expect("card exists");
     assert_eq!(opened["pkg"], json!({ "name": "demo" }));
     assert_eq!(opened["created_at"], json!("2026-09-01T00:00:00Z"));
-    assert_eq!(opened.pointer("/run/flow"), Some(&json!("coding_orch")));
+    assert_eq!(opened.pointer("/run/flow"), Some(&json!("code_review")));
     assert_eq!(
         opened.pointer("/run/status"),
         None,
@@ -151,7 +151,7 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     // ── get: the whole write mapping, inverted ─────────────────
     assert_eq!(sealed["card_id"], json!(card_id));
     assert_eq!(sealed.pointer("/run/status"), Some(&json!("failed")));
-    assert_eq!(sealed.pointer("/run/flow"), Some(&json!("coding_orch")));
+    assert_eq!(sealed.pointer("/run/flow"), Some(&json!("code_review")));
     assert_eq!(sealed.pointer("/run/reason"), Some(&json!("seeded")));
     assert_eq!(sealed["error"], json!("timeout after 30s"));
     assert_eq!(sealed["cost"], json!({ "usd": 0.012 }));
@@ -203,14 +203,14 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     );
     assert_eq!(
         hits[0].flow.as_deref(),
-        Some("coding_orch"),
+        Some("code_review"),
         "a find row carries the run.flow tag"
     );
 
     // The two translated paths: created_at and run.* are tags.
     for predicate in [
         json!({ "created_at": { "gte": "2026-08-01" } }),
-        json!({ "run": { "flow": "coding_orch" } }),
+        json!({ "run": { "flow": "code_review" } }),
         json!({ "run": { "status": "failed" } }),
         json!({ "params": { "persona": { "moves_count": 3 } } }),
         json!({ "stats": { "pass_rate": { "gte": 0.5 } } }),
@@ -239,7 +239,7 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
         listed[0].created_at.as_deref(),
         Some("2026-09-01T00:00:00Z")
     );
-    assert_eq!(listed[0].flow.as_deref(), Some("coding_orch"));
+    assert_eq!(listed[0].flow.as_deref(), Some("code_review"));
     assert!(store.list(Some("nosuchpkg")).expect("list").is_empty());
 
     // ── alias_set ──────────────────────────────────────────────
@@ -276,7 +276,7 @@ fn a_run_opens_writes_rows_closes_failed_and_reads_back() {
     assert!(store.get("no-such-card").expect("get").is_none());
 
     // ── lineage ────────────────────────────────────────────────
-    let mut child_seed = seed("coding_orch");
+    let mut child_seed = seed("code_review");
     child_seed["metadata"] = json!({
         "prior_card_id": card_id,
         "prior_relation": "sweep_variant",
